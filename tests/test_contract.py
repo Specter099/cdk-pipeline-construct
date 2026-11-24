@@ -129,3 +129,12 @@ def test_wildcard_resource_check_reports_the_offending_actions():
     c.assert_no_wildcard_resources(
         t, allowed_actions=wild
     )  # passes once those are allowed explicitly
+
+
+def test_step_commands_returns_the_commands_of_the_project_behind_a_step():
+    t = _step_build()
+    cmds = c.step_commands(t, "Deploy-app")
+    assert "cdk deploy AppStack --require-approval never" in cmds
+    assert c.step_commands(t, "Gate-synth-check")[-1] == "cdk synth"
+    with pytest.raises(AssertionError, match="no CodeBuild project"):
+        c.step_commands(t, "Nope")

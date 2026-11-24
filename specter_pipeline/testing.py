@@ -56,6 +56,19 @@ def projects(template: Template) -> dict:
     return template.find_resources("AWS::CodeBuild::Project")
 
 
+def step_commands(template: Template, step_name: str) -> list[str]:
+    """The buildspec commands of the CodeBuild project behind pipeline step ``step_name``
+    (for example ``"Deploy-app"`` or ``"Gate-tests"``)."""
+    import json  # noqa: PLC0415
+
+    for res in projects(template).values():
+        if str(res["Properties"].get("Description", "")).endswith(f"/{step_name}"):
+            return json.loads(res["Properties"]["Source"]["BuildSpec"])["phases"][
+                "build"
+            ]["commands"]
+    raise AssertionError(f"no CodeBuild project for pipeline step {step_name!r}")
+
+
 def pr_projects(template: Template, name_prefix: str) -> dict:
     return {
         lid: res
@@ -394,5 +407,6 @@ __all__ = [
     "assert_standard_contract",
     "pipeline",
     "pr_projects",
+    "step_commands",
     "projects",
 ]

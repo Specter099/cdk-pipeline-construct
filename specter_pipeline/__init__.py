@@ -6,8 +6,8 @@ from .runtimes import Runtime
 
 __all__ = [
     "DeployStep",
-    "GitHubConnectionStack",
     "Gate",
+    "GitHubConnectionStack",
     "PostDeployStep",
     "PullRequestChecks",
     "Runtime",

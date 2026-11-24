@@ -23,7 +23,7 @@ Design rules baked in:
 from __future__ import annotations
 
 import re
-from typing import Optional, Sequence
+from collections.abc import Sequence
 
 import aws_cdk as cdk
 from aws_cdk import aws_codebuild as codebuild
@@ -83,12 +83,12 @@ class StandardPipeline(Construct):
         repo: str,
         connection_arn: str,
         gates: Sequence[Gate],
-        application_stage: Optional[cdk.Stage] = None,
-        deploy_step: Optional[DeployStep] = None,
+        application_stage: cdk.Stage | None = None,
+        deploy_step: DeployStep | None = None,
         bootstrap_qualifier: str = "hnb659fds",
         synth_commands: Sequence[str],
         synth_install: Sequence[str] = (),
-        synth_env: Optional[dict[str, str]] = None,
+        synth_env: dict[str, str] | None = None,
         branch: str = "main",
         post_deploy: Sequence[PostDeployStep] = (),
         deploy_enabled: bool = False,
@@ -104,7 +104,7 @@ class StandardPipeline(Construct):
 
         if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo):
             raise ValueError(f"repo must be 'owner/name', got {repo!r}")
-        owner, _, name = repo.partition("/")
+        _, _, name = repo.partition("/")
         if not gates:
             raise ValueError("at least one gate is required")
         if len({g.name for g in gates}) != len(gates):
@@ -242,8 +242,10 @@ class StandardPipeline(Construct):
                     iam.PolicyStatement(
                         actions=["sts:AssumeRole"],
                         resources=[
-                            f"arn:aws:iam::{cdk.Aws.ACCOUNT_ID}:role/"
-                            f"cdk-{bootstrap_qualifier}-*-role-{cdk.Aws.ACCOUNT_ID}-{cdk.Aws.REGION}"
+                            (
+                                f"arn:aws:iam::{cdk.Aws.ACCOUNT_ID}:role/"
+                                f"cdk-{bootstrap_qualifier}-*-role-{cdk.Aws.ACCOUNT_ID}-{cdk.Aws.REGION}"
+                            )
                         ],
                     ),
                     *deploy_step.policy_statements,
@@ -292,7 +294,7 @@ class StandardPipeline(Construct):
         )
 
         # --- PR validation (separate, deploy-less path) ----------------------
-        self.pull_request_checks: Optional[PullRequestChecks] = None
+        self.pull_request_checks: PullRequestChecks | None = None
         if pull_request_checks:
             self.pull_request_checks = PullRequestChecks(
                 self,

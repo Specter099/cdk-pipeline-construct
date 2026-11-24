@@ -18,7 +18,7 @@ tarball unpacked into ``/tmp``. No custom ECR image is required.
 from __future__ import annotations
 
 import enum
-from typing import Sequence
+from collections.abc import Sequence
 
 from aws_cdk import aws_codebuild as codebuild
 

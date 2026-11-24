@@ -13,7 +13,7 @@ equivalent hook.
 from __future__ import annotations
 
 import dataclasses
-from typing import Mapping, Sequence
+from collections.abc import Mapping, Sequence
 
 from aws_cdk import aws_codebuild as codebuild
 from aws_cdk import aws_iam as iam

@@ -17,7 +17,7 @@ from specter_pipeline import (
 # Dummy, obviously-fake values: synth needs a concrete env, but nothing here
 # ever reaches AWS. Derived rather than literal so no real account id is implied.
 TEST_ACCOUNT = "0" * 12
-TEST_REGION = "-".join(["us", "east", "1"])
+TEST_REGION = "us-east-1"
 CONN = f"arn:aws:codeconnections:{TEST_REGION}:{TEST_ACCOUNT}:connection/abc"
 ENV = cdk.Environment(account=TEST_ACCOUNT, region=TEST_REGION)
 
@@ -39,14 +39,14 @@ GATES = [
 def build(**overrides) -> Template:
     app = cdk.App()
     stack = cdk.Stack(app, "PipelineStack", env=ENV)
-    kwargs = dict(
-        repo="Specter099/demo",
-        connection_arn=CONN,
-        application_stage=AppStage(app, "Prod", env=ENV),
-        gates=GATES,
-        synth_commands=["cdk -a 'python3 pipeline_app.py' synth"],
-        synth_install=["pip install -r requirements.txt"],
-        post_deploy=[
+    kwargs = {
+        "repo": "Specter099/demo",
+        "connection_arn": CONN,
+        "application_stage": AppStage(app, "Prod", env=ENV),
+        "gates": GATES,
+        "synth_commands": ["cdk -a 'python3 pipeline_app.py' synth"],
+        "synth_install": ["pip install -r requirements.txt"],
+        "post_deploy": [
             PostDeployStep(
                 "frontend",
                 ["npm run build"],
@@ -57,7 +57,7 @@ def build(**overrides) -> Template:
                 ],
             )
         ],
-    )
+    }
     kwargs.update(overrides)
     StandardPipeline(stack, "P", **kwargs)
     return Template.from_stack(stack)
@@ -438,7 +438,7 @@ def test_pr_webhook_filter_is_a_pattern_that_can_actually_match(tpl):
 def test_pr_base_branch_is_escaped():
     t = build(pull_request_checks=True)  # default main
     assert t  # sanity
-    from specter_pipeline import PullRequestChecks  # noqa: PLC0415
+    from specter_pipeline import PullRequestChecks
 
     app = cdk.App()
     stack = cdk.Stack(app, "S", env=ENV)

@@ -71,6 +71,14 @@ class Gate:
 
     def __post_init__(self) -> None:
         validate_name("gate", self.name)
+        if self.pull_request is not None and not isinstance(self.pull_request, bool):
+            raise TypeError(f"gate {self.name!r}: pull_request must be True, False or None")
+        # Frozen only guards attribute assignment; copy the sequences so a caller's later
+        # list.append() cannot add permissions after the pull-request check below.
+        object.__setattr__(self, "commands", list(self.commands))
+        object.__setattr__(self, "install", list(self.install))
+        object.__setattr__(self, "policy_statements", tuple(self.policy_statements))
+        object.__setattr__(self, "env", dict(self.env))
         if not self.commands:
             raise ValueError(f"gate {self.name!r} has no commands")
         compute_type(self.memory_gb)  # validates

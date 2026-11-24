@@ -82,7 +82,7 @@ def test_access_analyzer_script_is_pinned_to_a_commit_and_verified_before_it_run
     order = [
         i
         for i, cmd in enumerate(cmds)
-        if "curl" in cmd or "sha256sum -c" in cmd or "python3 /tmp/check" in cmd
+        if "curl" in cmd or "sha256sum -c" in cmd or "python3 -I /tmp/aa/check" in cmd
     ]
     assert order == sorted(order) and len(order) == 3
     assert cmds[0] == "cdk synth --quiet", (

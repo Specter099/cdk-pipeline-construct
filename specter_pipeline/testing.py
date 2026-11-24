@@ -34,15 +34,65 @@ _UNSUPPORTED_ON_LAMBDA = (
     "FileSystemLocations",
 )
 
-#: Actions a PR-check role may hold: its logs, the connection token, and the report
-#: permissions CodeBuild adds for the project's own report group.
-_PR_ROLE_ALLOWED_PREFIXES = (
-    "logs:",
-    "codeconnections:",
-    "codebuild:CreateReport",
-    "codebuild:UpdateReport",
-    "codebuild:BatchPut",
+#: The exact actions a PR-check role may hold (measured on a synthesized pipeline): its own
+#: logs, the report permissions CodeBuild adds for the project's own report group, and the
+#: connection token. Anything else, including a wider action under an allowed prefix, fails.
+_PR_ROLE_ALLOWED_ACTIONS = frozenset(
+    {
+        "logs:CreateLogGroup",
+        "logs:CreateLogStream",
+        "logs:PutLogEvents",
+        "codebuild:CreateReportGroup",
+        "codebuild:CreateReport",
+        "codebuild:UpdateReport",
+        "codebuild:BatchPutTestCases",
+        "codebuild:BatchPutCodeCoverages",
+        "codeconnections:GetConnectionToken",
+        "codeconnections:GetConnection",
+    }
 )
+
+
+def _as_list(value) -> list:
+    return value if isinstance(value, list) else [value]
+
+
+def _is_wildcard_resource(resource) -> bool:
+    """'*' itself, or an ARN whose resource field is exactly '*' (for example arn:aws:s3:::*).
+    An intrinsic Fn::Join is flattened with '_' standing in for its non-literal parts."""
+    if isinstance(resource, dict):
+        join = resource.get("Fn::Join")
+        if not join:
+            return False
+        resource = join[0].join(p if isinstance(p, str) else "_" for p in join[1])
+    if not isinstance(resource, str):
+        return False
+    if resource == "*":
+        return True
+    parts = resource.split(":", 5)
+    return resource.startswith("arn:") and len(parts) == 6 and parts[5] == "*"
+
+
+def _role_policy_statements(template: Template, role_ids: set[str]) -> list[tuple[str, dict]]:
+    """(role id, statement) for every statement that reaches one of ``role_ids``: standalone
+    AWS::IAM::Policy resources and the role's own inline policies. A role with managed policies
+    attached is itself a failure here, so it never reaches the caller silently."""
+    out: list[tuple[str, dict]] = []
+    roles = template.find_resources("AWS::IAM::Role")
+    for rid in role_ids:
+        props = roles[rid]["Properties"]
+        assert not props.get("ManagedPolicyArns"), f"{rid} has managed policies attached"
+        for inline in props.get("Policies", []):
+            out += [(rid, st) for st in _as_list(inline["PolicyDocument"]["Statement"])]
+    for pol in template.find_resources("AWS::IAM::Policy").values():
+        attached = {r["Ref"] for r in pol["Properties"].get("Roles", []) if "Ref" in r}
+        for rid in attached & role_ids:
+            out += [(rid, st) for st in _as_list(pol["Properties"]["PolicyDocument"]["Statement"])]
+    for rid, st in out:
+        assert "NotAction" not in st and "NotResource" not in st, (
+            f"{rid} uses NotAction/NotResource: {st}"
+        )
+    return out
 
 
 def pipeline(template: Template) -> dict:
@@ -111,8 +161,8 @@ def assert_lambda_compute(template: Template) -> None:
 def assert_ci_env_on_repo_command_projects(template: Template) -> None:
     """CI=true is set wherever repo commands run (scripts then use the ambient interpreter)."""
     for logical_id, res in projects(template).items():
-        if "SelfMutation" in logical_id:
-            continue  # CDK-managed; only runs `cdk deploy` of the pipeline stack
+        if "SelfMutation" in logical_id or "FileAsset" in logical_id:
+            continue  # CDK-managed: `cdk deploy` of the pipeline stack / asset publishing
         env = {
             v["Name"]: v["Value"]
             for v in res["Properties"]["Environment"].get("EnvironmentVariables", [])
@@ -122,6 +172,11 @@ def assert_ci_env_on_repo_command_projects(template: Template) -> None:
 
 def assert_stage_order(template: Template, deploy_stage: str = "Deploy") -> None:
     names = [s["Name"] for s in pipeline(template)["Stages"]]
+    # CDK Pipelines adds an "Assets" stage between UpdatePipeline and the rest when a stage-deployed
+    # application has file or Docker assets; it is the framework's and optional.
+    if "Assets" in names:
+        assert names.index("Assets") == 3, f"Assets in the wrong place: {names}"
+        names.remove("Assets")
     assert names == ["Source", "Build", "UpdatePipeline", "Gates", deploy_stage], (
         f"unexpected stage order: {names}"
     )
@@ -158,17 +213,29 @@ def assert_deploy_ordering(
     deploy_stage: str = "Deploy",
     deploy_prefix: str = "Deploy-",
     post_prefix: str = "Post-",
+    require_approval: bool = True,
 ) -> None:
-    """Approval strictly precedes deploy, which strictly precedes post-deploy steps.
+    """Approval strictly precedes every other action, deploy strictly precedes post-deploy steps.
 
     Equal RunOrder means the actions run in parallel: in a wave with no stacks the approval
-    and the deploy once shared a RunOrder, i.e. the deploy did not wait for approval."""
+    and the deploy once shared a RunOrder, i.e. the deploy did not wait for approval. Every
+    non-approval action is held to this, not only the ones recognised by name, so an extra
+    action cannot slip in beside the approval."""
     actions = _stage(template, deploy_stage)["Actions"]
     approvals = [a for a in actions if a["ActionTypeId"]["Category"] == "Approval"]
-    assert len(approvals) == 1, (
-        f"expected exactly one approval in {deploy_stage!r}, found {len(approvals)}"
-    )
-    approval = approvals[0]["RunOrder"]
+    if require_approval:
+        assert len(approvals) == 1, (
+            f"expected exactly one approval in {deploy_stage!r}, found {len(approvals)}"
+        )
+        approval = approvals[0]["RunOrder"]
+        for a in actions:
+            if a in approvals:
+                continue
+            assert approval < a["RunOrder"], (
+                f"{a['Name']} (RunOrder {a['RunOrder']}) does not wait for approval ({approval})"
+            )
+    else:
+        assert not approvals, f"{deploy_stage!r} has an approval but require_approval is False"
     deploys = [
         a
         for a in actions
@@ -176,10 +243,6 @@ def assert_deploy_ordering(
         or a["ActionTypeId"]["Provider"] == "CloudFormation"
     ]
     assert deploys, f"no deploy action in {deploy_stage!r}"
-    for a in deploys:
-        assert approval < a["RunOrder"], (
-            f"{a['Name']} (RunOrder {a['RunOrder']}) does not wait for approval ({approval})"
-        )
     posts = [a for a in actions if a["Name"].startswith(post_prefix)]
     for a in posts:
         assert max(d["RunOrder"] for d in deploys) < a["RunOrder"], (
@@ -292,22 +355,21 @@ def assert_pr_checks(
 
 
 def assert_pr_roles_least_privilege(template: Template, name_prefix: str) -> None:
-    """PR-check projects run PR-head code: logs, the connection token and report permissions only."""
-    roles = {
-        res["Properties"]["ServiceRole"]["Fn::GetAtt"][0]
-        for res in pr_projects(template, name_prefix).values()
-    }
-    for pol in template.find_resources("AWS::IAM::Policy").values():
-        if not {r["Ref"] for r in pol["Properties"]["Roles"]} & roles:
-            continue
-        for stmt in pol["Properties"]["PolicyDocument"]["Statement"]:
-            actions = (
-                stmt["Action"] if isinstance(stmt["Action"], list) else [stmt["Action"]]
+    """PR-check projects run PR-head code: logs, the connection token and report permissions only.
+
+    Exact actions, no wildcard resources, no managed or inline policies on the role, and at least
+    one PR-check role must exist (a wrong prefix would otherwise pass vacuously)."""
+    found = pr_projects(template, name_prefix)
+    assert found, f"no PR-check projects with prefix {name_prefix!r}"
+    roles = {res["Properties"]["ServiceRole"]["Fn::GetAtt"][0] for res in found.values()}
+    for rid, stmt in _role_policy_statements(template, roles):
+        assert stmt.get("Effect", "Allow") == "Allow", f"{rid}: unexpected effect {stmt}"
+        for action in _as_list(stmt["Action"]):
+            assert action in _PR_ROLE_ALLOWED_ACTIONS, f"PR-check role has {action}"
+        for resource in _as_list(stmt["Resource"]):
+            assert not _is_wildcard_resource(resource), (
+                f"PR-check role has a wildcard resource: {resource}"
             )
-            for action in actions:
-                assert action.startswith(_PR_ROLE_ALLOWED_PREFIXES), (
-                    f"PR-check role has {action}"
-                )
 
 
 def assert_gates_have_node(gates: Sequence[Gate], names: Iterable[str]) -> None:
@@ -330,18 +392,32 @@ CDK_INTERNAL_WILDCARDS = frozenset({"cloudformation:DescribeStacks", "s3:ListBuc
 def assert_no_wildcard_resources(
     template: Template, allowed_actions: Iterable[str] = ()
 ) -> None:
-    """No IAM statement grants on Resource '*' except for actions that only support it."""
+    """No IAM statement grants on a wildcard resource except for actions that only support it.
+
+    A wildcard is '*' anywhere in the Resource list (not only as the sole value) or an ARN whose
+    resource part is '*', and role-inline policies are scanned as well as AWS::IAM::Policy. The
+    two CDK-internal wildcards are honoured only on the self-mutation role."""
     allow = set(allowed_actions)
-    for logical_id, pol in template.find_resources("AWS::IAM::Policy").items():
-        for stmt in pol["Properties"]["PolicyDocument"]["Statement"]:
-            if stmt.get("Resource") != "*":
-                continue
-            actions = (
-                stmt["Action"] if isinstance(stmt["Action"], list) else [stmt["Action"]]
+    roles = template.find_resources("AWS::IAM::Role")
+    statements: list[tuple[str, dict]] = []
+    for lid, role in roles.items():
+        for inline in role["Properties"].get("Policies", []):
+            statements += [(lid, st) for st in _as_list(inline["PolicyDocument"]["Statement"])]
+    for lid, pol in template.find_resources("AWS::IAM::Policy").items():
+        attached = [r["Ref"] for r in pol["Properties"].get("Roles", []) if "Ref" in r]
+        owner = attached[0] if attached else lid
+        statements += [(owner, st) for st in _as_list(pol["Properties"]["PolicyDocument"]["Statement"])]
+    for owner, stmt in statements:
+        assert "NotAction" not in stmt and "NotResource" not in stmt, (
+            f"{owner}: NotAction/NotResource is not allowed: {stmt}"
+        )
+        if not any(_is_wildcard_resource(r) for r in _as_list(stmt["Resource"])):
+            continue
+        for action in _as_list(stmt["Action"]):
+            permitted = action in allow or (
+                action in CDK_INTERNAL_WILDCARDS and "SelfMutat" in owner
             )
-            assert all(a in allow for a in actions), (
-                f"{logical_id}: wildcard resource for {actions}"
-            )
+            assert permitted, f"{owner}: wildcard resource for {action}"
 
 
 # --- the whole contract -------------------------------------------------------------
@@ -357,6 +433,7 @@ def assert_standard_contract(
     pull_request_checks: bool = True,
     base_branch: str = "main",
     node_gates: Iterable[str] = (),
+    require_approval: bool = True,
 ) -> None:
     """Every invariant a StandardPipeline must satisfy. Repo-specific checks go alongside.
 
@@ -368,7 +445,7 @@ def assert_standard_contract(
     assert_ci_env_on_repo_command_projects(template)
     assert_stage_order(template, deploy_stage)
     assert_gates_present(template, gates)
-    assert_deploy_ordering(template, deploy_stage)
+    assert_deploy_ordering(template, deploy_stage, require_approval=require_approval)
     if deploy_enabled:
         assert_deploy_open(template)
     else:

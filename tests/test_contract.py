@@ -111,24 +111,10 @@ def test_catches_a_contract_called_with_a_malformed_repo():
         _contract(_step_build(), repo="demo")
 
 
-def test_wildcard_resource_check_reports_the_offending_actions():
-    t = _step_build()
-    wild = set()
-    for pol in t.find_resources("AWS::IAM::Policy").values():
-        for stmt in pol["Properties"]["PolicyDocument"]["Statement"]:
-            if stmt.get("Resource") == "*":
-                acts = (
-                    stmt["Action"]
-                    if isinstance(stmt["Action"], list)
-                    else [stmt["Action"]]
-                )
-                wild.update(acts)
-    if wild:
-        with pytest.raises(AssertionError, match="wildcard resource"):
-            c.assert_no_wildcard_resources(t)
-    c.assert_no_wildcard_resources(
-        t, allowed_actions=wild
-    )  # passes once those are allowed explicitly
+def test_wildcard_resource_check_passes_on_the_unmodified_pipeline_with_only_cdks_own_wildcards():
+    """The negative cases (wildcards in any position, inline policies, NotAction, CDK's allowance
+    only on the self-mutation role) are in test_contract_mutations.py."""
+    c.assert_no_wildcard_resources(_step_build(), allowed_actions=c.CDK_INTERNAL_WILDCARDS)
 
 
 def test_step_commands_returns_the_commands_of_the_project_behind_a_step():

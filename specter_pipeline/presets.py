@@ -7,9 +7,22 @@ with one call instead of re-deriving them:
 
     GATES = python_cdk_gates()
 
-Tool versions match the shared workflow. Not reproduced (and why):
+Tool versions (bandit, pip-audit, boto3, cfn-flip) match the shared workflow; the CDK CLI is
+pinned by this package instead (``DEFAULT_CDK_CLI_VERSION``), because the CLI must support the
+cloud-assembly schema of the repo's ``aws-cdk-lib``. Pin ``aws-cdk-lib`` in the repo and bump both
+together. Not reproduced (and why):
 
-* CDK Nag is informational there (it never fails the job), so there is no gate.
+* CDK Nag: the shared workflow runs ``CDK_NAG=true cdk synth`` and fails the job if that synth
+  fails. A repo that wires Nag to that variable must add its own gate; for a repo that does not
+  read ``CDK_NAG`` the step is a no-op, so nothing is lost.
+* Credentials for synth: the shared workflow runs ``cdk synth`` with an OIDC role; these gates have
+  none, so a repo with uncached context lookups (``from_lookup``) fails ``cdk-synth``,
+  ``access-analyzer`` and ``tests``. Commit ``cdk.context.json`` or avoid lookups.
+* Missing files: the shared workflow skips tests when ``tests/`` is absent and the dev install when
+  ``requirements-dev.txt`` is absent. These gates fail in both cases; pass ``tests=False`` or provide
+  the file.
+* Lint is skipped when ``ruff`` is not installed (as in the shared workflow), so put a pinned ruff
+  in the dev requirements or the lint gate is a no-op.
 * The PR diff comment needs a GitHub write token; the PR checks report a commit status per
   gate instead.
 * CI log shipping to S3/CloudWatch: CodeBuild already writes every build to CloudWatch Logs.
@@ -48,9 +61,11 @@ def access_analyzer_commands(aws_region: str = "us-east-1") -> list[str]:
     url = f"https://raw.githubusercontent.com/{ACCESS_ANALYZER_REPO}/{ACCESS_ANALYZER_COMMIT}/{ACCESS_ANALYZER_SCRIPT}"
     return [
         "cdk synth --quiet",
-        f"curl -fsSL -o /tmp/check_no_public_access.py {url}",
-        f'echo "{ACCESS_ANALYZER_SHA256}  /tmp/check_no_public_access.py" | sha256sum -c -',
-        f"python3 /tmp/check_no_public_access.py --template-dir cdk.out --aws-region {aws_region} --fail-on-public-access",
+        # A dedicated directory and `python3 -I` keep /tmp (HOME, holding everything else) off sys.path.
+        "mkdir -p /tmp/aa",
+        f"curl -fsSL -o /tmp/aa/check_no_public_access.py {url}",
+        f'echo "{ACCESS_ANALYZER_SHA256}  /tmp/aa/check_no_public_access.py" | sha256sum -c -',
+        f"python3 -I /tmp/aa/check_no_public_access.py --template-dir cdk.out --aws-region {aws_region} --fail-on-public-access",
     ]
 
 

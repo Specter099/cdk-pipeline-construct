@@ -69,6 +69,45 @@ Lambda compute has no instance, so there is no EC2 user data. The per-repo hooks
 
 Exactly one of the two is required.
 
+## Presets: the shared CDK review checks as gates
+
+`python_cdk_gates()` reproduces `Specter099/.github`'s `cdk-review.yml` for a repo that leaves
+GitHub Actions: **ruff, bandit, unit tests, pip-audit, `cdk synth` and IAM Access Analyzer**, with
+the same tool versions.
+
+```python
+from specter_pipeline.presets import python_cdk_gates
+GATES = python_cdk_gates(env={"JSII_SILENCE_WARNING_UNTESTED_NODE_VERSION": "1"})
+```
+
+* The Access Analyzer gate fetches the shared script at a pinned commit and verifies a committed
+  SHA-256 before running it. It has its own IAM (`access-analyzer:CheckNoPublicAccess`; the AWS
+  reference lists no resource types, so `*` is required) and therefore **does not run on pull
+  requests**: that path executes the PR head's code. `Gate(policy_statements=...)` followed by
+  `pull_request=True` is refused.
+* Not reproduced: CDK Nag (informational in the shared workflow), the PR diff comment (needs a
+  GitHub write token; PR checks report a commit status per gate instead), CI log shipping
+  (CodeBuild already writes every build to CloudWatch Logs).
+
+## Contract tests: `specter_pipeline.testing`
+
+Every consumer must prove the same things about its pipeline. Instead of copying a test file:
+
+```python
+from specter_pipeline import testing as contract
+
+def test_pipeline(template):
+    contract.assert_standard_contract(template, repo="Specter099/my-repo", gates=GATES,
+                                      node_gates=["tests", "cdk-synth"])
+```
+
+It checks Lambda compute everywhere, the stage order, the gates, the deploy closed (or open),
+approval strictly before deploy before post-deploy, no pipeline triggers, restart on update, the
+account-regional artifact bucket, the PR-check filter and least-privilege roles, and Node on the
+gates that need it. Each helper also exists on its own, and each is tested against a pipeline that
+violates it. Add repo-specific checks next to it (for example: the deploy command equals the CI
+workflow's, flag for flag and `-c` for `-c`).
+
 ## Safety defaults
 
 * `deploy_enabled=False` writes `DisableInboundStageTransitions` into the pipeline

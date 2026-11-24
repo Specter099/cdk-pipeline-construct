@@ -52,7 +52,13 @@ def compute_type(memory_gb: int) -> codebuild.ComputeType:
 
 @dataclasses.dataclass(frozen=True)
 class Gate:
-    """A check that must pass (on PRs and before deploy)."""
+    """A check that must pass before deploy (and, by default, on pull requests).
+
+    ``policy_statements`` grant the step's role extra AWS permissions (for example an
+    analyzer API). The PR-check path runs the code of the PR head, so a gate that has its
+    own AWS permissions is NOT run there unless you say so, and saying so is refused:
+    ``pull_request`` defaults to "yes if the gate has no policy statements".
+    """
 
     name: str
     commands: Sequence[str]
@@ -60,12 +66,33 @@ class Gate:
     install: Sequence[str] = ()
     env: Mapping[str, str] = dataclasses.field(default_factory=dict)
     memory_gb: int = 2
+    policy_statements: Sequence[iam.PolicyStatement] = ()
+    pull_request: bool | None = None
 
     def __post_init__(self) -> None:
         validate_name("gate", self.name)
+        if self.pull_request is not None and not isinstance(self.pull_request, bool):
+            raise TypeError(f"gate {self.name!r}: pull_request must be True, False or None")
+        # Frozen only guards attribute assignment; copy the sequences so a caller's later
+        # list.append() cannot add permissions after the pull-request check below.
+        object.__setattr__(self, "commands", list(self.commands))
+        object.__setattr__(self, "install", list(self.install))
+        object.__setattr__(self, "policy_statements", tuple(self.policy_statements))
+        object.__setattr__(self, "env", dict(self.env))
         if not self.commands:
             raise ValueError(f"gate {self.name!r} has no commands")
         compute_type(self.memory_gb)  # validates
+        if self.pull_request and self.policy_statements:
+            raise ValueError(
+                f"gate {self.name!r} has its own IAM permissions and cannot run on pull requests: "
+                "that path executes the PR head's code"
+            )
+
+    @property
+    def runs_on_pull_requests(self) -> bool:
+        if self.pull_request is None:
+            return not self.policy_statements
+        return self.pull_request
 
     @property
     def environment(self) -> dict[str, str]:

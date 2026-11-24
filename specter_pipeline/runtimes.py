@@ -32,6 +32,7 @@ DEFAULT_CDK_CLI_VERSION = "2.1149.0"
 
 _VENV = "/tmp/venv"
 _NODE_HOME = "/tmp/nodejs"
+_JSII_CACHE = "/tmp/jsii-cache"
 
 
 class Runtime(enum.Enum):
@@ -55,6 +56,12 @@ def python_prelude() -> list[str]:
         'for v in $(env | grep -oE "^PIP_[A-Z_]+"); do unset "$v"; done',
         "unset PYTHONPATH PYTHONUSERBASE",
         "export PIP_CONFIG_FILE=/dev/null PIP_DISABLE_PIP_VERSION_CHECK=1",
+        # On Lambda compute HOME is /tmp, so jsii (the CDK library's Node bridge)
+        # defaults its package cache to /tmp/.cache, whose permissions it rejects
+        # ("other users may be able to modify it"), failing `import aws_cdk`.
+        # Found by running real builds on Lambda compute. Give it a private dir.
+        f"mkdir -m 700 -p {_JSII_CACHE}",
+        f"export JSII_RUNTIME_PACKAGE_CACHE_ROOT={_JSII_CACHE}",
         f"python3 -m venv {_VENV}",
         f". {_VENV}/bin/activate",
     ]

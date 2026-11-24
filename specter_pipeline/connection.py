@@ -8,13 +8,21 @@ A newly created connection is always PENDING. A human must complete the GitHub
 App authorization once in the console (Developer Tools > Settings > Connections
 > Update pending connection). That step cannot be done through the API.
 """
+
 import aws_cdk as cdk
 from aws_cdk import aws_codeconnections as codeconnections
 from constructs import Construct
 
 
 class GitHubConnectionStack(cdk.Stack):
-    def __init__(self, scope: Construct, construct_id: str, *, connection_name: str = "specter099-github", **kwargs) -> None:
+    def __init__(
+        self,
+        scope: Construct,
+        construct_id: str,
+        *,
+        connection_name: str = "specter099-github",
+        **kwargs,
+    ) -> None:
         super().__init__(scope, construct_id, **kwargs)
 
         self.connection = codeconnections.CfnConnection(

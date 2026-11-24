@@ -36,7 +36,9 @@ BASE_ENV = {"CI": "true"}
 def validate_name(kind: str, name: str) -> None:
     """Step names become CodePipeline action and CodeBuild project names."""
     if not name or not all(c.isascii() and (c.isalnum() or c in "-_") for c in name):
-        raise ValueError(f"{kind} name must be ASCII alphanumeric, '-' or '_': {name!r}")
+        raise ValueError(
+            f"{kind} name must be ASCII alphanumeric, '-' or '_': {name!r}"
+        )
 
 
 def compute_type(memory_gb: int) -> codebuild.ComputeType:

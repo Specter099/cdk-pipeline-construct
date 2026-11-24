@@ -95,7 +95,9 @@ def test_no_lambda_unsupported_project_settings(tpl):
         ):
             assert unsupported not in props, f"{logical_id} sets {unsupported}"
         # NO_CACHE is CloudFormation's explicit default; anything else is caching.
-        assert props.get("Cache", {"Type": "NO_CACHE"}) == {"Type": "NO_CACHE"}, logical_id
+        assert props.get("Cache", {"Type": "NO_CACHE"}) == {"Type": "NO_CACHE"}, (
+            logical_id
+        )
 
 
 def test_deploy_stage_is_held_closed_by_default(tpl):
@@ -217,7 +219,10 @@ def test_ci_true_is_set_on_every_project_that_runs_repo_commands(tpl):
     for logical_id, res in projects(tpl).items():
         if "SelfMutation" in logical_id:
             continue  # CDK-managed: only runs `cdk deploy` of the pipeline stack
-        names = {v["Name"]: v["Value"] for v in res["Properties"]["Environment"].get("EnvironmentVariables", [])}
+        names = {
+            v["Name"]: v["Value"]
+            for v in res["Properties"]["Environment"].get("EnvironmentVariables", [])
+        }
         assert names.get("CI") == "true", logical_id
 
 
@@ -353,7 +358,13 @@ def test_deploy_step_mode_has_a_deploy_stage_without_cloudformation_actions():
     t = _step_build()
     (pipe,) = t.find_resources("AWS::CodePipeline::Pipeline").values()
     stages = pipe["Properties"]["Stages"]
-    assert [s["Name"] for s in stages] == ["Source", "Build", "UpdatePipeline", "Gates", "Deploy"]
+    assert [s["Name"] for s in stages] == [
+        "Source",
+        "Build",
+        "UpdatePipeline",
+        "Gates",
+        "Deploy",
+    ]
     deploy = sorted(stages[-1]["Actions"], key=lambda a: a["RunOrder"])
     assert not [a for a in deploy if a["ActionTypeId"]["Provider"] == "CloudFormation"]
     names = [a["Name"] for a in deploy]
@@ -364,14 +375,22 @@ def test_deploy_step_mode_has_a_deploy_stage_without_cloudformation_actions():
 def test_deploy_step_runs_after_approval_and_post_steps_run_after_deploy():
     t = _step_build()
     (pipe,) = t.find_resources("AWS::CodePipeline::Pipeline").values()
-    deploy = {a["Name"]: a["RunOrder"] for a in pipe["Properties"]["Stages"][-1]["Actions"]}
+    deploy = {
+        a["Name"]: a["RunOrder"] for a in pipe["Properties"]["Stages"][-1]["Actions"]
+    }
     assert deploy["Approve-Deploy"] < deploy["Deploy-app"] < deploy["Post-frontend"]
 
 
 def test_deploy_step_mode_holds_the_deploy_closed_by_default():
     (pipe,) = _step_build().find_resources("AWS::CodePipeline::Pipeline").values()
-    assert pipe["Properties"]["DisableInboundStageTransitions"][0]["StageName"] == "Deploy"
-    (pipe,) = _step_build(deploy_enabled=True).find_resources("AWS::CodePipeline::Pipeline").values()
+    assert (
+        pipe["Properties"]["DisableInboundStageTransitions"][0]["StageName"] == "Deploy"
+    )
+    (pipe,) = (
+        _step_build(deploy_enabled=True)
+        .find_resources("AWS::CodePipeline::Pipeline")
+        .values()
+    )
     assert "DisableInboundStageTransitions" not in pipe["Properties"]
 
 
@@ -398,7 +417,9 @@ def test_deploy_step_role_can_only_assume_cdk_bootstrap_roles():
 
 def test_deploy_step_mode_still_all_lambda_compute():
     for logical_id, res in projects(_step_build()).items():
-        assert res["Properties"]["Environment"]["Type"] == "LINUX_LAMBDA_CONTAINER", logical_id
+        assert res["Properties"]["Environment"]["Type"] == "LINUX_LAMBDA_CONTAINER", (
+            logical_id
+        )
 
 
 def test_deploy_step_installs_pinned_cdk_cli():
@@ -443,7 +464,13 @@ def test_pr_base_branch_is_escaped():
     app = cdk.App()
     stack = cdk.Stack(app, "S", env=ENV)
     PullRequestChecks(
-        stack, "X", repo="Specter099/demo", base_branch="release/1.x", connection_arn=CONN, gates=GATES, name_prefix="demo"
+        stack,
+        "X",
+        repo="Specter099/demo",
+        base_branch="release/1.x",
+        connection_arn=CONN,
+        gates=GATES,
+        name_prefix="demo",
     )
     flat = json.dumps(Template.from_stack(stack).to_json())
     assert r"^refs/heads/release/1\\.x$" in flat
@@ -457,13 +484,18 @@ def test_pr_checks_have_an_explicit_fork_pr_approval_policy(tpl):
 
 
 def test_pr_project_roles_only_get_logs_and_the_connection_token(tpl):
-    pr_roles = {r["Properties"]["ServiceRole"]["Fn::GetAtt"][0] for r in _pr_projects(tpl).values()}
+    pr_roles = {
+        r["Properties"]["ServiceRole"]["Fn::GetAtt"][0]
+        for r in _pr_projects(tpl).values()
+    }
     seen = set()
     for pol in tpl.find_resources("AWS::IAM::Policy").values():
         if not {r["Ref"] for r in pol["Properties"]["Roles"]} & pr_roles:
             continue
         for stmt in pol["Properties"]["PolicyDocument"]["Statement"]:
-            actions = stmt["Action"] if isinstance(stmt["Action"], list) else [stmt["Action"]]
+            actions = (
+                stmt["Action"] if isinstance(stmt["Action"], list) else [stmt["Action"]]
+            )
             seen.update(actions)
             if any(a.startswith("codeconnections:") for a in actions):
                 assert stmt["Resource"] == CONN
@@ -491,7 +523,9 @@ def test_node_checksum_is_committed_not_downloaded():
     from specter_pipeline.runtimes import NODE_LINUX_X64_SHA256, node_tarball_prelude
 
     commands = "\n".join(node_tarball_prelude("v22.22.0"))
-    assert "SHASUMS256" not in commands, "checksum must not come from the tarball's origin"
+    assert "SHASUMS256" not in commands, (
+        "checksum must not come from the tarball's origin"
+    )
     assert NODE_LINUX_X64_SHA256["v22.22.0"] in commands
     assert commands.index("sha256sum -c") < commands.index("tar -xzf")
     with pytest.raises(ValueError, match="no committed SHA-256"):
@@ -519,12 +553,19 @@ def test_node_runtime_deploy_step_can_run_the_cli():
 
 @pytest.mark.parametrize(
     "repo,expected",
-    [("Specter099/MyRepo", "myrepo-pipeline"), ("Specter099/my.site", "my-site-pipeline")],
+    [
+        ("Specter099/MyRepo", "myrepo-pipeline"),
+        ("Specter099/my.site", "my-site-pipeline"),
+    ],
 )
 def test_bucket_purpose_is_lowercased_and_dots_become_hyphens(repo, expected):
     assert artifact_bucket_purpose(repo.split("/")[1]) == expected
     t = build(repo=repo)
-    (bucket,) = [r for r in t.find_resources("AWS::S3::Bucket").values() if "BucketName" in r["Properties"]]
+    (bucket,) = [
+        r
+        for r in t.find_resources("AWS::S3::Bucket").values()
+        if "BucketName" in r["Properties"]
+    ]
     assert expected in json.dumps(bucket["Properties"]["BucketName"])
 
 
@@ -551,6 +592,25 @@ def test_duplicate_post_deploy_names_rejected_with_a_clear_error():
 
 def test_notification_emails_are_subscribed_and_topic_has_no_kms_key():
     t = build(notification_emails=["ops@example.com"])
-    t.has_resource_properties("AWS::SNS::Subscription", {"Protocol": "email", "Endpoint": "ops@example.com"})
+    t.has_resource_properties(
+        "AWS::SNS::Subscription", {"Protocol": "email", "Endpoint": "ops@example.com"}
+    )
     (topic,) = t.find_resources("AWS::SNS::Topic").values()
-    assert "KmsMasterKeyId" not in topic.get("Properties", {}), "AWS-managed SNS key breaks CodeStar notifications"
+    assert "KmsMasterKeyId" not in topic.get("Properties", {}), (
+        "AWS-managed SNS key breaks CodeStar notifications"
+    )
+
+
+def test_python_prelude_gives_jsii_a_private_package_cache():
+    """On Lambda compute HOME=/tmp and jsii rejects the default /tmp/.cache; without this
+    `import aws_cdk` fails (seen on live Lambda compute)."""
+    from specter_pipeline.runtimes import prelude
+
+    for runtime in (Runtime.PYTHON, Runtime.PYTHON_NODE):
+        commands = prelude(runtime)
+        assert "mkdir -m 700 -p /tmp/jsii-cache" in commands
+        assert "export JSII_RUNTIME_PACKAGE_CACHE_ROOT=/tmp/jsii-cache" in commands
+        assert commands.index("mkdir -m 700 -p /tmp/jsii-cache") < commands.index(
+            "python3 -m venv /tmp/venv"
+        )
+    assert not any("jsii" in c for c in prelude(Runtime.NODE))

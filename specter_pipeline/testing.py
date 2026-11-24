@@ -247,7 +247,7 @@ def assert_pr_checks(
     """One webhook project per gate, matching PRs into ``base_branch`` only."""
     found = pr_projects(template, name_prefix)
     assert {r["Properties"]["Name"] for r in found.values()} == {
-        f"{name_prefix}-pr-{g.name}" for g in gates
+        f"{name_prefix}-pr-{g.name}" for g in gates if g.runs_on_pull_requests
     }, "PR check projects differ from the gates"
     for res in found.values():
         props = res["Properties"]
@@ -306,6 +306,12 @@ def assert_gates_have_node(gates: Sequence[Gate], names: Iterable[str]) -> None:
         assert by_name[name].runtime in (Runtime.PYTHON_NODE, Runtime.NODE), (
             f"gate {name!r} needs Node but runs on {by_name[name].runtime}"
         )
+
+
+#: Wildcard grants CDK Pipelines itself puts on the self-mutation role (it must describe the
+#: pipeline stack it deploys and list the bootstrap bucket). They are the framework's, not ours;
+#: any OTHER wildcard still fails. Measured on a synthesized pipeline: exactly these two.
+CDK_INTERNAL_WILDCARDS = frozenset({"cloudformation:DescribeStacks", "s3:ListBucket"})
 
 
 def assert_no_wildcard_resources(
@@ -369,6 +375,7 @@ def assert_standard_contract(
 
 
 __all__ = [
+    "CDK_INTERNAL_WILDCARDS",
     "assert_artifact_bucket",
     "assert_ci_env_on_repo_command_projects",
     "assert_deploy_closed",

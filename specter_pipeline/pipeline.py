@@ -203,6 +203,7 @@ class StandardPipeline(Construct):
                     prelude(gate.runtime, node_version), gate.install, gate.commands
                 ),
                 env=gate.environment,
+                role_policy_statements=list(gate.policy_statements),
                 build_environment=_environment(gate.runtime, gate.memory_gb),
             )
             for gate in gates
@@ -307,7 +308,7 @@ class StandardPipeline(Construct):
                 repo=repo,
                 base_branch=branch,
                 connection_arn=connection_arn,
-                gates=gates,
+                gates=[g for g in gates if g.runs_on_pull_requests],
                 name_prefix=name,
                 node_version=node_version,
             )

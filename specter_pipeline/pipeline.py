@@ -25,12 +25,13 @@ from typing import Optional, Sequence
 import aws_cdk as cdk
 from aws_cdk import aws_codebuild as codebuild
 from aws_cdk import aws_codepipeline as codepipeline
+from aws_cdk import aws_iam as iam
 from aws_cdk import aws_s3 as s3
 from aws_cdk import aws_sns as sns
 from aws_cdk import pipelines
 from constructs import Construct
 
-from .gate import BASE_ENV, Gate, PostDeployStep, compute_type
+from .gate import BASE_ENV, DeployStep, Gate, PostDeployStep, compute_type
 from .pull_request import PullRequestChecks
 from .runtimes import (
     DEFAULT_CDK_CLI_VERSION,
@@ -40,6 +41,10 @@ from .runtimes import (
     join,
     prelude,
 )
+
+#: Pipeline stage name used when deploying through a ``DeployStep`` (with an
+#: ``application_stage`` the stage's own name is used instead).
+DEPLOY_WAVE = "Deploy"
 
 # S3 bucket names are max 63 chars: purpose + "-" + 12 (account) + "-" + <=14
 # (longest region, ap-southeast-N) + "-an".
@@ -70,8 +75,10 @@ class StandardPipeline(Construct):
         *,
         repo: str,
         connection_arn: str,
-        application_stage: cdk.Stage,
         gates: Sequence[Gate],
+        application_stage: Optional[cdk.Stage] = None,
+        deploy_step: Optional[DeployStep] = None,
+        bootstrap_qualifier: str = "hnb659fds",
         synth_commands: Sequence[str],
         synth_install: Sequence[str] = (),
         synth_env: Optional[dict[str, str]] = None,
@@ -95,7 +102,12 @@ class StandardPipeline(Construct):
         if len({g.name for g in gates}) != len(gates):
             raise ValueError("gate names must be unique")
 
-        deploy_stage_name = application_stage.stage_name
+        if (application_stage is None) == (deploy_step is None):
+            raise ValueError("provide exactly one of application_stage or deploy_step")
+
+        deploy_stage_name = (
+            application_stage.stage_name if application_stage else DEPLOY_WAVE
+        )
 
         # --- artifact bucket (explicit, account-namespaced name) -------------
         self.artifact_bucket = s3.Bucket(
@@ -197,7 +209,45 @@ class StandardPipeline(Construct):
             )
             for step in post_deploy
         ]
-        self.pipeline.add_stage(application_stage, pre=pre, post=post)
+        if application_stage is not None:
+            self.pipeline.add_stage(application_stage, pre=pre, post=post)
+        else:
+            assert deploy_step is not None
+            deploy = pipelines.CodeBuildStep(
+                f"Deploy-{deploy_step.name}",
+                input=source,
+                commands=join(
+                    prelude(deploy_step.runtime, node_version),
+                    cdk_cli_install(cdk_cli_version),
+                    deploy_step.install,
+                    deploy_step.commands,
+                ),
+                env=deploy_step.environment,
+                role_policy_statements=[
+                    # `cdk deploy` assumes the CDK bootstrap roles (deploy,
+                    # file/image publishing, lookup); nothing else.
+                    iam.PolicyStatement(
+                        actions=["sts:AssumeRole"],
+                        resources=[
+                            f"arn:aws:iam::{cdk.Aws.ACCOUNT_ID}:role/"
+                            f"cdk-{bootstrap_qualifier}-*-role-{cdk.Aws.ACCOUNT_ID}-{cdk.Aws.REGION}"
+                        ],
+                    ),
+                    *deploy_step.policy_statements,
+                ],
+                build_environment=_environment(
+                    deploy_step.runtime, deploy_step.memory_gb
+                ),
+            )
+            # In a wave with no stacks, `pre` and `post` steps are NOT ordered
+            # by position alone: without these dependencies the approval and
+            # the deploy get the same RunOrder and run in parallel, i.e. the
+            # deploy would not wait for approval. Make the order explicit.
+            for approval in pre:
+                deploy.add_step_dependency(approval)
+            for step in post:
+                step.add_step_dependency(deploy)
+            self.pipeline.add_wave(DEPLOY_WAVE, pre=pre, post=[deploy, *post])
 
         self.pipeline.build_pipeline()
 

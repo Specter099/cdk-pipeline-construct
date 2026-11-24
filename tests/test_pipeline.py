@@ -341,3 +341,82 @@ def _buildspec_containing(t: Template, needle: str) -> str:
             parsed = json.loads(spec) if isinstance(spec, str) else spec
             return "\n".join(parsed["phases"]["build"]["commands"])
     raise AssertionError(f"no buildspec contains {needle!r}")
+
+
+# --- deploy_step mode (existing stack deployed by the repo's own command) --------
+
+
+def _step_build(**overrides) -> Template:
+    from specter_pipeline import DeployStep
+
+    return build(
+        application_stage=None,
+        deploy_step=DeployStep("app", ["cdk deploy AppStack --require-approval never"]),
+        **overrides,
+    )
+
+
+def test_deploy_step_mode_has_a_deploy_stage_without_cloudformation_actions():
+    t = _step_build()
+    (pipe,) = t.find_resources("AWS::CodePipeline::Pipeline").values()
+    stages = pipe["Properties"]["Stages"]
+    assert [s["Name"] for s in stages] == ["Source", "Build", "UpdatePipeline", "Gates", "Deploy"]
+    deploy = sorted(stages[-1]["Actions"], key=lambda a: a["RunOrder"])
+    assert not [a for a in deploy if a["ActionTypeId"]["Provider"] == "CloudFormation"]
+    names = [a["Name"] for a in deploy]
+    assert names.index("Approve-Deploy") < names.index("Deploy-app")
+    assert deploy[0]["ActionTypeId"]["Category"] == "Approval"
+
+
+def test_deploy_step_runs_after_approval_and_post_steps_run_after_deploy():
+    t = _step_build()
+    (pipe,) = t.find_resources("AWS::CodePipeline::Pipeline").values()
+    deploy = {a["Name"]: a["RunOrder"] for a in pipe["Properties"]["Stages"][-1]["Actions"]}
+    assert deploy["Approve-Deploy"] < deploy["Deploy-app"] < deploy["Post-frontend"]
+
+
+def test_deploy_step_mode_holds_the_deploy_closed_by_default():
+    (pipe,) = _step_build().find_resources("AWS::CodePipeline::Pipeline").values()
+    assert pipe["Properties"]["DisableInboundStageTransitions"][0]["StageName"] == "Deploy"
+    (pipe,) = _step_build(deploy_enabled=True).find_resources("AWS::CodePipeline::Pipeline").values()
+    assert "DisableInboundStageTransitions" not in pipe["Properties"]
+
+
+def test_deploy_step_role_can_only_assume_cdk_bootstrap_roles():
+    t = _step_build()
+    deploy_policies = [
+        p
+        for p in t.find_resources("AWS::IAM::Policy").values()
+        if "Deploy" in json.dumps(p["Properties"]["Roles"])
+    ]
+    assert deploy_policies
+    assumes = [
+        s
+        for p in deploy_policies
+        for s in p["Properties"]["PolicyDocument"]["Statement"]
+        if s["Action"] == "sts:AssumeRole"
+    ]
+    assert assumes, "deploy step has no sts:AssumeRole statement"
+    for stmt in assumes:
+        resource = json.dumps(stmt["Resource"])
+        assert "role/cdk-hnb659fds-" in resource and "-role-" in resource
+        assert stmt["Resource"] != "*"
+
+
+def test_deploy_step_mode_still_all_lambda_compute():
+    for logical_id, res in projects(_step_build()).items():
+        assert res["Properties"]["Environment"]["Type"] == "LINUX_LAMBDA_CONTAINER", logical_id
+
+
+def test_deploy_step_installs_pinned_cdk_cli():
+    spec = _buildspec_containing(_step_build(), "cdk deploy AppStack")
+    assert "aws-cdk@2.1149.0" in spec
+
+
+def test_exactly_one_of_stage_or_deploy_step_is_required():
+    from specter_pipeline import DeployStep
+
+    with pytest.raises(ValueError, match="exactly one"):
+        build(application_stage=None)
+    with pytest.raises(ValueError, match="exactly one"):
+        build(deploy_step=DeployStep("app", ["x"]))

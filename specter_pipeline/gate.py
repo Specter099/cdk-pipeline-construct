@@ -66,6 +66,39 @@ class Gate:
 
 
 @dataclasses.dataclass(frozen=True)
+class DeployStep:
+    """Deploy the application by running the repo's own deploy command.
+
+    Use this instead of ``application_stage`` for a stack that is already live.
+    Wrapping an existing stack in a CDK Pipelines ``Stage`` changes the
+    construct path that Lambda permissions and event-source mappings embed in
+    their logical IDs, so CloudFormation would delete and recreate them on the
+    first deploy. Running ``cdk deploy <stack>`` from the repo's own app keeps
+    every logical ID exactly as it is.
+
+    The step's role must be allowed to assume the CDK bootstrap roles (the
+    construct grants ``sts:AssumeRole`` on ``cdk-*`` roles for this account).
+    """
+
+    name: str
+    commands: Sequence[str]
+    runtime: Runtime = Runtime.PYTHON_NODE
+    install: Sequence[str] = ()
+    env: Mapping[str, str] = dataclasses.field(default_factory=dict)
+    memory_gb: int = 4
+    policy_statements: Sequence[iam.PolicyStatement] = ()
+
+    def __post_init__(self) -> None:
+        if not self.commands:
+            raise ValueError(f"deploy step {self.name!r} has no commands")
+        compute_type(self.memory_gb)
+
+    @property
+    def environment(self) -> dict[str, str]:
+        return {**BASE_ENV, **self.env}
+
+
+@dataclasses.dataclass(frozen=True)
 class PostDeployStep:
     """A step that runs after the application stage deploys successfully."""
 

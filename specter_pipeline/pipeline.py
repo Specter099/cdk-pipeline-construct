@@ -1,0 +1,237 @@
+"""StandardPipeline: the shared CI/CD pipeline every Specter099 repo uses.
+
+Shape (main branch only; PRs are handled by ``PullRequestChecks``)::
+
+    Source (CodeConnections)  ->  Build (synth)  ->  UpdatePipeline (self-mutate)
+        ->  Gates (all checks, in parallel)
+        ->  <Stage> (manual approval -> deploy the application -> post-deploy steps)
+
+Design rules baked in:
+
+* Every CodeBuild project -- including CDK Pipelines' own synth, self-mutation
+  and asset-publishing projects -- runs on Lambda compute.
+* The deploy stage can be held closed from the pipeline's own template
+  (``deploy_enabled=False`` => ``DisableInboundStageTransitions``), so the very
+  first execution, which starts as soon as the pipeline is created, cannot
+  deploy. Flip it in code (reviewed, and re-applied by self-mutation) rather
+  than with a one-off API call that the next self-mutation would undo.
+* The artifact bucket has an explicit ``{purpose}-{account}-{region}-an`` name.
+"""
+
+from __future__ import annotations
+
+from typing import Optional, Sequence
+
+import aws_cdk as cdk
+from aws_cdk import aws_codebuild as codebuild
+from aws_cdk import aws_codepipeline as codepipeline
+from aws_cdk import aws_s3 as s3
+from aws_cdk import aws_sns as sns
+from aws_cdk import pipelines
+from constructs import Construct
+
+from .gate import BASE_ENV, Gate, PostDeployStep, compute_type
+from .pull_request import PullRequestChecks
+from .runtimes import (
+    DEFAULT_CDK_CLI_VERSION,
+    DEFAULT_NODE_VERSION,
+    Runtime,
+    cdk_cli_install,
+    join,
+    prelude,
+)
+
+# S3 bucket names are max 63 chars: purpose + "-" + 12 (account) + "-" + <=14
+# (longest region, ap-southeast-N) + "-an".
+_MAX_PURPOSE_LEN = 63 - len("-an") - 1 - 14 - 1 - 12
+
+
+def artifact_bucket_purpose(name: str) -> str:
+    purpose = f"{name}-pipeline"
+    if len(purpose) > _MAX_PURPOSE_LEN:
+        raise ValueError(
+            f"pipeline name {name!r} is too long for the artifact bucket naming pattern "
+            f"({len(purpose)} > {_MAX_PURPOSE_LEN} chars)"
+        )
+    return purpose
+
+
+def _environment(runtime: Runtime, memory_gb: int) -> codebuild.BuildEnvironment:
+    return codebuild.BuildEnvironment(
+        build_image=runtime.image, compute_type=compute_type(memory_gb)
+    )
+
+
+class StandardPipeline(Construct):
+    def __init__(
+        self,
+        scope: Construct,
+        construct_id: str,
+        *,
+        repo: str,
+        connection_arn: str,
+        application_stage: cdk.Stage,
+        gates: Sequence[Gate],
+        synth_commands: Sequence[str],
+        synth_install: Sequence[str] = (),
+        synth_env: Optional[dict[str, str]] = None,
+        branch: str = "main",
+        post_deploy: Sequence[PostDeployStep] = (),
+        deploy_enabled: bool = False,
+        require_approval: bool = True,
+        pull_request_checks: bool = True,
+        synth_output_dir: str = "cdk.out",
+        synth_memory_gb: int = 4,
+        cdk_cli_version: str = DEFAULT_CDK_CLI_VERSION,
+        node_version: str = DEFAULT_NODE_VERSION,
+    ) -> None:
+        super().__init__(scope, construct_id)
+
+        owner, _, name = repo.partition("/")
+        if not owner or not name:
+            raise ValueError(f"repo must be 'owner/name', got {repo!r}")
+        if not gates:
+            raise ValueError("at least one gate is required")
+        if len({g.name for g in gates}) != len(gates):
+            raise ValueError("gate names must be unique")
+
+        deploy_stage_name = application_stage.stage_name
+
+        # --- artifact bucket (explicit, account-namespaced name) -------------
+        self.artifact_bucket = s3.Bucket(
+            self,
+            "Artifacts",
+            bucket_name=f"{artifact_bucket_purpose(name)}-{cdk.Aws.ACCOUNT_ID}-{cdk.Aws.REGION}-an",
+            encryption=s3.BucketEncryption.S3_MANAGED,
+            enforce_ssl=True,
+            block_public_access=s3.BlockPublicAccess.BLOCK_ALL,
+            versioned=True,
+            lifecycle_rules=[
+                s3.LifecycleRule(
+                    expiration=cdk.Duration.days(30),
+                    noncurrent_version_expiration=cdk.Duration.days(7),
+                )
+            ],
+            removal_policy=cdk.RemovalPolicy.RETAIN,
+        )
+
+        # --- source ----------------------------------------------------------
+        source = pipelines.CodePipelineSource.connection(
+            repo, branch, connection_arn=connection_arn, trigger_on_push=True
+        )
+
+        # --- synth (needs Python for the app and Node for the CDK CLI) -------
+        synth = pipelines.CodeBuildStep(
+            "Synth",
+            input=source,
+            commands=join(
+                prelude(Runtime.PYTHON_NODE, node_version),
+                cdk_cli_install(cdk_cli_version),
+                synth_install,
+                synth_commands,
+            ),
+            env={**BASE_ENV, **(synth_env or {})},
+            primary_output_directory=synth_output_dir,
+            build_environment=_environment(Runtime.PYTHON, synth_memory_gb),
+        )
+
+        # CDK Pipelines' own projects default to EC2 compute; pin them all.
+        node_small = pipelines.CodeBuildOptions(
+            build_environment=_environment(Runtime.NODE, 2)
+        )
+
+        cp_pipeline = codepipeline.Pipeline(
+            self,
+            "CodePipeline",
+            pipeline_name=f"{name}-pipeline",
+            pipeline_type=codepipeline.PipelineType.V2,
+            artifact_bucket=self.artifact_bucket,
+            restart_execution_on_update=False,
+        )
+
+        self.pipeline = pipelines.CodePipeline(
+            self,
+            "Pipeline",
+            code_pipeline=cp_pipeline,
+            synth=synth,
+            cli_version=cdk_cli_version,
+            code_build_defaults=node_small,
+            synth_code_build_defaults=node_small,
+            self_mutation_code_build_defaults=node_small,
+            asset_publishing_code_build_defaults=node_small,
+            docker_enabled_for_synth=False,
+            docker_enabled_for_self_mutation=False,
+            use_change_sets=True,
+        )
+
+        # --- gates: all run in parallel after the pipeline updates itself ----
+        gate_steps = [
+            pipelines.CodeBuildStep(
+                f"Gate-{gate.name}",
+                input=source,
+                commands=join(
+                    prelude(gate.runtime, node_version), gate.install, gate.commands
+                ),
+                env=gate.environment,
+                build_environment=_environment(gate.runtime, gate.memory_gb),
+            )
+            for gate in gates
+        ]
+        self.pipeline.add_wave("Gates", post=gate_steps)
+
+        # --- deploy stage: approval -> deploy -> post-deploy -----------------
+        pre: list[pipelines.Step] = []
+        if require_approval:
+            pre.append(pipelines.ManualApprovalStep(f"Approve-{deploy_stage_name}"))
+
+        post: list[pipelines.Step] = [
+            pipelines.CodeBuildStep(
+                f"Post-{step.name}",
+                input=source,
+                commands=join(
+                    prelude(step.runtime, node_version), step.install, step.commands
+                ),
+                env=step.environment,
+                role_policy_statements=list(step.policy_statements),
+                build_environment=_environment(step.runtime, step.memory_gb),
+            )
+            for step in post_deploy
+        ]
+        self.pipeline.add_stage(application_stage, pre=pre, post=post)
+
+        self.pipeline.build_pipeline()
+
+        # --- hold the deploy stage closed unless explicitly enabled ----------
+        if not deploy_enabled:
+            cfn_pipeline = cp_pipeline.node.default_child
+            cfn_pipeline.add_property_override(
+                "DisableInboundStageTransitions",
+                [
+                    {
+                        "StageName": deploy_stage_name,
+                        "Reason": "Deploy disabled in pipeline definition (deploy_enabled=False)",
+                    }
+                ],
+            )
+
+        # --- failure notifications ------------------------------------------
+        self.notification_topic = sns.Topic(self, "Notifications", enforce_ssl=True)
+        cp_pipeline.notify_on(
+            "Failed",
+            self.notification_topic,
+            events=[codepipeline.PipelineNotificationEvents.PIPELINE_EXECUTION_FAILED],
+        )
+
+        # --- PR validation (separate, deploy-less path) ----------------------
+        self.pull_request_checks: Optional[PullRequestChecks] = None
+        if pull_request_checks:
+            self.pull_request_checks = PullRequestChecks(
+                self,
+                "PullRequestChecks",
+                repo=repo,
+                base_branch=branch,
+                connection_arn=connection_arn,
+                gates=gates,
+                name_prefix=name,
+                node_version=node_version,
+            )

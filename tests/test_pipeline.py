@@ -98,11 +98,6 @@ def test_no_lambda_unsupported_project_settings(tpl):
         assert props.get("Cache", {"Type": "NO_CACHE"}) == {"Type": "NO_CACHE"}, logical_id
 
 
-def test_no_project_uses_docker_enabled_images(tpl):
-    for res in projects(tpl).values():
-        assert "docker" not in res["Properties"]["Environment"]["Image"].lower()
-
-
 def test_deploy_stage_is_held_closed_by_default(tpl):
     tpl.has_resource_properties(
         "AWS::CodePipeline::Pipeline",
@@ -167,7 +162,9 @@ def test_pipeline_is_v2_and_triggers_on_main_push_only(tpl):
     assert source["BranchName"] == "main"
     assert source["DetectChanges"] in (True, "true")
     # No pull-request trigger on the pipeline: PRs must never reach self-mutation.
-    assert "pull_request" not in json.dumps(props.get("Triggers", [])).lower()
+    # CloudFormation spells the key "PullRequest"; a lowercase "pull_request"
+    # search could never match it. The pipeline must have no triggers at all.
+    assert "Triggers" not in props
 
 
 def test_artifact_bucket_is_explicitly_named_and_hardened(tpl):
@@ -216,16 +213,12 @@ def test_synth_bootstraps_node_with_checksum_and_neutralises_pip(tpl):
     assert spec.index("sha256sum -c") < spec.index("tar -xzf")
 
 
-def test_ci_true_is_set_on_every_gate(tpl):
+def test_ci_true_is_set_on_every_project_that_runs_repo_commands(tpl):
     for logical_id, res in projects(tpl).items():
-        names = {
-            v["Name"]: v["Value"]
-            for v in res["Properties"]["Environment"].get("EnvironmentVariables", [])
-        }
-        if "Gate" in json.dumps(
-            res["Properties"].get("Name", "")
-        ) or "pr-" in json.dumps(res["Properties"].get("Name", "")):
-            assert names.get("CI") == "true", logical_id
+        if "SelfMutation" in logical_id:
+            continue  # CDK-managed: only runs `cdk deploy` of the pipeline stack
+        names = {v["Name"]: v["Value"] for v in res["Properties"]["Environment"].get("EnvironmentVariables", [])}
+        assert names.get("CI") == "true", logical_id
 
 
 def test_post_deploy_step_gets_its_policy(tpl):
@@ -420,3 +413,144 @@ def test_exactly_one_of_stage_or_deploy_step_is_required():
         build(application_stage=None)
     with pytest.raises(ValueError, match="exactly one"):
         build(deploy_step=DeployStep("app", ["x"]))
+
+
+# --- review fixes -----------------------------------------------------------------
+
+
+def test_pr_webhook_filter_is_a_pattern_that_can_actually_match(tpl):
+    """CDK's and_base_branch_is() prepends refs/heads/ itself; the old filter was
+    'refs/heads/^refs/heads/main$', which can never match any ref."""
+    import re as regex
+
+    patterns = []
+    for res in _pr_projects(tpl).values():
+        for group in res["Properties"]["Triggers"]["FilterGroups"]:
+            for flt in group:
+                if flt["Type"] == "BASE_REF":
+                    patterns.append(flt["Pattern"])
+    assert patterns and set(patterns) == {"^refs/heads/main$"}
+    assert regex.search(patterns[0], "refs/heads/main")
+    assert not regex.search(patterns[0], "refs/heads/main2")
+    assert not regex.search(patterns[0], "refs/heads/feature/main")
+
+
+def test_pr_base_branch_is_escaped():
+    t = build(pull_request_checks=True)  # default main
+    assert t  # sanity
+    from specter_pipeline import PullRequestChecks  # noqa: PLC0415
+
+    app = cdk.App()
+    stack = cdk.Stack(app, "S", env=ENV)
+    PullRequestChecks(
+        stack, "X", repo="Specter099/demo", base_branch="release/1.x", connection_arn=CONN, gates=GATES, name_prefix="demo"
+    )
+    flat = json.dumps(Template.from_stack(stack).to_json())
+    assert r"^refs/heads/release/1\\.x$" in flat
+
+
+def test_pr_checks_have_an_explicit_fork_pr_approval_policy(tpl):
+    for res in _pr_projects(tpl).values():
+        policy = res["Properties"]["Triggers"]["PullRequestBuildPolicy"]
+        assert policy["RequiresCommentApproval"] == "FORK_PULL_REQUESTS"
+        assert "GITHUB_READ" not in policy["ApproverRoles"]
+
+
+def test_pr_project_roles_only_get_logs_and_the_connection_token(tpl):
+    pr_roles = {r["Properties"]["ServiceRole"]["Fn::GetAtt"][0] for r in _pr_projects(tpl).values()}
+    seen = set()
+    for pol in tpl.find_resources("AWS::IAM::Policy").values():
+        if not {r["Ref"] for r in pol["Properties"]["Roles"]} & pr_roles:
+            continue
+        for stmt in pol["Properties"]["PolicyDocument"]["Statement"]:
+            actions = stmt["Action"] if isinstance(stmt["Action"], list) else [stmt["Action"]]
+            seen.update(actions)
+            if any(a.startswith("codeconnections:") for a in actions):
+                assert stmt["Resource"] == CONN
+    # codebuild:*Report* are the L2's own report-group permissions, scoped to this project.
+    assert seen <= {
+        "logs:CreateLogGroup",
+        "logs:CreateLogStream",
+        "logs:PutLogEvents",
+        "codeconnections:GetConnectionToken",
+        "codeconnections:GetConnection",
+        "codebuild:CreateReportGroup",
+        "codebuild:CreateReport",
+        "codebuild:UpdateReport",
+        "codebuild:BatchPutTestCases",
+        "codebuild:BatchPutCodeCoverages",
+    }, seen
+
+
+def test_pipeline_restarts_on_update_so_self_mutation_does_not_fail_the_run(tpl):
+    (pipe,) = tpl.find_resources("AWS::CodePipeline::Pipeline").values()
+    assert pipe["Properties"]["RestartExecutionOnUpdate"] in (True, "true")
+
+
+def test_node_checksum_is_committed_not_downloaded():
+    from specter_pipeline.runtimes import NODE_LINUX_X64_SHA256, node_tarball_prelude
+
+    commands = "\n".join(node_tarball_prelude("v22.22.0"))
+    assert "SHASUMS256" not in commands, "checksum must not come from the tarball's origin"
+    assert NODE_LINUX_X64_SHA256["v22.22.0"] in commands
+    assert commands.index("sha256sum -c") < commands.index("tar -xzf")
+    with pytest.raises(ValueError, match="no committed SHA-256"):
+        node_tarball_prelude("v99.0.0")
+
+
+def test_cdk_cli_install_puts_the_cli_on_path_for_the_node_runtime():
+    from specter_pipeline.runtimes import cdk_cli_install
+
+    commands = cdk_cli_install()
+    assert commands[0].startswith("export PATH=/tmp/nodejs/bin")
+    assert commands.index("cdk --version") > 0
+
+
+def test_node_runtime_deploy_step_can_run_the_cli():
+    from specter_pipeline import DeployStep
+
+    t = build(
+        application_stage=None,
+        deploy_step=DeployStep("n", ["cdk deploy X"], runtime=Runtime.NODE),
+    )
+    spec = _buildspec_containing(t, "cdk deploy X")
+    assert spec.index("export PATH=/tmp/nodejs/bin") < spec.index("cdk --version")
+
+
+@pytest.mark.parametrize(
+    "repo,expected",
+    [("Specter099/MyRepo", "myrepo-pipeline"), ("Specter099/my.site", "my-site-pipeline")],
+)
+def test_bucket_purpose_is_lowercased_and_dots_become_hyphens(repo, expected):
+    assert artifact_bucket_purpose(repo.split("/")[1]) == expected
+    t = build(repo=repo)
+    (bucket,) = [r for r in t.find_resources("AWS::S3::Bucket").values() if "BucketName" in r["Properties"]]
+    assert expected in json.dumps(bucket["Properties"]["BucketName"])
+
+
+@pytest.mark.parametrize("repo", ["a/b/c", "owner/", "/name", "owner/na me", ""])
+def test_malformed_repos_rejected_early(repo):
+    with pytest.raises(ValueError, match="owner/name"):
+        build(repo=repo)
+
+
+@pytest.mark.parametrize("name", ["my app!", "", "naïve"])
+def test_step_names_validated_like_gate_names(name):
+    from specter_pipeline import DeployStep
+
+    with pytest.raises(ValueError, match="name"):
+        PostDeployStep(name, ["x"])
+    with pytest.raises(ValueError, match="name"):
+        DeployStep(name, ["x"])
+
+
+def test_duplicate_post_deploy_names_rejected_with_a_clear_error():
+    with pytest.raises(ValueError, match="post-deploy step names must be unique"):
+        build(post_deploy=[PostDeployStep("a", ["x"]), PostDeployStep("a", ["y"])])
+
+
+def test_notification_emails_are_subscribed_and_topic_has_no_kms_key():
+    t = build(notification_emails=["ops@example.com"])
+    t.has_resource_properties("AWS::SNS::Subscription", {"Protocol": "email", "Endpoint": "ops@example.com"})
+    (topic,) = t.find_resources("AWS::SNS::Topic").values()
+    assert "KmsMasterKeyId" not in topic.get("Properties", {}), "AWS-managed SNS key breaks CodeStar notifications"

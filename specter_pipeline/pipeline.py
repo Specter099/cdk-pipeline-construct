@@ -13,13 +13,16 @@ Design rules baked in:
 * The deploy stage can be held closed from the pipeline's own template
   (``deploy_enabled=False`` => ``DisableInboundStageTransitions``), so the very
   first execution, which starts as soon as the pipeline is created, cannot
-  deploy. Flip it in code (reviewed, and re-applied by self-mutation) rather
-  than with a one-off API call that the next self-mutation would undo.
+  deploy. Flip it in code via a reviewed change rather than in the console, so
+  the pipeline's definition and its live state cannot disagree. (CloudFormation
+  only acts on a property *diff*, so a manual console change is not reliably
+  reverted by a later no-change update.)
 * The artifact bucket has an explicit ``{purpose}-{account}-{region}-an`` name.
 """
 
 from __future__ import annotations
 
+import re
 from typing import Optional, Sequence
 
 import aws_cdk as cdk
@@ -28,6 +31,7 @@ from aws_cdk import aws_codepipeline as codepipeline
 from aws_cdk import aws_iam as iam
 from aws_cdk import aws_s3 as s3
 from aws_cdk import aws_sns as sns
+from aws_cdk import aws_sns_subscriptions as subscriptions
 from aws_cdk import pipelines
 from constructs import Construct
 
@@ -52,7 +56,10 @@ _MAX_PURPOSE_LEN = 63 - len("-an") - 1 - 14 - 1 - 12
 
 
 def artifact_bucket_purpose(name: str) -> str:
-    purpose = f"{name}-pipeline"
+    # House rule: replace dots with hyphens. S3 bucket names are lowercase.
+    purpose = f"{name.lower().replace('.', '-')}-pipeline"
+    if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", purpose):
+        raise ValueError(f"pipeline name {name!r} cannot form a valid S3 bucket name")
     if len(purpose) > _MAX_PURPOSE_LEN:
         raise ValueError(
             f"pipeline name {name!r} is too long for the artifact bucket naming pattern "
@@ -85,6 +92,7 @@ class StandardPipeline(Construct):
         branch: str = "main",
         post_deploy: Sequence[PostDeployStep] = (),
         deploy_enabled: bool = False,
+        notification_emails: Sequence[str] = (),
         require_approval: bool = True,
         pull_request_checks: bool = True,
         synth_output_dir: str = "cdk.out",
@@ -94,13 +102,15 @@ class StandardPipeline(Construct):
     ) -> None:
         super().__init__(scope, construct_id)
 
-        owner, _, name = repo.partition("/")
-        if not owner or not name:
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo):
             raise ValueError(f"repo must be 'owner/name', got {repo!r}")
+        owner, _, name = repo.partition("/")
         if not gates:
             raise ValueError("at least one gate is required")
         if len({g.name for g in gates}) != len(gates):
             raise ValueError("gate names must be unique")
+        if len({p.name for p in post_deploy}) != len(post_deploy):
+            raise ValueError("post-deploy step names must be unique")
 
         if (application_stage is None) == (deploy_step is None):
             raise ValueError("provide exactly one of application_stage or deploy_step")
@@ -158,7 +168,10 @@ class StandardPipeline(Construct):
             pipeline_name=f"{name}-pipeline",
             pipeline_type=codepipeline.PipelineType.V2,
             artifact_bucket=self.artifact_bucket,
-            restart_execution_on_update=False,
+            # CodePipeline otherwise fails the running execution when the pipeline is
+            # updated (self-mutation does exactly that), so a commit that changes the
+            # pipeline would end "failed" at UpdatePipeline and never be deployed.
+            restart_execution_on_update=True,
         )
 
         self.pipeline = pipelines.CodePipeline(
@@ -265,7 +278,13 @@ class StandardPipeline(Construct):
             )
 
         # --- failure notifications ------------------------------------------
+        # Not KMS-encrypted on purpose: CodeStar Notifications cannot publish to a
+        # topic encrypted with the AWS-managed SNS key.
         self.notification_topic = sns.Topic(self, "Notifications", enforce_ssl=True)
+        for email in notification_emails:
+            self.notification_topic.add_subscription(
+                subscriptions.EmailSubscription(email)
+            )
         cp_pipeline.notify_on(
             "Failed",
             self.notification_topic,

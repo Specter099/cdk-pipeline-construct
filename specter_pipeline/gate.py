@@ -33,6 +33,12 @@ _COMPUTE = {
 BASE_ENV = {"CI": "true"}
 
 
+def validate_name(kind: str, name: str) -> None:
+    """Step names become CodePipeline action and CodeBuild project names."""
+    if not name or not all(c.isascii() and (c.isalnum() or c in "-_") for c in name):
+        raise ValueError(f"{kind} name must be ASCII alphanumeric, '-' or '_': {name!r}")
+
+
 def compute_type(memory_gb: int) -> codebuild.ComputeType:
     try:
         return _COMPUTE[memory_gb]
@@ -54,8 +60,7 @@ class Gate:
     memory_gb: int = 2
 
     def __post_init__(self) -> None:
-        if not self.name or not all(c.isalnum() or c in "-_" for c in self.name):
-            raise ValueError(f"gate name must be alphanumeric/-/_ : {self.name!r}")
+        validate_name("gate", self.name)
         if not self.commands:
             raise ValueError(f"gate {self.name!r} has no commands")
         compute_type(self.memory_gb)  # validates
@@ -89,6 +94,7 @@ class DeployStep:
     policy_statements: Sequence[iam.PolicyStatement] = ()
 
     def __post_init__(self) -> None:
+        validate_name("deploy step", self.name)
         if not self.commands:
             raise ValueError(f"deploy step {self.name!r} has no commands")
         compute_type(self.memory_gb)
@@ -111,6 +117,7 @@ class PostDeployStep:
     policy_statements: Sequence[iam.PolicyStatement] = ()
 
     def __post_init__(self) -> None:
+        validate_name("post-deploy step", self.name)
         if not self.commands:
             raise ValueError(f"post-deploy step {self.name!r} has no commands")
         compute_type(self.memory_gb)

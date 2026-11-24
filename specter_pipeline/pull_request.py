@@ -19,6 +19,7 @@ permissions here.
 
 from __future__ import annotations
 
+import re
 from typing import Mapping, Sequence
 
 from aws_cdk import aws_codebuild as codebuild
@@ -67,7 +68,10 @@ class PullRequestChecks(Construct):
                             codebuild.EventAction.PULL_REQUEST_CREATED,
                             codebuild.EventAction.PULL_REQUEST_UPDATED,
                             codebuild.EventAction.PULL_REQUEST_REOPENED,
-                        ).and_base_branch_is(f"^refs/heads/{base_branch}$")
+                            # `and_base_branch_is` prepends "refs/heads/" itself, so a
+                            # "^refs/heads/..." pattern becomes "refs/heads/^refs/heads/..."
+                            # and can never match. Use the full ref and anchor it.
+                        ).and_base_ref_is(f"^refs/heads/{re.escape(base_branch)}$")
                     ],
                 ),
                 environment=codebuild.BuildEnvironment(
@@ -98,6 +102,21 @@ class PullRequestChecks(Construct):
             cfn_project = project.node.default_child
             cfn_project.add_property_override(
                 "Source.Auth", {"Type": "CODECONNECTIONS", "Resource": connection_arn}
+            )
+            # Explicit rather than relying on a service default: a fork's PR
+            # head would run with this role (which can fetch the shared GitHub
+            # App token), so fork PRs need an approval comment from someone
+            # with write access.
+            cfn_project.add_property_override(
+                "Triggers.PullRequestBuildPolicy",
+                {
+                    "RequiresCommentApproval": "FORK_PULL_REQUESTS",
+                    "ApproverRoles": [
+                        "GITHUB_WRITE",
+                        "GITHUB_MAINTAIN",
+                        "GITHUB_ADMIN",
+                    ],
+                },
             )
             project.add_to_role_policy(
                 iam.PolicyStatement(

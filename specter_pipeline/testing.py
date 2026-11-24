@@ -59,7 +59,7 @@ def projects(template: Template) -> dict:
 def step_commands(template: Template, step_name: str) -> list[str]:
     """The buildspec commands of the CodeBuild project behind pipeline step ``step_name``
     (for example ``"Deploy-app"`` or ``"Gate-tests"``)."""
-    import json  # noqa: PLC0415
+    import json
 
     for res in projects(template).values():
         if str(res["Properties"].get("Description", "")).endswith(f"/{step_name}"):
@@ -407,6 +407,6 @@ __all__ = [
     "assert_standard_contract",
     "pipeline",
     "pr_projects",
-    "step_commands",
     "projects",
+    "step_commands",
 ]

@@ -169,19 +169,16 @@ def test_pipeline_is_v2_and_triggers_on_main_push_only(tpl):
     assert "Triggers" not in props
 
 
-def test_artifact_bucket_is_explicitly_named_and_hardened(tpl):
+def test_artifact_bucket_uses_the_account_regional_namespace_and_is_hardened(tpl):
+    """A literal '...-an' BucketName fails to create; the prefix + namespace form is required."""
     (bucket,) = [
         r
         for r in tpl.find_resources("AWS::S3::Bucket").values()
-        if "BucketName" in r["Properties"]
+        if "BucketNamePrefix" in r["Properties"]
     ]
-    name = json.dumps(bucket["Properties"]["BucketName"])
-    assert (
-        "demo-pipeline" in name
-        and "AWS::AccountId" in name
-        and "AWS::Region" in name
-        and name.rstrip('"}]').endswith("-an")
-    )
+    assert "BucketName" not in bucket["Properties"]
+    assert bucket["Properties"]["BucketNamePrefix"] == "demo-pipeline"
+    assert bucket["Properties"]["BucketNamespace"] == "account-regional"
     props = bucket["Properties"]
     assert props["PublicAccessBlockConfiguration"]["BlockPublicAcls"] in (True, "true")
     assert props["VersioningConfiguration"]["Status"] == "Enabled"
@@ -564,9 +561,9 @@ def test_bucket_purpose_is_lowercased_and_dots_become_hyphens(repo, expected):
     (bucket,) = [
         r
         for r in t.find_resources("AWS::S3::Bucket").values()
-        if "BucketName" in r["Properties"]
+        if "BucketNamePrefix" in r["Properties"]
     ]
-    assert expected in json.dumps(bucket["Properties"]["BucketName"])
+    assert bucket["Properties"]["BucketNamePrefix"] == expected
 
 
 @pytest.mark.parametrize("repo", ["a/b/c", "owner/", "/name", "owner/na me", ""])

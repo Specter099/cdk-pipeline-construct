@@ -123,7 +123,12 @@ class StandardPipeline(Construct):
         self.artifact_bucket = s3.Bucket(
             self,
             "Artifacts",
-            bucket_name=f"{artifact_bucket_purpose(name)}-{cdk.Aws.ACCOUNT_ID}-{cdk.Aws.REGION}-an",
+            # House naming rule {purpose}-{account}-{region}-an. A "...-an" name is
+            # reserved for S3 account-regional namespaces: creating one with a literal
+            # bucket_name fails ("missing the required x-amz-bucket-namespace header").
+            # With the namespace set, S3 builds the name from this prefix.
+            bucket_name_prefix=artifact_bucket_purpose(name),
+            bucket_namespace=s3.BucketNamespace.ACCOUNT_REGIONAL,
             encryption=s3.BucketEncryption.S3_MANAGED,
             enforce_ssl=True,
             block_public_access=s3.BlockPublicAccess.BLOCK_ALL,

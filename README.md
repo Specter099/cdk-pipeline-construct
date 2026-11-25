@@ -114,6 +114,7 @@ Lambda compute has no instance, so there is no EC2 user data. The per-repo hooks
 |---|---|
 | Install tools or dependencies | `Gate(install=[...])` / `DeployStep(install=[...])` |
 | Runtime and size | `runtime=Runtime.PYTHON \| NODE \| PYTHON_NODE`, `memory_gb=1/2/4/8/10` |
+| Longer than 15 minutes | `ec2=Ec2(size="medium", timeout_minutes=90)` (see below) |
 | Environment variables | `env={...}` (`CI=true` is always set) |
 | Extra IAM for a step | `policy_statements=[...]` |
 | Repo-specific logic | the repo's own script (e.g. `scripts/ci-local.sh`), called from `commands` |
@@ -192,8 +193,33 @@ workflow's, flag for flag and `-c` for `-c`).
 ## Lambda compute limits to design around
 
 No Docker, no root, writes only under `/tmp`, **15-minute hard limit**, no caching, no
-custom timeouts, no VPC. A repo that needs any of these should run on EC2 compute (not
-implemented yet).
+custom timeouts, no VPC.
+
+## EC2 compute for long steps
+
+A step that can outlive 15 minutes opts into EC2 compute, one step at a time:
+
+```python
+from specter_pipeline import Ec2, Gate
+
+Gate("tf-plan", ["terraform plan -out=tfplan"], ec2=Ec2(size="medium", timeout_minutes=90))
+```
+
+* Any step takes `ec2=`: `Gate`, `Assembly`, `DeployStep` (including the construct-only deploy
+  action) and `PostDeployStep`. Everything else, including CDK Pipelines' own projects, stays on
+  Lambda.
+* Sizes are CodeBuild's: `small` (2 vCPU, 3 GB), `medium` (4, 7), `large` (8, 15), `xlarge`,
+  `2xlarge`. `timeout_minutes` (5 to 480) is required in effect: choose it from the worst case,
+  because a timeout during an apply does the same damage as Lambda's limit.
+* The image is the pinned Amazon Linux 2023 standard image (`aws/codebuild/amazonlinux-x86_64-standard:5.0`),
+  never privileged. The runtime set-up is the same as on Lambda, so a step's commands do not change
+  when it moves.
+* An EC2 gate's PR check runs on EC2 too, and so does the PR check of a `uses_assembly` gate when the
+  assembly step is on EC2 (it synthesizes first).
+* Not yet: caching, VPC, Docker. The contract still refuses all three.
+* The contract expects EC2 exactly where it is declared. Gates with `ec2=` are inferred; name any
+  other EC2 step, such as `Deploy-app` or `Assemble`, in
+  `assert_standard_contract(..., ec2_steps=[...])`. An undeclared EC2 project fails.
 
 ## Development
 

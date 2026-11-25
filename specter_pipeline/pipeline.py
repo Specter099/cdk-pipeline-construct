@@ -173,6 +173,14 @@ class StandardPipeline(Construct):
         if deploy_step is not None and assembly is None and deploy_step.stacks:
             raise ValueError("DeployStep(stacks=...) deploys an Assembly; the pipeline has none")
         if assembly is not None and deploy_step is not None:
+            if not (deploy_step.install or deploy_step.commands) and (
+                deploy_step.env or deploy_step.policy_statements
+            ):
+                raise ValueError(
+                    f"deploy step {deploy_step.name!r}: env and policy_statements apply to its "
+                    "own install/commands (the PreDeploy action); with none they would be dropped. "
+                    "The deploy itself gets only CI=true and the CDK bootstrap roles"
+                )
             if not deploy_step.stacks:
                 raise ValueError(
                     f"deploy step {deploy_step.name!r}: with an assembly, name the stacks "
@@ -191,7 +199,8 @@ class StandardPipeline(Construct):
             if gate.uses_assembly and not any(names_path(c, mount) for c in gate.commands):
                 raise ValueError(
                     f"gate {gate.name!r} reads the assembly, which is linked at {mount!r}, but "
-                    "none of its commands names that directory"
+                    "none of its commands names that directory. Pass it as an argument, "
+                    f"for example ./scripts/scan.sh {mount}"
                 )
 
         deploy_stage_name = (
@@ -326,7 +335,8 @@ class StandardPipeline(Construct):
             assume_bootstrap = iam.PolicyStatement(
                 actions=["sts:AssumeRole"],
                 resources=[
-                    f"arn:aws:iam::{account}:role/cdk-{bootstrap_qualifier}-*-role-{account}-{region}"
+                    f"arn:{cdk.Aws.PARTITION}:iam::{account}:role/"
+                    f"cdk-{bootstrap_qualifier}-*-role-{account}-{region}"
                     for account, region in [
                         (cdk.Aws.ACCOUNT_ID, cdk.Aws.REGION),
                         *deploy_step.deploy_environments,

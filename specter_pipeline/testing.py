@@ -303,8 +303,10 @@ def _assert_construct_deploy(template: Template, action: dict) -> None:
     assert env["Image"] == codebuild.LinuxLambdaBuildImage.AMAZON_LINUX_2023_NODE_22.image_id, (
         f"{step} does not run on the Node Lambda image: {env['Image']}"
     )
-    variables = {v["Name"]: v.get("Value") for v in env.get("EnvironmentVariables", [])}
-    assert variables == {"CI": "true"}, f"{step} has environment variables besides CI: {variables}"
+    variables = {(v["Name"], v.get("Type", "PLAINTEXT"), v.get("Value")) for v in env.get("EnvironmentVariables", [])}
+    assert variables == {("CI", "PLAINTEXT", "true")}, (
+        f"{step} has environment variables besides a plaintext CI=true: {variables}"
+    )
     spec = json.loads(props["Source"]["BuildSpec"])
     assert set(spec) <= {"version", "phases"}, f"{step} buildspec has extra keys: {sorted(spec)}"
     assert set(spec.get("phases", {})) == {"build"}, (

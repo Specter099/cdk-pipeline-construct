@@ -15,6 +15,10 @@ Security: these projects execute the code of the PR head. Their role is
 deliberately limited to CloudWatch Logs and the connection token. Keep the
 repository private (or restrict who can open PRs) -- do not attach deploy
 permissions here.
+
+A gate with ``uses_assembly=True`` reads ``cdk.out`` in the pipeline. A PR has no pipeline
+assembly, so its project first runs ``assembly_commands`` (the pipeline's own assembly or synth
+recipe) on the Python+Node runtime, then the gate.
 """
 
 from __future__ import annotations
@@ -26,8 +30,8 @@ from aws_cdk import aws_codebuild as codebuild
 from aws_cdk import aws_iam as iam
 from constructs import Construct
 
-from .gate import Gate, compute_type
-from .runtimes import DEFAULT_NODE_VERSION, join, prelude
+from .gate import BASE_ENV, Gate, compute_type
+from .runtimes import DEFAULT_NODE_VERSION, Runtime, join, prelude
 
 
 class PullRequestChecks(Construct):
@@ -42,6 +46,8 @@ class PullRequestChecks(Construct):
         gates: Sequence[Gate],
         name_prefix: str,
         node_version: str = DEFAULT_NODE_VERSION,
+        assembly_commands: Sequence[str] = (),
+        assembly_env: Mapping[str, str] | None = None,
     ) -> None:
         super().__init__(scope, construct_id)
         owner, _, repo_name = repo.partition("/")
@@ -52,6 +58,18 @@ class PullRequestChecks(Construct):
         projects: dict[str, codebuild.Project] = {}
 
         for gate in gates:
+            if gate.uses_assembly and not assembly_commands:
+                raise ValueError(
+                    f"gate {gate.name!r} reads the assembly, so its PR check needs assembly_commands"
+                )
+            # An assembly gate builds cdk.out first, which needs Python and Node.
+            runtime = Runtime.PYTHON_NODE if gate.uses_assembly else gate.runtime
+            pre = list(assembly_commands) if gate.uses_assembly else []
+            env = (
+                {**BASE_ENV, **(assembly_env or {}), **gate.env}
+                if gate.uses_assembly
+                else gate.environment
+            )
             project = codebuild.Project(
                 self,
                 f"Pr-{gate.name}",
@@ -75,12 +93,12 @@ class PullRequestChecks(Construct):
                     ],
                 ),
                 environment=codebuild.BuildEnvironment(
-                    build_image=gate.runtime.image,
+                    build_image=runtime.image,
                     compute_type=compute_type(gate.memory_gb),
                 ),
                 environment_variables={
                     key: codebuild.BuildEnvironmentVariable(value=value)
-                    for key, value in gate.environment.items()
+                    for key, value in env.items()
                 },
                 build_spec=codebuild.BuildSpec.from_object(
                     {
@@ -88,7 +106,8 @@ class PullRequestChecks(Construct):
                         "phases": {
                             "build": {
                                 "commands": join(
-                                    prelude(gate.runtime, node_version),
+                                    prelude(runtime, node_version),
+                                    pre,
                                     gate.install,
                                     gate.commands,
                                 )

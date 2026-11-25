@@ -7,6 +7,15 @@ with one call instead of re-deriving them:
 
     GATES = python_cdk_gates()
 
+Build once: with ``assembly=True`` the checks read the cloud assembly the pipeline deploys instead
+of synthesizing their own. Pair it with ``python_cdk_assembly()`` on a ``deploy_step`` pipeline::
+
+    StandardPipeline(..., assembly=python_cdk_assembly(), gates=python_cdk_gates(assembly=True),
+                     deploy_step=DeployStep("app", ["cdk deploy --app cdk.out MyStack ..."]))
+
+The ``cdk-synth`` gate is then dropped (the assembly step is that synth) and ``access-analyzer``
+scans the shared templates on the plain Python runtime.
+
 Tool versions (bandit, pip-audit, boto3, cfn-flip) match the shared workflow; the CDK CLI is
 pinned by this package instead (``DEFAULT_CDK_CLI_VERSION``), because the CLI must support the
 cloud-assembly schema of the repo's ``aws-cdk-lib``. Pin ``aws-cdk-lib`` in the repo and bump both
@@ -30,11 +39,12 @@ together. Not reproduced (and why):
 
 from __future__ import annotations
 
+import shlex
 from collections.abc import Mapping, Sequence
 
 from aws_cdk import aws_iam as iam
 
-from .gate import Gate
+from .gate import Assembly, Gate
 from .runtimes import DEFAULT_CDK_CLI_VERSION, Runtime, cdk_cli_install
 
 # Versions the shared workflow pins.
@@ -57,15 +67,17 @@ ACCESS_ANALYZER_SHA256 = (
 DEFAULT_BANDIT_EXCLUDES = ("./.venv", "./cdk.out", "./lambda_layer")
 
 
-def access_analyzer_commands(aws_region: str = "us-east-1") -> list[str]:
+def access_analyzer_commands(
+    aws_region: str = "us-east-1", *, synth: bool = True, template_dir: str = "cdk.out"
+) -> list[str]:
     url = f"https://raw.githubusercontent.com/{ACCESS_ANALYZER_REPO}/{ACCESS_ANALYZER_COMMIT}/{ACCESS_ANALYZER_SCRIPT}"
     return [
-        "cdk synth --quiet",
+        *(["cdk synth --quiet"] if synth else []),
         # A dedicated directory and `python3 -I` keep /tmp (HOME, holding everything else) off sys.path.
         "mkdir -p /tmp/aa",
         f"curl -fsSL -o /tmp/aa/check_no_public_access.py {url}",
         f'echo "{ACCESS_ANALYZER_SHA256}  /tmp/aa/check_no_public_access.py" | sha256sum -c -',
-        f"python3 -I /tmp/aa/check_no_public_access.py --template-dir cdk.out --aws-region {aws_region} --fail-on-public-access",
+        f"python3 -I /tmp/aa/check_no_public_access.py --template-dir {shlex.quote(template_dir)} --aws-region {aws_region} --fail-on-public-access",
     ]
 
 
@@ -80,8 +92,14 @@ def python_cdk_gates(
     aws_region: str = "us-east-1",
     env: Mapping[str, str] | None = None,
     test_memory_gb: int = 2,
+    assembly: bool = False,
+    assembly_dir: str = "cdk.out",
 ) -> list[Gate]:
     """The shared review checks as pipeline gates.
+
+    ``assembly=True`` builds once: no ``cdk-synth`` gate, and ``access-analyzer`` reads the
+    pipeline's assembly from ``assembly_dir``. On a ``deploy_step`` pipeline that is ``cdk.out``;
+    with ``application_stage`` the stage's templates are in ``cdk.out/assembly-<StageName>``.
 
     ``env`` is added to the steps that run CDK or the tests (for example
     ``JSII_SILENCE_WARNING_UNTESTED_NODE_VERSION``). The Access Analyzer gate has its own IAM
@@ -122,29 +140,35 @@ def python_cdk_gates(
                 memory_gb=test_memory_gb,
             )
         )
-    gates += [
+    gates.append(
         Gate(
             "dependency-audit",
             [f"pip-audit -r {runtime_requirements}"],
             Runtime.PYTHON,
             install=[f"pip install {PIP_AUDIT}"],
-        ),
-        Gate(
-            "cdk-synth",
-            ["cdk synth"],
-            Runtime.PYTHON_NODE,
-            install=[runtime_deps, *cdk_install],
-            env=extra,
-        ),
-    ]
+        )
+    )
+    if not assembly:
+        gates.append(
+            Gate(
+                "cdk-synth",
+                ["cdk synth"],
+                Runtime.PYTHON_NODE,
+                install=[runtime_deps, *cdk_install],
+                env=extra,
+            )
+        )
     if access_analyzer:
+        analyzer_tools = f"pip install {BOTO3} {CFN_FLIP}"
         gates.append(
             Gate(
                 "access-analyzer",
-                access_analyzer_commands(aws_region),
-                Runtime.PYTHON_NODE,
-                install=[runtime_deps, *cdk_install, f"pip install {BOTO3} {CFN_FLIP}"],
+                access_analyzer_commands(aws_region, synth=not assembly, template_dir=assembly_dir),
+                # Reading templates needs only Python; synthesizing them needs Node and the app.
+                Runtime.PYTHON if assembly else Runtime.PYTHON_NODE,
+                install=[analyzer_tools] if assembly else [runtime_deps, *cdk_install, analyzer_tools],
                 env=extra,
+                uses_assembly=assembly,
                 policy_statements=[
                     # Resource "*" is required, not lazy: the AWS Service Authorization Reference lists
                     # CheckNoPublicAccess (Read) with no resource types and no condition keys. It is a
@@ -156,3 +180,18 @@ def python_cdk_gates(
             )
         )
     return gates
+
+
+def python_cdk_assembly(
+    *,
+    runtime_requirements: str = "requirements.txt",
+    env: Mapping[str, str] | None = None,
+    memory_gb: int = 4,
+) -> Assembly:
+    """The assembly step for a Python CDK app: install its requirements, ``cdk synth``."""
+    return Assembly(
+        install=[f"pip install -r {runtime_requirements}"],
+        commands=["cdk synth"],
+        env=dict(env or {}),
+        memory_gb=memory_gb,
+    )

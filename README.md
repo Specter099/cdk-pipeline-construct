@@ -28,9 +28,42 @@ StandardPipeline(
 
 ```
 Source (main) -> Build (synth) -> UpdatePipeline (self-mutate)
-   -> Gates (every check, in parallel)
+   -> Gates (assembly step, then every check in parallel)
    -> Deploy (manual approval -> deploy -> post-deploy steps)
 ```
+
+## Build once: the checked templates are the deployed templates
+
+Without it, `cdk synth` runs separately in the synth gate, the Access Analyzer gate and the deploy,
+each after its own `pip install`, so the template that passed the checks is not provably the one
+that ships. With it, the application is synthesized once and every consumer reads that artifact.
+
+```python
+from specter_pipeline import Assembly, DeployStep, StandardPipeline
+from specter_pipeline.presets import python_cdk_assembly, python_cdk_gates
+
+GATES = python_cdk_gates(assembly=True)          # no cdk-synth gate; access-analyzer reads cdk.out
+StandardPipeline(
+    self, "Pipeline", repo="Specter099/my-repo", connection_arn=connection_arn, gates=GATES,
+    assembly=python_cdk_assembly(),                # pip install -r requirements.txt && cdk synth
+    deploy_step=DeployStep("app", ["cdk deploy --app cdk.out MyStack --require-approval never"]),
+    synth_commands=['cdk -a "python3 pipeline_app.py" synth'],
+)
+```
+
+* `Assembly` runs first in the Gates stage on Python+Node with the pinned CDK CLI. Its `cdk.out` is
+  linked into every gate with `Gate(uses_assembly=True)` and into the deploy step. Gates that do not
+  read it start at the same time, so the stage is no slower.
+* A `cdk deploy` in the deploy step without `--app cdk.out` is refused at synth time: it would
+  synthesize again. A deploy script is not inspected, so `assert_builds_once` checks the result.
+* The assembly step takes no IAM permissions. Commit `cdk.context.json` instead of looking values up.
+* With `application_stage` there is nothing to add: the Synth output is what the stage deploys, and
+  `uses_assembly` gates read it. The stage's templates are under `cdk.out/assembly-<StageName>/`,
+  so pass `python_cdk_gates(assembly=True, assembly_dir="cdk.out/assembly-Prod")`.
+* On pull requests there is no pipeline assembly, so the PR project of a `uses_assembly` gate runs
+  the assembly (or synth) commands first.
+* Not yet proven on a live pipeline: that `cdk deploy --app cdk.out` works when `cdk.out` is the
+  linked artifact (CDK Pipelines links it as a symlink and the CLI writes a lock file into it).
 
 Pull requests are validated by **`PullRequestChecks`**: one CodeBuild project per
 gate, triggered by a webhook, reporting a commit status per gate. This is a
@@ -49,6 +82,7 @@ Lambda compute has no instance, so there is no EC2 user data. The per-repo hooks
 | Environment variables | `env={...}` (`CI=true` is always set) |
 | Extra IAM for a step | `policy_statements=[...]` |
 | Repo-specific logic | the repo's own script (e.g. `scripts/ci-local.sh`), called from `commands` |
+| Inspect the deployed templates | `Gate(uses_assembly=True)` reads `cdk.out` |
 
 ## Runtimes (verified against live Lambda compute images)
 
@@ -101,7 +135,8 @@ def test_pipeline(template):
                                       node_gates=["tests", "cdk-synth"])
 ```
 
-It checks Lambda compute everywhere, the stage order, the gates, the deploy closed (or open),
+It checks Lambda compute everywhere, the stage order, the gates, build-once (when any gate reads the
+assembly), the deploy closed (or open),
 approval strictly before deploy before post-deploy, no pipeline triggers, restart on update, the
 account-regional artifact bucket, the PR-check filter and least-privilege roles, and Node on the
 gates that need it. Each helper also exists on its own, and each is tested against a pipeline that
@@ -130,6 +165,7 @@ implemented yet).
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements-dev.txt
+ruff check specter_pipeline tests
 JSII_RUNTIME_PACKAGE_CACHE_ROOT=$TMPDIR/jsii-cache pytest -q   # env var only needed in a sandbox
 ```
 

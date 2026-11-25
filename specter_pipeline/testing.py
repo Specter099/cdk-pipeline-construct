@@ -17,12 +17,13 @@ pipeline; the comments say which.
 
 from __future__ import annotations
 
+import json
 import re
 from collections.abc import Iterable, Sequence
 
 from aws_cdk.assertions import Template
 
-from .gate import Gate
+from .gate import Gate, cdk_deploy_apps
 from .pipeline import artifact_bucket_purpose
 from .runtimes import Runtime
 
@@ -106,17 +107,28 @@ def projects(template: Template) -> dict:
     return template.find_resources("AWS::CodeBuild::Project")
 
 
+def _step_buildspec(template: Template, step_name: str) -> dict:
+    for res in projects(template).values():
+        if str(res["Properties"].get("Description", "")).endswith(f"/{step_name}"):
+            return json.loads(res["Properties"]["Source"]["BuildSpec"])
+    raise AssertionError(f"no CodeBuild project for pipeline step {step_name!r}")
+
+
 def step_commands(template: Template, step_name: str) -> list[str]:
     """The buildspec commands of the CodeBuild project behind pipeline step ``step_name``
     (for example ``"Deploy-app"`` or ``"Gate-tests"``)."""
-    import json
+    return _step_buildspec(template, step_name)["phases"]["build"]["commands"]
 
-    for res in projects(template).values():
-        if str(res["Properties"].get("Description", "")).endswith(f"/{step_name}"):
-            return json.loads(res["Properties"]["Source"]["BuildSpec"])["phases"][
-                "build"
-            ]["commands"]
-    raise AssertionError(f"no CodeBuild project for pipeline step {step_name!r}")
+
+_MOUNT = re.compile(r"""ln -s -- "\$CODEBUILD_SRC_DIR_([A-Za-z0-9_]+)" '([^']+)'""")
+
+
+def step_mounts(template: Template, step_name: str) -> dict[str, str]:
+    """{artifact name: directory} for the extra artifacts CDK Pipelines links into a step's
+    working directory (``additional_inputs``)."""
+    spec = _step_buildspec(template, step_name)
+    install = spec.get("phases", {}).get("install", {}).get("commands", [])
+    return {m.group(1): m.group(2) for cmd in install for m in _MOUNT.finditer(cmd)}
 
 
 def pr_projects(template: Template, name_prefix: str) -> dict:
@@ -182,15 +194,28 @@ def assert_stage_order(template: Template, deploy_stage: str = "Deploy") -> None
     )
 
 
+def _assembly_actions(template: Template) -> list[dict]:
+    """Actions in the Gates stage that produce an artifact: the build-once assembly step."""
+    return [a for a in _stage(template, "Gates")["Actions"] if a.get("OutputArtifacts")]
+
+
 def assert_gates_present(template: Template, gates: Sequence[Gate]) -> None:
-    present = {a["Name"] for a in _stage(template, "Gates")["Actions"]}
-    expected = {f"Gate-{g.name}" for g in gates}
-    assert present == expected, (
-        f"gates differ: missing={sorted(expected - present)} extra={sorted(present - expected)}"
+    """Exactly these gates (plus at most one assembly step), in parallel: every gate that does
+    not read the assembly shares one RunOrder, and so does every gate that does."""
+    actions = _stage(template, "Gates")["Actions"]
+    producers = _assembly_actions(template)
+    assert len(producers) <= 1, f"more than one step produces an artifact in Gates: {producers}"
+    by_name = {a["Name"]: a for a in actions if a not in producers}
+    expected = {f"Gate-{g.name}": g for g in gates}
+    assert set(by_name) == set(expected), (
+        f"gates differ: missing={sorted(set(expected) - set(by_name))} "
+        f"extra={sorted(set(by_name) - set(expected))}"
     )
-    assert len({a["RunOrder"] for a in _stage(template, "Gates")["Actions"]}) == 1, (
-        "gates should run in parallel"
-    )
+    for reads in (False, True):
+        orders = {
+            by_name[n]["RunOrder"] for n, g in expected.items() if g.uses_assembly is reads
+        }
+        assert len(orders) <= 1, "gates should run in parallel"
 
 
 def assert_deploy_closed(template: Template, deploy_stage: str = "Deploy") -> None:
@@ -248,6 +273,55 @@ def assert_deploy_ordering(
         assert max(d["RunOrder"] for d in deploys) < a["RunOrder"], (
             f"{a['Name']} does not wait for the deploy"
         )
+
+
+def assert_builds_once(
+    template: Template, gates: Sequence[Gate], deploy_stage: str = "Deploy"
+) -> None:
+    """The templates the gates inspect are the templates that are deployed.
+
+    ``deploy_step`` pipelines: one assembly step in Gates; every gate with
+    ``uses_assembly=True`` and the deploy action read its artifact, and every ``cdk deploy``
+    in the deploy step passes ``--app`` pointing at the directory that artifact is linked to.
+    ``application_stage`` pipelines: those gates read the Synth output, which is what the
+    stage's CloudFormation actions deploy."""
+    actions = {a["Name"]: a for a in _stage(template, "Gates")["Actions"]}
+    producers = _assembly_actions(template)
+    deploy_actions = _stage(template, deploy_stage)["Actions"]
+    cfn = [a for a in deploy_actions if a["ActionTypeId"]["Provider"] == "CloudFormation"]
+
+    if cfn:
+        assert not producers, "a stage-deployed pipeline must not build a second assembly"
+        deployed = {i["Name"] for a in cfn for i in a.get("InputArtifacts", [])}
+        assert len(deployed) == 1, f"stage deploys from {sorted(deployed)}, expected one assembly"
+        artifact = deployed.pop()
+    else:
+        assert len(producers) == 1, (
+            "no assembly step in Gates: the deploy would synthesize its own templates"
+        )
+        artifact = producers[0]["OutputArtifacts"][0]["Name"]
+        (deploy,) = [a for a in deploy_actions if a["Name"].startswith("Deploy-")]
+        assert artifact in {i["Name"] for i in deploy.get("InputArtifacts", [])}, (
+            f"{deploy['Name']} does not read the assembly {artifact!r}"
+        )
+        mount = step_mounts(template, deploy["Name"]).get(artifact)
+        assert mount, f"{deploy['Name']} does not link {artifact!r} into its directory"
+        apps = [app for cmd in step_commands(template, deploy["Name"]) for app in cdk_deploy_apps(cmd)]
+        assert apps, f"{deploy['Name']} has no `cdk deploy` command"
+        for app in apps:
+            assert app == mount, (
+                f"{deploy['Name']} runs `cdk deploy` with app {app!r}, not the assembly at {mount!r}"
+            )
+        for g in gates:
+            if g.uses_assembly:
+                assert actions[f"Gate-{g.name}"]["RunOrder"] > producers[0]["RunOrder"], (
+                    f"Gate-{g.name} does not wait for the assembly"
+                )
+
+    for g in gates:
+        reads = {i["Name"] for i in actions[f"Gate-{g.name}"].get("InputArtifacts", [])}
+        if g.uses_assembly:
+            assert artifact in reads, f"Gate-{g.name} does not read the deployed assembly {artifact!r}"
 
 
 def assert_no_pipeline_triggers(template: Template) -> None:
@@ -434,11 +508,13 @@ def assert_standard_contract(
     base_branch: str = "main",
     node_gates: Iterable[str] = (),
     require_approval: bool = True,
+    builds_once: bool | None = None,
 ) -> None:
     """Every invariant a StandardPipeline must satisfy. Repo-specific checks go alongside.
 
     ``repo`` is ``owner/name``; ``node_gates`` names the gates that run the CDK CLI or import
-    aws_cdk and therefore need Node."""
+    aws_cdk and therefore need Node. ``builds_once`` (default: on when any gate reads the
+    assembly) adds ``assert_builds_once``."""
     name = repo.partition("/")[2]
     assert name, f"repo must be 'owner/name', got {repo!r}"
     assert_lambda_compute(template)
@@ -462,11 +538,14 @@ def assert_standard_contract(
             "PR-check projects exist but pull_request_checks is off"
         )
     assert_gates_have_node(gates, node_gates)
+    if builds_once if builds_once is not None else any(g.uses_assembly for g in gates):
+        assert_builds_once(template, gates, deploy_stage)
 
 
 __all__ = [
     "CDK_INTERNAL_WILDCARDS",
     "assert_artifact_bucket",
+    "assert_builds_once",
     "assert_ci_env_on_repo_command_projects",
     "assert_deploy_closed",
     "assert_deploy_open",
@@ -486,4 +565,5 @@ __all__ = [
     "pr_projects",
     "projects",
     "step_commands",
+    "step_mounts",
 ]

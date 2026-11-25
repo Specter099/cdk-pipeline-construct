@@ -73,16 +73,17 @@ DEFAULT_BANDIT_EXCLUDES = ("./.venv", "./cdk.out", "./lambda_layer")
 
 def scan_every_assembly(template_dir: str, scan: str) -> list[str]:
     """Run ``scan --template-dir <dir>`` on ``template_dir`` and on every nested ``assembly-*``
-    directory under it (an application_stage pipeline's stacks live in
+    directory under it (``-H``: in the pipeline ``template_dir`` is a symlink to the artifact,
+    which a plain ``find`` would not enter; an application_stage pipeline's stacks live in
     ``cdk.out/assembly-<Stage>/``, an app's own Stages likewise), skipping directories without
     templates. Fails if no directory had any, so the gate cannot pass having scanned nothing."""
     d = shlex.quote(template_dir)
     empty = shlex.quote(f"no CloudFormation templates under {template_dir}")
     return [
-        f"{{ printf '%s\\n' {d}; find {d} -mindepth 1 -type d -name 'assembly-*'; }} | sort -u > /tmp/aa/dirs",
+        f"{{ printf '%s\\n' {d}; find -H {d} -mindepth 1 -type d -name 'assembly-*'; }} | sort -u > /tmp/aa/dirs",
         (
             'found=0; while IFS= read -r dir; do ls "$dir"/*.template.json >/dev/null 2>&1 || continue; '
-            f'found=1; {scan} --template-dir "$dir" || exit 1; done < /tmp/aa/dirs; '
+            f'found=1; {scan} --template-dir "$dir" </dev/null || exit 1; done < /tmp/aa/dirs; '
             f'[ "$found" = 1 ] || {{ echo {empty}; exit 1; }}'
         ),
     ]
@@ -226,11 +227,14 @@ def python_cdk_assembly(
     runtime_requirements: str = "requirements.txt",
     env: Mapping[str, str] | None = None,
     memory_gb: int = 4,
+    output_dir: str = "cdk.out",
 ) -> Assembly:
-    """The assembly step for a Python CDK app: install its requirements, ``cdk synth``."""
+    """The assembly step for a Python CDK app: install its requirements, ``cdk synth``. Pass
+    the same ``output_dir`` as ``python_cdk_gates(assembly_dir=...)``."""
     return Assembly(
         install=[f"pip install -r {runtime_requirements}"],
-        commands=["cdk synth"],
+        commands=["cdk synth"] if output_dir == "cdk.out" else [f"cdk synth -o {shlex.quote(output_dir)}"],
         env=dict(env or {}),
         memory_gb=memory_gb,
+        output_dir=output_dir,
     )

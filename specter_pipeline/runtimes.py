@@ -32,6 +32,8 @@ DEFAULT_CDK_CLI_VERSION = "2.1149.0"
 
 _VENV = "/tmp/venv"
 _NODE_HOME = "/tmp/nodejs"
+#: Where the pinned Node and CDK CLI are installed; the CLI is ``f"{NODE_HOME}/bin/cdk"``.
+NODE_HOME = _NODE_HOME
 _JSII_CACHE = "/tmp/jsii-cache"
 
 

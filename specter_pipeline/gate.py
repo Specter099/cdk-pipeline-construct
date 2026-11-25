@@ -22,7 +22,7 @@ from typing import ClassVar
 from aws_cdk import aws_codebuild as codebuild
 from aws_cdk import aws_iam as iam
 
-from .runtimes import Runtime
+from .runtimes import NODE_HOME, Runtime
 
 _COMPUTE = {
     1: codebuild.ComputeType.LAMBDA_1GB,
@@ -187,17 +187,20 @@ class DeployStep(_Step):
     The step's role must be allowed to assume the CDK bootstrap roles (the
     construct grants ``sts:AssumeRole`` on ``cdk-*`` roles for this account).
 
-    With an ``Assembly`` (build once) give ``stacks`` instead of a deploy command: the
-    construct deploys exactly the assembly the gates checked, with
-    ``cdk deploy --app <snapshot> <stacks> <deploy_args>``. ``commands`` are then optional
-    pre-deploy work and may not use the CDK CLI.
+    With an ``Assembly`` (build once) give ``stacks`` instead of a deploy command. The deploy
+    is then a construct-only action: its only input is the assembly artifact (no source, so no
+    repo code or ``cdk.json`` runs there), and it runs the pinned CLI by absolute path:
+    ``cdk deploy --app <snapshot> <stacks> <deploy_args>`` (``--require-approval never`` is
+    added unless ``deploy_args`` sets ``--require-approval``). ``install``/``commands``, if any,
+    run before it in a separate ``PreDeploy-<name>`` action that holds ``policy_statements``
+    but cannot assume the CDK deploy roles; they may not use the CDK CLI.
     """
 
     commands: Sequence[str] = ()
     runtime: Runtime = Runtime.PYTHON_NODE
     memory_gb: int = 4
     stacks: Sequence[str] = ()
-    deploy_args: Sequence[str] = ("--require-approval", "never")
+    deploy_args: Sequence[str] = ()
 
     _kind: ClassVar[str] = "deploy step"
 
@@ -211,10 +214,10 @@ class DeployStep(_Step):
             if not re.fullmatch(r"[A-Za-z0-9*][A-Za-z0-9_*/.-]*", stack):
                 raise ValueError(f"deploy step {self.name!r}: invalid stack name {stack!r}")
         for arg in self.deploy_args:
-            flag = arg.split("=", 1)[0]
-            if flag in _OWNED_DEPLOY_FLAGS:
+            if owns_deploy_flag(arg):
                 raise ValueError(
-                    f"deploy step {self.name!r}: {flag} is set by the construct, not deploy_args"
+                    f"deploy step {self.name!r}: {arg!r} sets --app, --build or --output, "
+                    "which the construct sets, not deploy_args"
                 )
 
     def _needs_commands(self) -> bool:
@@ -236,13 +239,25 @@ class PostDeployStep(_Step):
 #: Where the deploy step copies the assembly before running any repo command.
 SNAPSHOT_DIR = "/tmp/assembly"
 
+#: The pinned CDK CLI, run by absolute path so a PATH change cannot swap it.
+CDK_BIN = f"{NODE_HOME}/bin/cdk"
+
 #: Flags the construct sets on the deploy itself. --build and --output would run or redirect a
 #: synthesis; --app is the snapshot.
-_OWNED_DEPLOY_FLAGS = frozenset({"--app", "-a", "--build", "--output", "-o"})
+_OWNED_LONG = ("--app", "--build", "--output")
+
+
+def owns_deploy_flag(arg: str) -> bool:
+    """``--app``/``--build``/``--output`` (also ``--app=x``) or a short-flag cluster holding
+    ``-a`` or ``-o`` (``-va``)."""
+    if arg.split("=", 1)[0] in _OWNED_LONG:
+        return True
+    return bool(re.fullmatch(r"-[A-Za-z]*[ao][A-Za-z]*(=.*)?", arg))
 
 #: The CDK CLI in any spelling a shell could run: cdk, aws-cdk, cdk@2, .../bin/cdk, in a loop,
-#: subshell, backticks or wrapper. Not cdk.out, cdk.json, aws-cdk-lib, cdk_nag or cdk8s.
-_CDK_CLI = re.compile(r"(?<![\w.-])(aws-)?cdk(@[\w.^~*-]*)?(?![\w.-])")
+#: subshell, backticks or wrapper. Not cdk.out, cdk.json, aws-cdk-lib, cdk_nag, cdk8s or a
+#: cdk/ directory in a path. A bare word "cdk" (`cd cdk`, `--prefix cdk`) is still refused.
+_CDK_CLI = re.compile(r"(?<![\w.-])(aws-)?cdk(@[\w.^~*-]*)?(?![\w./-])")
 
 
 def mentions_cdk_cli(command: str) -> bool:
@@ -264,6 +279,7 @@ def snapshot_commands(mount: str) -> list[str]:
 
 
 def deploy_command(stacks: Sequence[str], deploy_args: Sequence[str]) -> str:
-    return " ".join(
-        ["cdk", "deploy", "--app", SNAPSHOT_DIR, *map(shlex.quote, stacks), *map(shlex.quote, deploy_args)]
-    )
+    args = list(deploy_args)
+    if not any(a.split("=", 1)[0] == "--require-approval" for a in args):
+        args += ["--require-approval", "never"]  # no TTY: a prompt would fail the deploy
+    return shlex.join([CDK_BIN, "deploy", "--app", SNAPSHOT_DIR, *stacks, *args])

@@ -24,9 +24,16 @@ from collections.abc import Iterable, Sequence
 
 from aws_cdk.assertions import Template
 
-from .gate import SNAPSHOT_DIR, Gate, mentions_cdk_cli, snapshot_commands
+from .gate import (
+    CDK_BIN,
+    SNAPSHOT_DIR,
+    Gate,
+    mentions_cdk_cli,
+    owns_deploy_flag,
+    snapshot_commands,
+)
 from .pipeline import artifact_bucket_purpose
-from .runtimes import Runtime
+from .runtimes import Runtime, cdk_cli_install
 
 #: Settings CodeBuild rejects or ignores on Lambda compute.
 _UNSUPPORTED_ON_LAMBDA = (
@@ -276,37 +283,26 @@ def assert_deploy_ordering(
         )
 
 
-#: The pinned CDK CLI install the construct itself adds (runtimes.cdk_cli_install).
-_CLI_LINES = (re.compile(r"npm install -g --prefix \S+ aws-cdk@[\w.-]+"), re.compile(r"cdk --version"))
-
-
-def _assert_deploys_snapshot(step: str, commands: list[str], mount: str) -> None:
-    """The deploy step copies the linked assembly before any repo command, deploys only that
-    copy as its last command, and runs the CDK CLI nowhere else."""
-    snap = snapshot_commands(mount)
-    starts = [i for i in range(len(commands)) if commands[i : i + len(snap)] == snap]
-    assert len(starts) == 1, f"{step} does not snapshot the assembly at {mount!r} exactly once"
-    first_own = starts[0] + len(snap)
-    last = commands[-1]
+def _assert_construct_deploy(step: str, spec: dict) -> None:
+    """The deploy action runs exactly: snapshot the assembly, install the pinned CLI, deploy the
+    snapshot with that CLI by absolute path. Nothing else, in no other phase."""
+    assert set(spec.get("phases", {})) == {"build"}, (
+        f"{step} has phases besides build: {sorted(spec.get('phases', {}))}"
+    )
+    cmds = spec["phases"]["build"]["commands"]
+    versions = [m.group(1) for c in cmds if (m := re.fullmatch(r"npm install -g --prefix \S+ aws-cdk@(\S+)", c))]
+    assert len(versions) == 1, f"{step} does not install the pinned CDK CLI exactly once"
+    expected_head = [*snapshot_commands("."), *cdk_cli_install(versions[0])]
+    assert cmds[:-1] == expected_head, (
+        f"{step} runs commands besides the snapshot, the CLI install and the deploy: {cmds[:-1]}"
+    )
+    last = cmds[-1]
     tokens = shlex.split(last)
-    assert tokens[:4] == ["cdk", "deploy", "--app", SNAPSHOT_DIR], (
-        f"{step} does not deploy the assembly snapshot last: {last!r}"
+    assert tokens[:4] == [CDK_BIN, "deploy", "--app", SNAPSHOT_DIR] and shlex.join(tokens) == last, (
+        f"{step} does not deploy the assembly snapshot with the pinned CLI: {last!r}"
     )
-    owned = {"--app", "-a", "--build", "--output", "-o"}
-    assert sum(t.split("=", 1)[0] in owned for t in tokens) == 1, (
+    assert not any(owns_deploy_flag(t) for t in tokens[4:]), (
         f"{step} deploy overrides --app, --build or --output: {last!r}"
-    )
-    for i, command in enumerate(commands[:-1]):
-        if starts[0] <= i < first_own or any(r.fullmatch(command) for r in _CLI_LINES):
-            continue
-        assert not mentions_cdk_cli(command), (
-            f"{step} uses the CDK CLI outside the construct's deploy: {command!r}"
-        )
-    # Only the runtime prelude may run before the snapshot: the construct puts the snapshot
-    # ahead of its own CLI install, which precedes every repo command.
-    cli = [i for i, c in enumerate(commands) if _CLI_LINES[0].fullmatch(c)]
-    assert cli and starts[0] < cli[0], (
-        f"{step} runs commands between its prelude and the assembly snapshot"
     )
 
 
@@ -316,9 +312,9 @@ def assert_builds_once(
     """The templates the gates inspect are the templates that are deployed.
 
     ``deploy_step`` pipelines: one assembly step in Gates; every gate with
-    ``uses_assembly=True`` and the deploy action read its artifact; the deploy step copies it
-    before running anything else, deploys only that copy as its last command, and uses the CDK
-    CLI nowhere else.
+    ``uses_assembly=True`` read its artifact and refer to the directory it is linked at; the
+    deploy action reads only that artifact and runs exactly the construct's snapshot, pinned CLI
+    install and deploy; any ``PreDeploy-`` action runs before it and never uses the CDK CLI.
     ``application_stage`` pipelines: those gates read the Synth output, which is what the
     stage's CloudFormation actions deploy."""
     actions = {a["Name"]: a for a in _stage(template, "Gates")["Actions"]}
@@ -337,12 +333,17 @@ def assert_builds_once(
         )
         artifact = producers[0]["OutputArtifacts"][0]["Name"]
         (deploy,) = [a for a in deploy_actions if a["Name"].startswith("Deploy-")]
-        assert artifact in {i["Name"] for i in deploy.get("InputArtifacts", [])}, (
-            f"{deploy['Name']} does not read the assembly {artifact!r}"
+        reads = [i["Name"] for i in deploy.get("InputArtifacts", [])]
+        assert artifact in reads, f"{deploy['Name']} does not read the assembly {artifact!r}"
+        assert reads == [artifact], (
+            f"{deploy['Name']} reads {reads}: the deploy must read the assembly and nothing else"
         )
-        mount = step_mounts(template, deploy["Name"]).get(artifact)
-        assert mount, f"{deploy['Name']} does not link {artifact!r} into its directory"
-        _assert_deploys_snapshot(deploy["Name"], step_commands(template, deploy["Name"]), mount)
+        _assert_construct_deploy(deploy["Name"], _step_buildspec(template, deploy["Name"]))
+        for a in deploy_actions:
+            if a["Name"].startswith("PreDeploy-"):
+                assert a["RunOrder"] < deploy["RunOrder"], f"{a['Name']} does not finish before the deploy"
+                for cmd in step_commands(template, a["Name"]):
+                    assert not mentions_cdk_cli(cmd), f"{a['Name']} uses the CDK CLI: {cmd!r}"
         for g in gates:
             if g.uses_assembly:
                 assert actions[f"Gate-{g.name}"]["RunOrder"] > producers[0]["RunOrder"], (
@@ -353,6 +354,12 @@ def assert_builds_once(
         reads = {i["Name"] for i in actions[f"Gate-{g.name}"].get("InputArtifacts", [])}
         if g.uses_assembly:
             assert artifact in reads, f"Gate-{g.name} does not read the deployed assembly {artifact!r}"
+            mount = step_mounts(template, f"Gate-{g.name}").get(artifact)
+            assert mount, f"Gate-{g.name} does not link the assembly into its directory"
+            assert any(mount in cmd for cmd in step_commands(template, f"Gate-{g.name}")), (
+                f"Gate-{g.name} never refers to {mount!r}, where the assembly is linked: it may "
+                "be reading some other directory"
+            )
 
 
 def assert_no_pipeline_triggers(template: Template) -> None:

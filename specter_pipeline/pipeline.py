@@ -26,6 +26,7 @@ Design rules baked in:
 
 from __future__ import annotations
 
+import itertools
 import re
 from collections.abc import Sequence
 
@@ -99,11 +100,9 @@ def _codebuild_step(
     extra_policies: Sequence[iam.PolicyStatement] = (),
     additional_inputs: dict[str, pipelines.IFileSetProducer] | None = None,
     primary_output_directory: str | None = None,
-    before: Sequence[str] = (),
-    after: Sequence[str] = (),
 ) -> pipelines.CodeBuildStep:
-    """The one way a step becomes a CodeBuild action: runtime prelude, ``before``, optional CDK
-    CLI, the step's install and commands, ``after``; CI env, its IAM, Lambda compute."""
+    """The one way a step becomes a CodeBuild action: runtime prelude, optional CDK CLI, the
+    step's install and commands; CI env, its IAM, Lambda compute."""
     return pipelines.CodeBuildStep(
         step_id,
         input=source,
@@ -111,11 +110,9 @@ def _codebuild_step(
         primary_output_directory=primary_output_directory,
         commands=join(
             prelude(spec.runtime, node_version),
-            before,
             cdk_cli_install(cdk_cli_version) if cdk_cli_version else (),
             spec.install,
             spec.commands,
-            after,
         ),
         env=spec.environment,
         role_policy_statements=[*extra_policies, *spec.policy_statements],
@@ -315,44 +312,69 @@ class StandardPipeline(Construct):
             self.pipeline.add_stage(application_stage, pre=pre, post=post)
         else:
             assert deploy_step is not None
-            deploy = _codebuild_step(
-                f"Deploy-{deploy_step.name}",
-                deploy_step,
-                source=source,
-                node_version=node_version,
-                cdk_cli_version=cdk_cli_version,
-                additional_inputs=assembly_inputs,
-                # Build once: snapshot the checked assembly before any repo command runs, and
-                # deploy that snapshot with a command the construct owns.
-                before=snapshot_commands(assembly.output_dir) if assembly else (),
-                after=(
-                    [deploy_command(deploy_step.stacks, deploy_step.deploy_args)]
-                    if assembly
-                    else ()
-                ),
-                extra_policies=[
-                    # `cdk deploy` assumes the CDK bootstrap roles (deploy,
-                    # file/image publishing, lookup); nothing else.
-                    iam.PolicyStatement(
-                        actions=["sts:AssumeRole"],
-                        resources=[
-                            (
-                                f"arn:aws:iam::{cdk.Aws.ACCOUNT_ID}:role/"
-                                f"cdk-{bootstrap_qualifier}-*-role-{cdk.Aws.ACCOUNT_ID}-{cdk.Aws.REGION}"
-                            )
-                        ],
-                    ),
+            # `cdk deploy` assumes the CDK bootstrap roles (deploy, file/image publishing,
+            # lookup); nothing else.
+            assume_bootstrap = iam.PolicyStatement(
+                actions=["sts:AssumeRole"],
+                resources=[
+                    (
+                        f"arn:aws:iam::{cdk.Aws.ACCOUNT_ID}:role/"
+                        f"cdk-{bootstrap_qualifier}-*-role-{cdk.Aws.ACCOUNT_ID}-{cdk.Aws.REGION}"
+                    )
                 ],
             )
+            steps: list[pipelines.Step] = []
+            if assembly is not None and assemble is not None:
+                # Build once. Repo work runs in its own action, without deploy rights; the
+                # deploy action is the construct's alone: its only input is the assembly (no
+                # source, so no repo code or cdk.json), it snapshots it and deploys the
+                # snapshot with the pinned CLI.
+                if deploy_step.install or deploy_step.commands:
+                    steps.append(
+                        _codebuild_step(
+                            f"PreDeploy-{deploy_step.name}",
+                            deploy_step,
+                            source=source,
+                            node_version=node_version,
+                        )
+                    )
+                steps.append(
+                    pipelines.CodeBuildStep(
+                        f"Deploy-{deploy_step.name}",
+                        input=assemble,
+                        commands=join(
+                            snapshot_commands("."),
+                            cdk_cli_install(cdk_cli_version),
+                            [deploy_command(deploy_step.stacks, deploy_step.deploy_args)],
+                        ),
+                        env=deploy_step.environment,
+                        role_policy_statements=[assume_bootstrap],
+                        build_environment=_environment(Runtime.NODE, deploy_step.memory_gb),
+                    )
+                )
+            else:
+                steps.append(
+                    _codebuild_step(
+                        f"Deploy-{deploy_step.name}",
+                        deploy_step,
+                        source=source,
+                        node_version=node_version,
+                        cdk_cli_version=cdk_cli_version,
+                        extra_policies=[assume_bootstrap],
+                    )
+                )
+            deploy = steps[-1]
+            for earlier, later in itertools.pairwise(steps):
+                later.add_step_dependency(earlier)
             # In a wave with no stacks, `pre` and `post` steps are NOT ordered
             # by position alone: without these dependencies the approval and
             # the deploy get the same RunOrder and run in parallel, i.e. the
             # deploy would not wait for approval. Make the order explicit.
             for approval in pre:
-                deploy.add_step_dependency(approval)
+                steps[0].add_step_dependency(approval)
             for step in post:
                 step.add_step_dependency(deploy)
-            self.pipeline.add_wave(DEPLOY_WAVE, pre=pre, post=[deploy, *post])
+            self.pipeline.add_wave(DEPLOY_WAVE, pre=pre, post=[*steps, *post])
 
         self.pipeline.build_pipeline()
 

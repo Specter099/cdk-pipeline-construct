@@ -51,23 +51,27 @@ StandardPipeline(
 )
 ```
 
-**What is guaranteed.** The construct writes the deploy itself. The deploy step:
-1. copies the assembly artifact to `/tmp/assembly`, after the runtime set-up and before any of your
-   commands run;
-2. runs your `install` and `commands`;
-3. runs `cdk deploy --app /tmp/assembly <stacks> <deploy_args>` as its last command.
+**What is guaranteed.** With an assembly, the deploy is an action only the construct writes:
+* its only input is the assembly artifact, so there is no source checkout, no repo script and no
+  `cdk.json` in it;
+* it copies the assembly to `/tmp/assembly`, installs the pinned CDK CLI, and runs
+  `/tmp/nodejs/bin/cdk deploy --app /tmp/assembly <stacks> <deploy_args>`, by absolute path so a
+  `PATH` change cannot swap the CLI;
+* `--require-approval never` is added unless `deploy_args` sets `--require-approval`, and
+  `deploy_args` may not set `--app`, `--build` or `--output`, including short forms such as `-va`.
 
-Nothing your commands do to `cdk.out` changes what that last command deploys. That includes a
-re-synth, `cdk diff`, or a `build` command in `cdk.json`. `deploy_args` (default
-`--require-approval never`) may not set `--app`, `--build` or `--output`.
-`assert_builds_once` checks this shape on the synthesized template, and the standard contract runs
-it whenever the pipeline has an assembly step.
+Your `install` and `commands`, if any, run before it in a separate `PreDeploy-<name>` action, after
+the approval. That action holds your `policy_statements` but cannot assume the CDK deploy roles, and
+it cannot touch the deploy action's files. `assert_builds_once` checks the deploy action's inputs,
+phases and exact command list. The standard contract runs it whenever the pipeline has an assembly
+step.
 
-**What is a guard, not a guarantee.** With an assembly, the deploy step's `install` and `commands`
-may not mention the CDK CLI in any spelling (`cdk`, `aws-cdk`, `cdk@2`, `.../bin/cdk`). This is a
-plain text match, so loops, comments, backticks and wrappers cannot hide a second `cdk deploy`.
-A script or a shell variable is opaque to it: `./deploy.sh` could still run its own deploy. Keep
-deploy scripts free of CDK commands; the construct runs the deploy.
+**What is a guard, not a guarantee.** The `PreDeploy` commands may not mention the CDK CLI in any
+spelling (`cdk`, `aws-cdk`, `cdk@2`, `.../bin/cdk`). This is a plain text match, so loops, comments,
+backticks and wrappers cannot hide it. It does not see inside scripts or shell variables. A `cdk/`
+directory in a path is allowed, but the bare word is refused (`cd cdk`, `npm ci --prefix cdk`); put
+such work in a script. The guard is a second line of defence: without the deploy roles, a `cdk deploy`
+there fails unless your own `policy_statements` grant CloudFormation access.
 
 * `Assembly` runs first in the Gates stage on Python+Node with the pinned CDK CLI. Its `cdk.out` is
   linked into every gate with `Gate(uses_assembly=True)` and into the deploy step. Gates that do not
@@ -77,7 +81,11 @@ deploy scripts free of CDK commands; the construct runs the deploy.
   `uses_assembly` gates read it.
 * The preset's Access Analyzer gate scans the top-level templates and every nested `assembly-*`
   directory, so it covers a stage's stacks (`cdk.out/assembly-Prod/`) and an app's own stages. It
-  fails if it finds no templates at all.
+  follows the link CDK Pipelines puts at `cdk.out`, and fails if it finds no templates at all.
+* A non-default assembly directory goes to both sides:
+  `python_cdk_assembly(output_dir="infra/cdk.out")` with
+  `python_cdk_gates(assembly=True, assembly_dir="infra/cdk.out")`. The contract fails when a gate
+  never refers to the directory the assembly is linked at.
 * On pull requests there is no pipeline assembly, so the PR project of a `uses_assembly` gate runs
   the assembly (or synth) commands first, with the assembly's (or synth's) memory. It also receives
   `Assembly.env` (or `synth_env`) beside the PR's code, so keep secrets out of both. The preset keeps

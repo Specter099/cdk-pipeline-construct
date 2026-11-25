@@ -52,13 +52,19 @@ StandardPipeline(
 ```
 
 **What is guaranteed.** With an assembly, the deploy is an action only the construct writes:
-* its only input is the assembly artifact, so there is no source checkout, no repo script and no
-  `cdk.json` in it;
-* it copies the assembly to `/tmp/assembly`, installs the pinned CDK CLI, and runs
-  `/tmp/nodejs/bin/cdk deploy --app /tmp/assembly <stacks> <deploy_args>`, by absolute path so a
-  `PATH` change cannot swap the CLI;
+* its only input is the assembly artifact, so there is no source checkout and no repo script in it;
+* it copies the assembly to `/tmp/assembly`, and refuses an assembly that contains a `cdk.json`
+  (the CLI would run that file's `build` hook before loading the snapshot);
+* it installs the pinned CDK CLI and runs
+  `/tmp/nodejs/bin/cdk deploy --app /tmp/assembly <stacks> <deploy_args>` from a fresh empty
+  directory, by absolute path so a `PATH` change cannot swap the CLI;
+* its only environment variable is `CI=true`. `DeployStep.env` goes to the `PreDeploy` action, so it
+  cannot steer the CLI (for example with `NODE_OPTIONS`);
+* it may assume the CDK bootstrap roles of the pipeline's own account and region, plus each
+  `(account, region)` in `DeployStep(deploy_environments=[...])`, and nothing else;
 * `--require-approval never` is added unless `deploy_args` sets `--require-approval`, and
-  `deploy_args` may not set `--app`, `--build` or `--output`, including short forms such as `-va`.
+  `deploy_args` may not set `--app`, `--build` or `--output` in any spelling the CLI accepts
+  (`-va`, `--no-app`, camelCase).
 
 Your `install` and `commands`, if any, run before it in a separate `PreDeploy-<name>` action, after
 the approval. That action holds your `policy_statements` but cannot assume the CDK deploy roles, and
@@ -74,7 +80,8 @@ such work in a script. The guard is a second line of defence: without the deploy
 there fails unless your own `policy_statements` grant CloudFormation access.
 
 * `Assembly` runs first in the Gates stage on Python+Node with the pinned CDK CLI. Its `cdk.out` is
-  linked into every gate with `Gate(uses_assembly=True)` and into the deploy step. Gates that do not
+  linked into every gate with `Gate(uses_assembly=True)`, and is the deploy action's only input. A
+  gate that reads it must name that directory in its commands, or the pipeline refuses it. Gates that do not
   read it start at the same time, so the stage is no slower.
 * The assembly step takes no IAM permissions. Commit `cdk.context.json` instead of looking values up.
 * With `application_stage` there is nothing to add: the Synth output is what the stage deploys, and
@@ -163,8 +170,8 @@ def test_pipeline(template):
                                       node_gates=["tests", "cdk-synth"])
 ```
 
-It checks Lambda compute everywhere, the stage order, the gates, build-once (when any gate reads the
-assembly), the deploy closed (or open),
+It checks Lambda compute everywhere, the stage order, the gates, build-once (whenever the pipeline has an
+assembly step or a gate reads the assembly), the deploy closed (or open),
 approval strictly before deploy before post-deploy, no pipeline triggers, restart on update, the
 account-regional artifact bucket, the PR-check filter and least-privilege roles, and Node on the
 gates that need it. Each helper also exists on its own, and each is tested against a pipeline that

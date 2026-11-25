@@ -19,18 +19,18 @@ from __future__ import annotations
 
 import json
 import re
-import shlex
 from collections.abc import Iterable, Sequence
 
+from aws_cdk import aws_codebuild as codebuild
 from aws_cdk.assertions import Template
 
 from .gate import (
-    CDK_BIN,
-    SNAPSHOT_DIR,
     Gate,
     mentions_cdk_cli,
+    names_path,
     owns_deploy_flag,
     snapshot_commands,
+    split_deploy_command,
 )
 from .pipeline import artifact_bucket_purpose
 from .runtimes import Runtime, cdk_cli_install
@@ -283,26 +283,53 @@ def assert_deploy_ordering(
         )
 
 
-def _assert_construct_deploy(step: str, spec: dict) -> None:
+def _project_of(template: Template, step_name: str) -> dict:
+    for res in projects(template).values():
+        if str(res["Properties"].get("Description", "")).endswith(f"/{step_name}"):
+            return res["Properties"]
+    raise AssertionError(f"no CodeBuild project for pipeline step {step_name!r}")
+
+
+def _assert_construct_deploy(template: Template, action: dict) -> None:
     """The deploy action runs exactly: snapshot the assembly, install the pinned CLI, deploy the
-    snapshot with that CLI by absolute path. Nothing else, in no other phase."""
+    snapshot with that CLI by absolute path from an empty directory. Nothing else: no other
+    buildspec key, phase or phase setting, no environment beyond CI=true, the Node image."""
+    step = action["Name"]
+    assert not action.get("Configuration", {}).get("EnvironmentVariables"), (
+        f"{step} sets action-level environment variables"
+    )
+    props = _project_of(template, step)
+    env = props["Environment"]
+    assert env["Image"] == codebuild.LinuxLambdaBuildImage.AMAZON_LINUX_2023_NODE_22.image_id, (
+        f"{step} does not run on the Node Lambda image: {env['Image']}"
+    )
+    variables = {v["Name"]: v.get("Value") for v in env.get("EnvironmentVariables", [])}
+    assert variables == {"CI": "true"}, f"{step} has environment variables besides CI: {variables}"
+    spec = json.loads(props["Source"]["BuildSpec"])
+    assert set(spec) <= {"version", "phases"}, f"{step} buildspec has extra keys: {sorted(spec)}"
     assert set(spec.get("phases", {})) == {"build"}, (
         f"{step} has phases besides build: {sorted(spec.get('phases', {}))}"
     )
+    assert set(spec["phases"]["build"]) == {"commands"}, (
+        f"{step} build phase has settings besides commands: {sorted(spec['phases']['build'])}"
+    )
     cmds = spec["phases"]["build"]["commands"]
-    versions = [m.group(1) for c in cmds if (m := re.fullmatch(r"npm install -g --prefix \S+ aws-cdk@(\S+)", c))]
-    assert len(versions) == 1, f"{step} does not install the pinned CDK CLI exactly once"
+    versions = [
+        m.group(1)
+        for c in cmds
+        if (m := re.fullmatch(r"npm install -g --prefix \S+ aws-cdk@(\d+\.\d+\.\d+)", c))
+    ]
+    assert len(versions) == 1, f"{step} does not install a pinned CDK CLI version exactly once"
     expected_head = [*snapshot_commands("."), *cdk_cli_install(versions[0])]
     assert cmds[:-1] == expected_head, (
         f"{step} runs commands besides the snapshot, the CLI install and the deploy: {cmds[:-1]}"
     )
-    last = cmds[-1]
-    tokens = shlex.split(last)
-    assert tokens[:4] == [CDK_BIN, "deploy", "--app", SNAPSHOT_DIR] and shlex.join(tokens) == last, (
-        f"{step} does not deploy the assembly snapshot with the pinned CLI: {last!r}"
+    tokens = split_deploy_command(cmds[-1])
+    assert tokens is not None, (
+        f"{step} does not deploy the assembly snapshot with the pinned CLI: {cmds[-1]!r}"
     )
     assert not any(owns_deploy_flag(t) for t in tokens[4:]), (
-        f"{step} deploy overrides --app, --build or --output: {last!r}"
+        f"{step} deploy overrides --app, --build or --output: {cmds[-1]!r}"
     )
 
 
@@ -312,7 +339,8 @@ def assert_builds_once(
     """The templates the gates inspect are the templates that are deployed.
 
     ``deploy_step`` pipelines: one assembly step in Gates; every gate with
-    ``uses_assembly=True`` read its artifact and refer to the directory it is linked at; the
+    ``uses_assembly=True`` read its artifact and name the directory it is linked at in their
+    commands; the
     deploy action reads only that artifact and runs exactly the construct's snapshot, pinned CLI
     install and deploy; any ``PreDeploy-`` action runs before it and never uses the CDK CLI.
     ``application_stage`` pipelines: those gates read the Synth output, which is what the
@@ -338,7 +366,7 @@ def assert_builds_once(
         assert reads == [artifact], (
             f"{deploy['Name']} reads {reads}: the deploy must read the assembly and nothing else"
         )
-        _assert_construct_deploy(deploy["Name"], _step_buildspec(template, deploy["Name"]))
+        _assert_construct_deploy(template, deploy)
         for a in deploy_actions:
             if a["Name"].startswith("PreDeploy-"):
                 assert a["RunOrder"] < deploy["RunOrder"], f"{a['Name']} does not finish before the deploy"
@@ -356,7 +384,7 @@ def assert_builds_once(
             assert artifact in reads, f"Gate-{g.name} does not read the deployed assembly {artifact!r}"
             mount = step_mounts(template, f"Gate-{g.name}").get(artifact)
             assert mount, f"Gate-{g.name} does not link the assembly into its directory"
-            assert any(mount in cmd for cmd in step_commands(template, f"Gate-{g.name}")), (
+            assert any(names_path(cmd, mount) for cmd in g.commands), (
                 f"Gate-{g.name} never refers to {mount!r}, where the assembly is linked: it may "
                 "be reading some other directory"
             )

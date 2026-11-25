@@ -50,6 +50,7 @@ from .gate import (
     compute_type,
     deploy_command,
     mentions_cdk_cli,
+    names_path,
     snapshot_commands,
 )
 from .pull_request import PullRequestChecks
@@ -185,6 +186,14 @@ class StandardPipeline(Construct):
                         "here could deploy or synthesize something the gates never checked"
                     )
 
+        mount = assembly.output_dir if assembly is not None else synth_output_dir
+        for gate in gates:
+            if gate.uses_assembly and not any(names_path(c, mount) for c in gate.commands):
+                raise ValueError(
+                    f"gate {gate.name!r} reads the assembly, which is linked at {mount!r}, but "
+                    "none of its commands names that directory"
+                )
+
         deploy_stage_name = (
             application_stage.stage_name if application_stage else DEPLOY_WAVE
         )
@@ -317,10 +326,11 @@ class StandardPipeline(Construct):
             assume_bootstrap = iam.PolicyStatement(
                 actions=["sts:AssumeRole"],
                 resources=[
-                    (
-                        f"arn:aws:iam::{cdk.Aws.ACCOUNT_ID}:role/"
-                        f"cdk-{bootstrap_qualifier}-*-role-{cdk.Aws.ACCOUNT_ID}-{cdk.Aws.REGION}"
-                    )
+                    f"arn:aws:iam::{account}:role/cdk-{bootstrap_qualifier}-*-role-{account}-{region}"
+                    for account, region in [
+                        (cdk.Aws.ACCOUNT_ID, cdk.Aws.REGION),
+                        *deploy_step.deploy_environments,
+                    ]
                 ],
             )
             steps: list[pipelines.Step] = []
@@ -347,7 +357,8 @@ class StandardPipeline(Construct):
                             cdk_cli_install(cdk_cli_version),
                             [deploy_command(deploy_step.stacks, deploy_step.deploy_args)],
                         ),
-                        env=deploy_step.environment,
+                        # Only CI=true: the step's env could steer the CLI (NODE_OPTIONS ...).
+                        env=dict(BASE_ENV),
                         role_policy_statements=[assume_bootstrap],
                         build_environment=_environment(Runtime.NODE, deploy_step.memory_gb),
                     )

@@ -13,6 +13,7 @@ equivalent hook.
 from __future__ import annotations
 
 import dataclasses
+import posixpath
 import re
 import shlex
 from collections.abc import Mapping, Sequence
@@ -151,8 +152,17 @@ class Assembly(_Step):
             )
         if self.runtime is not Runtime.PYTHON_NODE:
             raise ValueError("the assembly step runs the CDK CLI and needs Runtime.PYTHON_NODE")
-        if not re.fullmatch(r"[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)*", self.output_dir) or ".." in self.output_dir:
-            raise ValueError(f"assembly output_dir must be a relative path, got {self.output_dir!r}")
+        norm = posixpath.normpath(self.output_dir) if self.output_dir else ""
+        if (
+            not re.fullmatch(r"[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)*/?", self.output_dir)
+            or norm in (".", "")
+            or ".." in self.output_dir.split("/")
+        ):
+            raise ValueError(
+                f"assembly output_dir must be a relative path below the source, got {self.output_dir!r}"
+            )
+        if self.name.startswith(("Gate-", "Deploy-", "Post-", "Approve-")):
+            raise ValueError(f"assembly name {self.name!r} collides with the pipeline's step names")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -186,35 +196,155 @@ class PostDeployStep(_Step):
     _kind: ClassVar[str] = "post-deploy step"
 
 
-_SHELL_SEPARATORS = frozenset({"&&", "||", ";", "|"})
+# --- does a deploy step deploy the assembly, and only the assembly? ----------------------------
+
+#: A CDK CLI command word: cdk, aws-cdk, or either pinned with @version (npx cdk@2 ...).
+_CDK_WORD = re.compile(r"(aws-)?cdk(@\S*)?")
+#: Words that run the next word as the command.
+_WRAPPERS = frozenset({"npx", "exec", "env", "time", "command", "nohup", "sudo", "xargs"})
+_SHELLS = frozenset({"bash", "sh", "zsh", "dash", "ksh"})
+_CHDIR = frozenset({"cd", "pushd", "popd"})
+#: CDK options that take a value, so the value is not mistaken for the subcommand.
+_CDK_VALUE_OPTS = frozenset(
+    {"-a", "--app", "-c", "--context", "-o", "--output", "--profile", "-p", "--plugin",
+     "-r", "--role-arn", "--ca-bundle-path", "--proxy", "--build", "--toolkit-stack-name"}
+)
+_SYNTH = frozenset({"synth", "synthesize"})
 
 
-def cdk_deploy_apps(command: str) -> list[str | None]:
-    """For each ``cdk deploy`` in a shell command, the ``--app``/``-a`` value it passes (None if
-    it passes none). Each part of a command joined with ``&&``, ``||``, ``;`` or ``|`` is inspected
-    on its own. A command that cannot be tokenised and mentions both words counts as one deploy
-    with no app, so it fails closed."""
+@dataclasses.dataclass(frozen=True)
+class CdkCall:
+    """One CDK CLI invocation found in a shell command."""
+
+    subcommand: str | None
+    apps: tuple[str, ...]
+
+
+class UnparseableCommand(ValueError):
+    pass
+
+
+def _segments(command: str) -> list[list[str]]:
+    """Simple commands, split on every shell control operator (``;`` ``&`` ``&&`` ``||`` ``|``
+    ``(`` ``)``, newlines, unspaced or not). Quoted strings stay single words."""
+    lexer = shlex.shlex(command.replace("\n", " ; "), posix=True, punctuation_chars=True)
+    lexer.whitespace_split = True
     try:
-        tokens = shlex.split(command, posix=True)
-    except ValueError:
-        return [None] if "cdk" in command and "deploy" in command else []
+        tokens = list(lexer)
+    except ValueError as err:
+        raise UnparseableCommand(f"cannot parse shell command {command!r}: {err}") from None
     segments: list[list[str]] = [[]]
     for tok in tokens:
-        if tok in _SHELL_SEPARATORS:
+        if tok and all(ch in "();<>|&" for ch in tok):
             segments.append([])
         else:
             segments[-1].append(tok)
-    found: list[str | None] = []
-    for seg in segments:
-        cli = [i for i, t in enumerate(seg) if t.rsplit("/", 1)[-1] == "cdk"]
-        if not cli or "deploy" not in seg[cli[0] + 1 :]:
+    return [seg for seg in segments if seg]
+
+
+def _command_word(seg: list[str]) -> tuple[str, list[str]]:
+    """The word a simple command runs (past VAR=x assignments and wrappers such as npx), and
+    its arguments."""
+    i = 0
+    while i < len(seg):
+        word = seg[i]
+        if "=" in word and not word.startswith("-") and word.split("=", 1)[0].isidentifier():
+            i += 1
             continue
-        args = seg[cli[0] + 1 :]
-        app: str | None = None
-        for k, arg in enumerate(args):
-            if arg in ("--app", "-a") and k + 1 < len(args):
-                app = args[k + 1]
-            elif arg.startswith("--app="):
-                app = arg.split("=", 1)[1]
-        found.append(app)
-    return found
+        name = word.rsplit("/", 1)[-1]
+        if name in _WRAPPERS:
+            i += 1
+            while i < len(seg) and seg[i].startswith("-"):
+                i += 2 if seg[i] in ("-p", "--package") else 1
+            continue
+        return name, seg[i + 1 :]
+    return "", []
+
+
+def shell_calls(command: str) -> list[tuple[str, list[str]]]:
+    """(command word, args) for every simple command, descending into ``bash -c '...'`` and
+    ``eval``."""
+    out: list[tuple[str, list[str]]] = []
+    for seg in _segments(command):
+        word, args = _command_word(seg)
+        if word in _SHELLS and "-c" in args and args.index("-c") + 1 < len(args):
+            out += shell_calls(args[args.index("-c") + 1])
+        elif word == "eval":
+            out += shell_calls(" ".join(args))
+        else:
+            out.append((word, args))
+    return out
+
+
+def _cdk_call(word: str, args: list[str]) -> CdkCall | None:
+    if not _CDK_WORD.fullmatch(word):
+        return None
+    sub: str | None = None
+    apps: list[str] = []
+    k = 0
+    while k < len(args):
+        arg = args[k]
+        if arg in ("-a", "--app"):
+            if k + 1 < len(args):
+                apps.append(args[k + 1])
+            k += 2
+            continue
+        if arg.startswith("--app="):
+            apps.append(arg.split("=", 1)[1])
+        elif arg in _CDK_VALUE_OPTS:
+            k += 2
+            continue
+        elif sub is None and not arg.startswith("-"):
+            sub = arg
+        k += 1
+    return CdkCall(sub, tuple(apps))
+
+
+def cdk_calls(command: str) -> list[CdkCall]:
+    """Every CDK CLI invocation in a shell command, in order."""
+    return [c for word, args in shell_calls(command) if (c := _cdk_call(word, args))]
+
+
+def assembly_deploy_violations(commands: Sequence[str], output_dir: str) -> list[str]:
+    """Why ``commands`` (run in order in one shell, as a CodeBuild phase does) might deploy
+    anything other than the assembly at ``output_dir``. Empty means: at least one ``cdk deploy``,
+    every one reading exactly ``--app <output_dir>``, no ``cdk synth``, no change of directory
+    before a deploy. Anything that cannot be parsed is a violation (fail closed)."""
+    want = posixpath.normpath(output_dir)
+    problems: list[str] = []
+    deploys = 0
+    moved: str | None = None
+    for command in commands:
+        try:
+            calls = shell_calls(command)
+        except UnparseableCommand as err:
+            problems.append(str(err))
+            continue
+        for word, args in calls:
+            if word in _CHDIR:
+                moved = command
+            call = _cdk_call(word, args)
+            if call is None:
+                continue
+            if call.subcommand in _SYNTH:
+                problems.append(
+                    f"{command!r} runs `cdk synth`, which rewrites {output_dir} "
+                    "after the gates checked it"
+                )
+            elif call.subcommand == "deploy":
+                deploys += 1
+                if len(call.apps) != 1 or posixpath.normpath(call.apps[0]) != want:
+                    problems.append(
+                        f"{command!r} must pass exactly `--app {output_dir}` to `cdk deploy`"
+                    )
+                elif moved is not None:
+                    problems.append(
+                        f"{command!r} deploys after {moved!r} changed directory, so "
+                        f"--app {output_dir} would not be the assembly"
+                    )
+    if not deploys:
+        problems.append(
+            f"no `cdk deploy --app {output_dir}` found; call it directly in the deploy step's "
+            "commands (a script cannot be checked)"
+        )
+    return problems

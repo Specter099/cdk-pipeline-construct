@@ -23,7 +23,7 @@ from collections.abc import Iterable, Sequence
 
 from aws_cdk.assertions import Template
 
-from .gate import Gate, cdk_deploy_apps
+from .gate import Gate, assembly_deploy_violations
 from .pipeline import artifact_bucket_purpose
 from .runtimes import Runtime
 
@@ -306,12 +306,8 @@ def assert_builds_once(
         )
         mount = step_mounts(template, deploy["Name"]).get(artifact)
         assert mount, f"{deploy['Name']} does not link {artifact!r} into its directory"
-        apps = [app for cmd in step_commands(template, deploy["Name"]) for app in cdk_deploy_apps(cmd)]
-        assert apps, f"{deploy['Name']} has no `cdk deploy` command"
-        for app in apps:
-            assert app == mount, (
-                f"{deploy['Name']} runs `cdk deploy` with app {app!r}, not the assembly at {mount!r}"
-            )
+        problems = assembly_deploy_violations(step_commands(template, deploy["Name"]), mount)
+        assert not problems, f"{deploy['Name']} does not deploy the assembly: " + "; ".join(problems)
         for g in gates:
             if g.uses_assembly:
                 assert actions[f"Gate-{g.name}"]["RunOrder"] > producers[0]["RunOrder"], (
@@ -513,8 +509,8 @@ def assert_standard_contract(
     """Every invariant a StandardPipeline must satisfy. Repo-specific checks go alongside.
 
     ``repo`` is ``owner/name``; ``node_gates`` names the gates that run the CDK CLI or import
-    aws_cdk and therefore need Node. ``builds_once`` (default: on when any gate reads the
-    assembly) adds ``assert_builds_once``."""
+    aws_cdk and therefore need Node. ``builds_once`` (default: on when the pipeline has an
+    assembly step or any gate reads the assembly) adds ``assert_builds_once``."""
     name = repo.partition("/")[2]
     assert name, f"repo must be 'owner/name', got {repo!r}"
     assert_lambda_compute(template)
@@ -538,7 +534,9 @@ def assert_standard_contract(
             "PR-check projects exist but pull_request_checks is off"
         )
     assert_gates_have_node(gates, node_gates)
-    if builds_once if builds_once is not None else any(g.uses_assembly for g in gates):
+    if builds_once is None:
+        builds_once = bool(_assembly_actions(template)) or any(g.uses_assembly for g in gates)
+    if builds_once:
         assert_builds_once(template, gates, deploy_stage)
 
 

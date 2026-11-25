@@ -45,7 +45,7 @@ from .gate import (
     Gate,
     PostDeployStep,
     _Step,
-    cdk_deploy_apps,
+    assembly_deploy_violations,
     compute_type,
 )
 from .pull_request import PullRequestChecks
@@ -166,14 +166,14 @@ class StandardPipeline(Construct):
         if deploy_step is not None and assembly is None and any(g.uses_assembly for g in gates):
             raise ValueError("a gate has uses_assembly=True but the pipeline has no assembly")
         if assembly is not None and deploy_step is not None:
-            for command in deploy_step.commands:
-                for app in cdk_deploy_apps(command):
-                    if app != assembly.output_dir:
-                        raise ValueError(
-                            f"deploy step {deploy_step.name!r} runs `cdk deploy` without "
-                            f"`--app {assembly.output_dir}`, so it would synthesize again instead of "
-                            f"deploying the assembly the gates checked: {command!r}"
-                        )
+            problems = assembly_deploy_violations(
+                [*deploy_step.install, *deploy_step.commands], assembly.output_dir
+            )
+            if problems:
+                raise ValueError(
+                    f"deploy step {deploy_step.name!r} must deploy exactly the assembly the gates "
+                    "checked: " + "; ".join(problems)
+                )
 
         deploy_stage_name = (
             application_stage.stage_name if application_stage else DEPLOY_WAVE
@@ -380,4 +380,5 @@ class StandardPipeline(Construct):
                     assembly.commands if assembly else synth_commands,
                 ),
                 assembly_env=(assembly.env if assembly else dict(synth_env or {})),
+                assembly_memory_gb=assembly.memory_gb if assembly else synth_memory_gb,
             )

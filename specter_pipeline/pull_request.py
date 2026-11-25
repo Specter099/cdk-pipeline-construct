@@ -18,7 +18,9 @@ permissions here.
 
 A gate with ``uses_assembly=True`` reads ``cdk.out`` in the pipeline. A PR has no pipeline
 assembly, so its project first runs ``assembly_commands`` (the pipeline's own assembly or synth
-recipe) on the Python+Node runtime, then the gate.
+recipe) on the Python+Node runtime with the assembly's memory, then the gate. Its project
+therefore also receives the assembly's (or synth's) environment variables, next to PR-head code:
+keep secrets out of ``Assembly.env`` and ``synth_env``.
 """
 
 from __future__ import annotations
@@ -48,6 +50,7 @@ class PullRequestChecks(Construct):
         node_version: str = DEFAULT_NODE_VERSION,
         assembly_commands: Sequence[str] = (),
         assembly_env: Mapping[str, str] | None = None,
+        assembly_memory_gb: int = 4,
     ) -> None:
         super().__init__(scope, construct_id)
         owner, _, repo_name = repo.partition("/")
@@ -64,6 +67,10 @@ class PullRequestChecks(Construct):
                 )
             # An assembly gate builds cdk.out first, which needs Python and Node.
             runtime = Runtime.PYTHON_NODE if gate.uses_assembly else gate.runtime
+            # ...and as much memory as the pipeline gives that synthesis.
+            memory_gb = (
+                max(gate.memory_gb, assembly_memory_gb) if gate.uses_assembly else gate.memory_gb
+            )
             pre = list(assembly_commands) if gate.uses_assembly else []
             env = (
                 {**BASE_ENV, **(assembly_env or {}), **gate.env}
@@ -94,7 +101,7 @@ class PullRequestChecks(Construct):
                 ),
                 environment=codebuild.BuildEnvironment(
                     build_image=runtime.image,
-                    compute_type=compute_type(gate.memory_gb),
+                    compute_type=compute_type(memory_gb),
                 ),
                 environment_variables={
                     key: codebuild.BuildEnvironmentVariable(value=value)

@@ -13,8 +13,11 @@ of synthesizing their own. Pair it with ``python_cdk_assembly()`` on a ``deploy_
     StandardPipeline(..., assembly=python_cdk_assembly(), gates=python_cdk_gates(assembly=True),
                      deploy_step=DeployStep("app", ["cdk deploy --app cdk.out MyStack ..."]))
 
-The ``cdk-synth`` gate is then dropped (the assembly step is that synth) and ``access-analyzer``
-scans the shared templates on the plain Python runtime.
+The ``cdk-synth`` gate then only confirms the shared assembly exists (the assembly step is that
+synth; on a pull request its PR check synthesizes the PR, so a broken synth is still caught before
+merge), and ``access-analyzer`` scans the shared templates on the plain Python runtime. It fails
+if the directory holds no templates or holds nested stage assemblies instead, so it cannot pass
+having scanned nothing.
 
 Tool versions (bandit, pip-audit, boto3, cfn-flip) match the shared workflow; the CDK CLI is
 pinned by this package instead (``DEFAULT_CDK_CLI_VERSION``), because the CLI must support the
@@ -67,12 +70,27 @@ ACCESS_ANALYZER_SHA256 = (
 DEFAULT_BANDIT_EXCLUDES = ("./.venv", "./cdk.out", "./lambda_layer")
 
 
+def assembly_scan_guard(template_dir: str) -> list[str]:
+    """Fail unless ``template_dir`` holds templates and no nested stage assemblies (an
+    application_stage pipeline's top-level cdk.out holds only the pipeline stack)."""
+    d = shlex.quote(template_dir)
+    nested = shlex.quote(
+        f"{template_dir} holds nested stage assemblies; "
+        "scan cdk.out/assembly-<StageName> (assembly_dir=...)"
+    )
+    empty = shlex.quote(f"no templates in {template_dir}")
+    return [
+        f"if ls -d {d}/assembly-* >/dev/null 2>&1; then echo {nested}; exit 1; fi",
+        f"ls {d}/*.template.json >/dev/null 2>&1 || {{ echo {empty}; exit 1; }}",
+    ]
+
+
 def access_analyzer_commands(
     aws_region: str = "us-east-1", *, synth: bool = True, template_dir: str = "cdk.out"
 ) -> list[str]:
     url = f"https://raw.githubusercontent.com/{ACCESS_ANALYZER_REPO}/{ACCESS_ANALYZER_COMMIT}/{ACCESS_ANALYZER_SCRIPT}"
     return [
-        *(["cdk synth --quiet"] if synth else []),
+        *(["cdk synth --quiet"] if synth else assembly_scan_guard(template_dir)),
         # A dedicated directory and `python3 -I` keep /tmp (HOME, holding everything else) off sys.path.
         "mkdir -p /tmp/aa",
         f"curl -fsSL -o /tmp/aa/check_no_public_access.py {url}",
@@ -97,8 +115,8 @@ def python_cdk_gates(
 ) -> list[Gate]:
     """The shared review checks as pipeline gates.
 
-    ``assembly=True`` builds once: no ``cdk-synth`` gate, and ``access-analyzer`` reads the
-    pipeline's assembly from ``assembly_dir``. On a ``deploy_step`` pipeline that is ``cdk.out``;
+    ``assembly=True`` builds once: ``cdk-synth`` and ``access-analyzer`` read the pipeline's
+    assembly from ``assembly_dir`` instead of synthesizing. On a ``deploy_step`` pipeline that is ``cdk.out``;
     with ``application_stage`` the stage's templates are in ``cdk.out/assembly-<StageName>``.
 
     ``env`` is added to the steps that run CDK or the tests (for example
@@ -148,7 +166,20 @@ def python_cdk_gates(
             install=[f"pip install {PIP_AUDIT}"],
         )
     )
-    if not assembly:
+    if assembly:
+        # Free in the pipeline (the artifact already exists). On a pull request the PR check of a
+        # uses_assembly gate synthesizes first, so this keeps a synth on every PR: without it no
+        # PR check would synthesize (access-analyzer has IAM and never runs on PRs).
+        gates.append(
+            Gate(
+                "cdk-synth",
+                [f"test -f {shlex.quote(assembly_dir)}/manifest.json"],
+                Runtime.PYTHON,
+                env=extra,
+                uses_assembly=True,
+            )
+        )
+    else:
         gates.append(
             Gate(
                 "cdk-synth",

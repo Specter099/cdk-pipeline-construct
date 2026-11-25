@@ -18,10 +18,15 @@ Design rules baked in:
   only acts on a property *diff*, so a manual console change is not reliably
   reverted by a later no-change update.)
 * The artifact bucket has an explicit ``{purpose}-{account}-{region}-an`` name.
+* Build once: the cloud assembly that is deployed is the one the gates inspect. With
+  ``application_stage`` that is the Synth output; with ``deploy_step`` an ``Assembly`` step
+  builds it at the start of the Gates stage, and the deploy step snapshots it and deploys the
+  snapshot with a command the construct writes (``DeployStep(stacks=[...])``).
 """
 
 from __future__ import annotations
 
+import itertools
 import re
 from collections.abc import Sequence
 
@@ -35,7 +40,19 @@ from aws_cdk import aws_sns_subscriptions as subscriptions
 from aws_cdk import pipelines
 from constructs import Construct
 
-from .gate import BASE_ENV, DeployStep, Gate, PostDeployStep, compute_type
+from .gate import (
+    BASE_ENV,
+    Assembly,
+    DeployStep,
+    Gate,
+    PostDeployStep,
+    _Step,
+    compute_type,
+    deploy_command,
+    mentions_cdk_cli,
+    names_path,
+    snapshot_commands,
+)
 from .pull_request import PullRequestChecks
 from .runtimes import (
     DEFAULT_CDK_CLI_VERSION,
@@ -74,6 +91,36 @@ def _environment(runtime: Runtime, memory_gb: int) -> codebuild.BuildEnvironment
     )
 
 
+def _codebuild_step(
+    step_id: str,
+    spec: _Step,
+    *,
+    source: pipelines.IFileSetProducer,
+    node_version: str,
+    cdk_cli_version: str | None = None,
+    extra_policies: Sequence[iam.PolicyStatement] = (),
+    additional_inputs: dict[str, pipelines.IFileSetProducer] | None = None,
+    primary_output_directory: str | None = None,
+) -> pipelines.CodeBuildStep:
+    """The one way a step becomes a CodeBuild action: runtime prelude, optional CDK CLI, the
+    step's install and commands; CI env, its IAM, Lambda compute."""
+    return pipelines.CodeBuildStep(
+        step_id,
+        input=source,
+        additional_inputs=additional_inputs or None,
+        primary_output_directory=primary_output_directory,
+        commands=join(
+            prelude(spec.runtime, node_version),
+            cdk_cli_install(cdk_cli_version) if cdk_cli_version else (),
+            spec.install,
+            spec.commands,
+        ),
+        env=spec.environment,
+        role_policy_statements=[*extra_policies, *spec.policy_statements],
+        build_environment=_environment(spec.runtime, spec.memory_gb),
+    )
+
+
 class StandardPipeline(Construct):
     def __init__(
         self,
@@ -85,6 +132,7 @@ class StandardPipeline(Construct):
         gates: Sequence[Gate],
         application_stage: cdk.Stage | None = None,
         deploy_step: DeployStep | None = None,
+        assembly: Assembly | None = None,
         bootstrap_qualifier: str = "hnb659fds",
         synth_commands: Sequence[str],
         synth_install: Sequence[str] = (),
@@ -114,6 +162,46 @@ class StandardPipeline(Construct):
 
         if (application_stage is None) == (deploy_step is None):
             raise ValueError("provide exactly one of application_stage or deploy_step")
+
+        if assembly is not None and application_stage is not None:
+            raise ValueError(
+                "assembly is for deploy_step pipelines: with application_stage the Synth step "
+                "already builds the assembly that is deployed"
+            )
+        if deploy_step is not None and assembly is None and any(g.uses_assembly for g in gates):
+            raise ValueError("a gate has uses_assembly=True but the pipeline has no assembly")
+        if deploy_step is not None and assembly is None and deploy_step.stacks:
+            raise ValueError("DeployStep(stacks=...) deploys an Assembly; the pipeline has none")
+        if assembly is not None and deploy_step is not None:
+            if not (deploy_step.install or deploy_step.commands) and (
+                deploy_step.env or deploy_step.policy_statements
+            ):
+                raise ValueError(
+                    f"deploy step {deploy_step.name!r}: env and policy_statements apply to its "
+                    "own install/commands (the PreDeploy action); with none they would be dropped. "
+                    "The deploy itself gets only CI=true and the CDK bootstrap roles"
+                )
+            if not deploy_step.stacks:
+                raise ValueError(
+                    f"deploy step {deploy_step.name!r}: with an assembly, name the stacks "
+                    "(DeployStep(stacks=[...])) and the construct deploys the checked assembly"
+                )
+            for command in [*deploy_step.install, *deploy_step.commands]:
+                if mentions_cdk_cli(command):
+                    raise ValueError(
+                        f"deploy step {deploy_step.name!r}: {command!r} uses the CDK CLI. With an "
+                        "assembly the construct runs the only `cdk deploy`; any other CDK command "
+                        "here could deploy or synthesize something the gates never checked"
+                    )
+
+        mount = assembly.output_dir if assembly is not None else synth_output_dir
+        for gate in gates:
+            if gate.uses_assembly and not any(names_path(c, mount) for c in gate.commands):
+                raise ValueError(
+                    f"gate {gate.name!r} reads the assembly, which is linked at {mount!r}, but "
+                    "none of its commands names that directory. Pass it as an argument, "
+                    f"for example ./scripts/scan.sh {mount}"
+                )
 
         deploy_stage_name = (
             application_stage.stage_name if application_stage else DEPLOY_WAVE
@@ -194,21 +282,38 @@ class StandardPipeline(Construct):
             use_change_sets=True,
         )
 
+        # --- build once: the assembly gates inspect is the one deployed -----
+        # (application_stage: the Synth output; deploy_step: an Assembly step)
+        assembly_inputs: dict[str, pipelines.IFileSetProducer] = {}
+        assemble: pipelines.CodeBuildStep | None = None
+        if assembly is not None:
+            assemble = _codebuild_step(
+                assembly.name,
+                assembly,
+                source=source,
+                node_version=node_version,
+                cdk_cli_version=cdk_cli_version,
+                primary_output_directory=assembly.output_dir,
+            )
+            assembly_inputs = {assembly.output_dir: assemble}
+        elif application_stage is not None:
+            assembly_inputs = {synth_output_dir: synth}
+
         # --- gates: all run in parallel after the pipeline updates itself ----
+        # (gates that read the assembly start once it exists; the rest do not wait)
         gate_steps = [
-            pipelines.CodeBuildStep(
+            _codebuild_step(
                 f"Gate-{gate.name}",
-                input=source,
-                commands=join(
-                    prelude(gate.runtime, node_version), gate.install, gate.commands
-                ),
-                env=gate.environment,
-                role_policy_statements=list(gate.policy_statements),
-                build_environment=_environment(gate.runtime, gate.memory_gb),
+                gate,
+                source=source,
+                node_version=node_version,
+                additional_inputs=assembly_inputs if gate.uses_assembly else None,
             )
             for gate in gates
         ]
-        self.pipeline.add_wave("Gates", post=gate_steps)
+        self.pipeline.add_wave(
+            "Gates", pre=[assemble] if assemble else [], post=gate_steps
+        )
 
         # --- deploy stage: approval -> deploy -> post-deploy -----------------
         pre: list[pipelines.Step] = []
@@ -216,15 +321,8 @@ class StandardPipeline(Construct):
             pre.append(pipelines.ManualApprovalStep(f"Approve-{deploy_stage_name}"))
 
         post: list[pipelines.Step] = [
-            pipelines.CodeBuildStep(
-                f"Post-{step.name}",
-                input=source,
-                commands=join(
-                    prelude(step.runtime, node_version), step.install, step.commands
-                ),
-                env=step.environment,
-                role_policy_statements=list(step.policy_statements),
-                build_environment=_environment(step.runtime, step.memory_gb),
+            _codebuild_step(
+                f"Post-{step.name}", step, source=source, node_version=node_version
             )
             for step in post_deploy
         ]
@@ -232,43 +330,72 @@ class StandardPipeline(Construct):
             self.pipeline.add_stage(application_stage, pre=pre, post=post)
         else:
             assert deploy_step is not None
-            deploy = pipelines.CodeBuildStep(
-                f"Deploy-{deploy_step.name}",
-                input=source,
-                commands=join(
-                    prelude(deploy_step.runtime, node_version),
-                    cdk_cli_install(cdk_cli_version),
-                    deploy_step.install,
-                    deploy_step.commands,
-                ),
-                env=deploy_step.environment,
-                role_policy_statements=[
-                    # `cdk deploy` assumes the CDK bootstrap roles (deploy,
-                    # file/image publishing, lookup); nothing else.
-                    iam.PolicyStatement(
-                        actions=["sts:AssumeRole"],
-                        resources=[
-                            (
-                                f"arn:aws:iam::{cdk.Aws.ACCOUNT_ID}:role/"
-                                f"cdk-{bootstrap_qualifier}-*-role-{cdk.Aws.ACCOUNT_ID}-{cdk.Aws.REGION}"
-                            )
-                        ],
-                    ),
-                    *deploy_step.policy_statements,
+            # `cdk deploy` assumes the CDK bootstrap roles (deploy, file/image publishing,
+            # lookup); nothing else.
+            assume_bootstrap = iam.PolicyStatement(
+                actions=["sts:AssumeRole"],
+                resources=[
+                    f"arn:{cdk.Aws.PARTITION}:iam::{account}:role/"
+                    f"cdk-{bootstrap_qualifier}-*-role-{account}-{region}"
+                    for account, region in [
+                        (cdk.Aws.ACCOUNT_ID, cdk.Aws.REGION),
+                        *deploy_step.deploy_environments,
+                    ]
                 ],
-                build_environment=_environment(
-                    deploy_step.runtime, deploy_step.memory_gb
-                ),
             )
+            steps: list[pipelines.Step] = []
+            if assembly is not None and assemble is not None:
+                # Build once. Repo work runs in its own action, without deploy rights; the
+                # deploy action is the construct's alone: its only input is the assembly (no
+                # source, so no repo code or cdk.json), it snapshots it and deploys the
+                # snapshot with the pinned CLI.
+                if deploy_step.install or deploy_step.commands:
+                    steps.append(
+                        _codebuild_step(
+                            f"PreDeploy-{deploy_step.name}",
+                            deploy_step,
+                            source=source,
+                            node_version=node_version,
+                        )
+                    )
+                steps.append(
+                    pipelines.CodeBuildStep(
+                        f"Deploy-{deploy_step.name}",
+                        input=assemble,
+                        commands=join(
+                            snapshot_commands("."),
+                            cdk_cli_install(cdk_cli_version),
+                            [deploy_command(deploy_step.stacks, deploy_step.deploy_args)],
+                        ),
+                        # Only CI=true: the step's env could steer the CLI (NODE_OPTIONS ...).
+                        env=dict(BASE_ENV),
+                        role_policy_statements=[assume_bootstrap],
+                        build_environment=_environment(Runtime.NODE, deploy_step.memory_gb),
+                    )
+                )
+            else:
+                steps.append(
+                    _codebuild_step(
+                        f"Deploy-{deploy_step.name}",
+                        deploy_step,
+                        source=source,
+                        node_version=node_version,
+                        cdk_cli_version=cdk_cli_version,
+                        extra_policies=[assume_bootstrap],
+                    )
+                )
+            deploy = steps[-1]
+            for earlier, later in itertools.pairwise(steps):
+                later.add_step_dependency(earlier)
             # In a wave with no stacks, `pre` and `post` steps are NOT ordered
             # by position alone: without these dependencies the approval and
             # the deploy get the same RunOrder and run in parallel, i.e. the
             # deploy would not wait for approval. Make the order explicit.
             for approval in pre:
-                deploy.add_step_dependency(approval)
+                steps[0].add_step_dependency(approval)
             for step in post:
                 step.add_step_dependency(deploy)
-            self.pipeline.add_wave(DEPLOY_WAVE, pre=pre, post=[deploy, *post])
+            self.pipeline.add_wave(DEPLOY_WAVE, pre=pre, post=[*steps, *post])
 
         self.pipeline.build_pipeline()
 
@@ -311,4 +438,11 @@ class StandardPipeline(Construct):
                 gates=[g for g in gates if g.runs_on_pull_requests],
                 name_prefix=name,
                 node_version=node_version,
+                assembly_commands=join(
+                    cdk_cli_install(cdk_cli_version),
+                    assembly.install if assembly else synth_install,
+                    assembly.commands if assembly else synth_commands,
+                ),
+                assembly_env=(assembly.env if assembly else dict(synth_env or {})),
+                assembly_memory_gb=assembly.memory_gb if assembly else synth_memory_gb,
             )

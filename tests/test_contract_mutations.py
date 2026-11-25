@@ -11,7 +11,8 @@ import pytest
 from aws_cdk.assertions import Template
 from test_pipeline import GATES, _step_build
 
-from specter_pipeline import Gate, testing as c
+from specter_pipeline import Gate
+from specter_pipeline import testing as c
 
 PREFIX = "demo"
 

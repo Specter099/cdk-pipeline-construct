@@ -28,9 +28,77 @@ StandardPipeline(
 
 ```
 Source (main) -> Build (synth) -> UpdatePipeline (self-mutate)
-   -> Gates (every check, in parallel)
+   -> Gates (assembly step, then every check in parallel)
    -> Deploy (manual approval -> deploy -> post-deploy steps)
 ```
+
+## Build once: the checked templates are the deployed templates
+
+Without it, `cdk synth` runs separately in the synth gate, the Access Analyzer gate and the deploy,
+each after its own `pip install`, so the template that passed the checks is not provably the one
+that ships. With it, the application is synthesized once and every consumer reads that artifact.
+
+```python
+from specter_pipeline import DeployStep, StandardPipeline
+from specter_pipeline.presets import python_cdk_assembly, python_cdk_gates
+
+GATES = python_cdk_gates(assembly=True)          # cdk-synth and access-analyzer read cdk.out
+StandardPipeline(
+    self, "Pipeline", repo="Specter099/my-repo", connection_arn=connection_arn, gates=GATES,
+    assembly=python_cdk_assembly(),                # pip install -r requirements.txt && cdk synth
+    deploy_step=DeployStep("app", stacks=["MyStack"]),
+    synth_commands=['cdk -a "python3 pipeline_app.py" synth'],
+)
+```
+
+**What is guaranteed.** With an assembly, the deploy is an action only the construct writes:
+* its only input is the assembly artifact, so there is no source checkout and no repo script in it;
+* it copies the assembly to `/tmp/assembly`, and refuses an assembly that contains a `cdk.json`
+  (the CLI would run that file's `build` hook before loading the snapshot);
+* it installs the pinned CDK CLI and runs
+  `/tmp/nodejs/bin/cdk deploy --app /tmp/assembly <stacks> <deploy_args>` from a fresh empty
+  directory, by absolute path so a `PATH` change cannot swap the CLI;
+* its only environment variable is `CI=true`. `DeployStep.env` goes to the `PreDeploy` action, so it
+  cannot steer the CLI (for example with `NODE_OPTIONS`);
+* it may assume the CDK bootstrap roles of the pipeline's own account and region, plus each
+  `(account, region)` in `DeployStep(deploy_environments=[...])`, and nothing else;
+* `--require-approval never` is added unless `deploy_args` sets `--require-approval`, and
+  `deploy_args` may not set `--app`, `--build` or `--output` in any spelling the CLI accepts
+  (`-va`, `--no-app`, camelCase).
+
+Your `install` and `commands`, if any, run before it in a separate `PreDeploy-<name>` action, after
+the approval. That action holds your `policy_statements` but cannot assume the CDK deploy roles, and
+it cannot touch the deploy action's files. `assert_builds_once` checks the deploy action's inputs,
+phases and exact command list. The standard contract runs it whenever the pipeline has an assembly
+step.
+
+**What is a guard, not a guarantee.** The `PreDeploy` commands may not mention the CDK CLI in any
+spelling (`cdk`, `aws-cdk`, `cdk@2`, `.../bin/cdk`). This is a plain text match, so loops, comments,
+backticks and wrappers cannot hide it. It does not see inside scripts or shell variables. A `cdk/`
+directory in a path is allowed, but the bare word is refused (`cd cdk`, `npm ci --prefix cdk`); put
+such work in a script. The guard is a second line of defence: without the deploy roles, a `cdk deploy`
+there fails unless your own `policy_statements` grant CloudFormation access.
+
+* `Assembly` runs first in the Gates stage on Python+Node with the pinned CDK CLI. Its `cdk.out` is
+  linked into every gate with `Gate(uses_assembly=True)`, and is the deploy action's only input. A
+  gate that reads it must name that directory in its commands, or the pipeline refuses it. Gates that do not
+  read it start at the same time, so the stage is no slower.
+* The assembly step takes no IAM permissions. Commit `cdk.context.json` instead of looking values up.
+* With `application_stage` there is nothing to add: the Synth output is what the stage deploys, and
+  `uses_assembly` gates read it.
+* The preset's Access Analyzer gate scans the top-level templates and every nested `assembly-*`
+  directory, so it covers a stage's stacks (`cdk.out/assembly-Prod/`) and an app's own stages. It
+  follows the link CDK Pipelines puts at `cdk.out`, and fails if it finds no templates at all.
+* A non-default assembly directory goes to both sides:
+  `python_cdk_assembly(output_dir="infra/cdk.out")` with
+  `python_cdk_gates(assembly=True, assembly_dir="infra/cdk.out")`. The contract fails when a gate
+  never refers to the directory the assembly is linked at.
+* On pull requests there is no pipeline assembly, so the PR project of a `uses_assembly` gate runs
+  the assembly (or synth) commands first, with the assembly's (or synth's) memory. It also receives
+  `Assembly.env` (or `synth_env`) beside the PR's code, so keep secrets out of both. The preset keeps
+  a permission-free `cdk-synth` gate in assembly mode for this reason: every PR still synthesizes.
+* Not yet proven on a live pipeline: deploying from the `/tmp/assembly` copy on Lambda compute.
+  Try it once with `deploy_enabled=False`, then enable the deploy.
 
 Pull requests are validated by **`PullRequestChecks`**: one CodeBuild project per
 gate, triggered by a webhook, reporting a commit status per gate. This is a
@@ -49,6 +117,7 @@ Lambda compute has no instance, so there is no EC2 user data. The per-repo hooks
 | Environment variables | `env={...}` (`CI=true` is always set) |
 | Extra IAM for a step | `policy_statements=[...]` |
 | Repo-specific logic | the repo's own script (e.g. `scripts/ci-local.sh`), called from `commands` |
+| Inspect the deployed templates | `Gate(uses_assembly=True)` reads `cdk.out` |
 
 ## Runtimes (verified against live Lambda compute images)
 
@@ -101,7 +170,8 @@ def test_pipeline(template):
                                       node_gates=["tests", "cdk-synth"])
 ```
 
-It checks Lambda compute everywhere, the stage order, the gates, the deploy closed (or open),
+It checks Lambda compute everywhere, the stage order, the gates, build-once (whenever the pipeline has an
+assembly step or a gate reads the assembly), the deploy closed (or open),
 approval strictly before deploy before post-deploy, no pipeline triggers, restart on update, the
 account-regional artifact bucket, the PR-check filter and least-privilege roles, and Node on the
 gates that need it. Each helper also exists on its own, and each is tested against a pipeline that
@@ -130,6 +200,7 @@ implemented yet).
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements-dev.txt
+ruff check specter_pipeline tests
 JSII_RUNTIME_PACKAGE_CACHE_ROOT=$TMPDIR/jsii-cache pytest -q   # env var only needed in a sandbox
 ```
 

@@ -17,14 +17,23 @@ pipeline; the comments say which.
 
 from __future__ import annotations
 
+import json
 import re
 from collections.abc import Iterable, Sequence
 
+from aws_cdk import aws_codebuild as codebuild
 from aws_cdk.assertions import Template
 
-from .gate import Gate
+from .gate import (
+    Gate,
+    mentions_cdk_cli,
+    names_path,
+    owns_deploy_flag,
+    snapshot_commands,
+    split_deploy_command,
+)
 from .pipeline import artifact_bucket_purpose
-from .runtimes import Runtime
+from .runtimes import Runtime, cdk_cli_install
 
 #: Settings CodeBuild rejects or ignores on Lambda compute.
 _UNSUPPORTED_ON_LAMBDA = (
@@ -106,17 +115,28 @@ def projects(template: Template) -> dict:
     return template.find_resources("AWS::CodeBuild::Project")
 
 
+def _step_buildspec(template: Template, step_name: str) -> dict:
+    for res in projects(template).values():
+        if str(res["Properties"].get("Description", "")).endswith(f"/{step_name}"):
+            return json.loads(res["Properties"]["Source"]["BuildSpec"])
+    raise AssertionError(f"no CodeBuild project for pipeline step {step_name!r}")
+
+
 def step_commands(template: Template, step_name: str) -> list[str]:
     """The buildspec commands of the CodeBuild project behind pipeline step ``step_name``
     (for example ``"Deploy-app"`` or ``"Gate-tests"``)."""
-    import json
+    return _step_buildspec(template, step_name)["phases"]["build"]["commands"]
 
-    for res in projects(template).values():
-        if str(res["Properties"].get("Description", "")).endswith(f"/{step_name}"):
-            return json.loads(res["Properties"]["Source"]["BuildSpec"])["phases"][
-                "build"
-            ]["commands"]
-    raise AssertionError(f"no CodeBuild project for pipeline step {step_name!r}")
+
+_MOUNT = re.compile(r"""ln -s -- "\$CODEBUILD_SRC_DIR_([A-Za-z0-9_]+)" '([^']+)'""")
+
+
+def step_mounts(template: Template, step_name: str) -> dict[str, str]:
+    """{artifact name: directory} for the extra artifacts CDK Pipelines links into a step's
+    working directory (``additional_inputs``)."""
+    spec = _step_buildspec(template, step_name)
+    install = spec.get("phases", {}).get("install", {}).get("commands", [])
+    return {m.group(1): m.group(2) for cmd in install for m in _MOUNT.finditer(cmd)}
 
 
 def pr_projects(template: Template, name_prefix: str) -> dict:
@@ -182,15 +202,28 @@ def assert_stage_order(template: Template, deploy_stage: str = "Deploy") -> None
     )
 
 
+def _assembly_actions(template: Template) -> list[dict]:
+    """Actions in the Gates stage that produce an artifact: the build-once assembly step."""
+    return [a for a in _stage(template, "Gates")["Actions"] if a.get("OutputArtifacts")]
+
+
 def assert_gates_present(template: Template, gates: Sequence[Gate]) -> None:
-    present = {a["Name"] for a in _stage(template, "Gates")["Actions"]}
-    expected = {f"Gate-{g.name}" for g in gates}
-    assert present == expected, (
-        f"gates differ: missing={sorted(expected - present)} extra={sorted(present - expected)}"
+    """Exactly these gates (plus at most one assembly step), in parallel: every gate that does
+    not read the assembly shares one RunOrder, and so does every gate that does."""
+    actions = _stage(template, "Gates")["Actions"]
+    producers = _assembly_actions(template)
+    assert len(producers) <= 1, f"more than one step produces an artifact in Gates: {producers}"
+    by_name = {a["Name"]: a for a in actions if a not in producers}
+    expected = {f"Gate-{g.name}": g for g in gates}
+    assert set(by_name) == set(expected), (
+        f"gates differ: missing={sorted(set(expected) - set(by_name))} "
+        f"extra={sorted(set(by_name) - set(expected))}"
     )
-    assert len({a["RunOrder"] for a in _stage(template, "Gates")["Actions"]}) == 1, (
-        "gates should run in parallel"
-    )
+    for reads in (False, True):
+        orders = {
+            by_name[n]["RunOrder"] for n, g in expected.items() if g.uses_assembly is reads
+        }
+        assert len(orders) <= 1, "gates should run in parallel"
 
 
 def assert_deploy_closed(template: Template, deploy_stage: str = "Deploy") -> None:
@@ -248,6 +281,115 @@ def assert_deploy_ordering(
         assert max(d["RunOrder"] for d in deploys) < a["RunOrder"], (
             f"{a['Name']} does not wait for the deploy"
         )
+
+
+def _project_of(template: Template, step_name: str) -> dict:
+    for res in projects(template).values():
+        if str(res["Properties"].get("Description", "")).endswith(f"/{step_name}"):
+            return res["Properties"]
+    raise AssertionError(f"no CodeBuild project for pipeline step {step_name!r}")
+
+
+def _assert_construct_deploy(template: Template, action: dict) -> None:
+    """The deploy action runs exactly: snapshot the assembly, install the pinned CLI, deploy the
+    snapshot with that CLI by absolute path from an empty directory. Nothing else: no other
+    buildspec key, phase or phase setting, no environment beyond CI=true, the Node image."""
+    step = action["Name"]
+    assert not action.get("Configuration", {}).get("EnvironmentVariables"), (
+        f"{step} sets action-level environment variables"
+    )
+    props = _project_of(template, step)
+    env = props["Environment"]
+    assert env["Image"] == codebuild.LinuxLambdaBuildImage.AMAZON_LINUX_2023_NODE_22.image_id, (
+        f"{step} does not run on the Node Lambda image: {env['Image']}"
+    )
+    variables = {(v["Name"], v.get("Type", "PLAINTEXT"), v.get("Value")) for v in env.get("EnvironmentVariables", [])}
+    assert variables == {("CI", "PLAINTEXT", "true")}, (
+        f"{step} has environment variables besides a plaintext CI=true: {variables}"
+    )
+    spec = json.loads(props["Source"]["BuildSpec"])
+    assert set(spec) <= {"version", "phases"}, f"{step} buildspec has extra keys: {sorted(spec)}"
+    assert set(spec.get("phases", {})) == {"build"}, (
+        f"{step} has phases besides build: {sorted(spec.get('phases', {}))}"
+    )
+    assert set(spec["phases"]["build"]) == {"commands"}, (
+        f"{step} build phase has settings besides commands: {sorted(spec['phases']['build'])}"
+    )
+    cmds = spec["phases"]["build"]["commands"]
+    versions = [
+        m.group(1)
+        for c in cmds
+        if (m := re.fullmatch(r"npm install -g --prefix \S+ aws-cdk@(\d+\.\d+\.\d+)", c))
+    ]
+    assert len(versions) == 1, f"{step} does not install a pinned CDK CLI version exactly once"
+    expected_head = [*snapshot_commands("."), *cdk_cli_install(versions[0])]
+    assert cmds[:-1] == expected_head, (
+        f"{step} runs commands besides the snapshot, the CLI install and the deploy: {cmds[:-1]}"
+    )
+    tokens = split_deploy_command(cmds[-1])
+    assert tokens is not None, (
+        f"{step} does not deploy the assembly snapshot with the pinned CLI: {cmds[-1]!r}"
+    )
+    assert not any(owns_deploy_flag(t) for t in tokens[4:]), (
+        f"{step} deploy overrides --app, --build or --output: {cmds[-1]!r}"
+    )
+
+
+def assert_builds_once(
+    template: Template, gates: Sequence[Gate], deploy_stage: str = "Deploy"
+) -> None:
+    """The templates the gates inspect are the templates that are deployed.
+
+    ``deploy_step`` pipelines: one assembly step in Gates; every gate with
+    ``uses_assembly=True`` read its artifact and name the directory it is linked at in their
+    commands; the
+    deploy action reads only that artifact and runs exactly the construct's snapshot, pinned CLI
+    install and deploy; any ``PreDeploy-`` action runs before it and never uses the CDK CLI.
+    ``application_stage`` pipelines: those gates read the Synth output, which is what the
+    stage's CloudFormation actions deploy."""
+    actions = {a["Name"]: a for a in _stage(template, "Gates")["Actions"]}
+    producers = _assembly_actions(template)
+    deploy_actions = _stage(template, deploy_stage)["Actions"]
+    cfn = [a for a in deploy_actions if a["ActionTypeId"]["Provider"] == "CloudFormation"]
+
+    if cfn:
+        assert not producers, "a stage-deployed pipeline must not build a second assembly"
+        deployed = {i["Name"] for a in cfn for i in a.get("InputArtifacts", [])}
+        assert len(deployed) == 1, f"stage deploys from {sorted(deployed)}, expected one assembly"
+        artifact = deployed.pop()
+    else:
+        assert len(producers) == 1, (
+            "no assembly step in Gates: the deploy would synthesize its own templates"
+        )
+        artifact = producers[0]["OutputArtifacts"][0]["Name"]
+        (deploy,) = [a for a in deploy_actions if a["Name"].startswith("Deploy-")]
+        reads = [i["Name"] for i in deploy.get("InputArtifacts", [])]
+        assert artifact in reads, f"{deploy['Name']} does not read the assembly {artifact!r}"
+        assert reads == [artifact], (
+            f"{deploy['Name']} reads {reads}: the deploy must read the assembly and nothing else"
+        )
+        _assert_construct_deploy(template, deploy)
+        for a in deploy_actions:
+            if a["Name"].startswith("PreDeploy-"):
+                assert a["RunOrder"] < deploy["RunOrder"], f"{a['Name']} does not finish before the deploy"
+                for cmd in step_commands(template, a["Name"]):
+                    assert not mentions_cdk_cli(cmd), f"{a['Name']} uses the CDK CLI: {cmd!r}"
+        for g in gates:
+            if g.uses_assembly:
+                assert actions[f"Gate-{g.name}"]["RunOrder"] > producers[0]["RunOrder"], (
+                    f"Gate-{g.name} does not wait for the assembly"
+                )
+
+    for g in gates:
+        reads = {i["Name"] for i in actions[f"Gate-{g.name}"].get("InputArtifacts", [])}
+        if g.uses_assembly:
+            assert artifact in reads, f"Gate-{g.name} does not read the deployed assembly {artifact!r}"
+            mount = step_mounts(template, f"Gate-{g.name}").get(artifact)
+            assert mount, f"Gate-{g.name} does not link the assembly into its directory"
+            assert any(names_path(cmd, mount) for cmd in g.commands), (
+                f"Gate-{g.name} never refers to {mount!r}, where the assembly is linked: it may "
+                "be reading some other directory"
+            )
 
 
 def assert_no_pipeline_triggers(template: Template) -> None:
@@ -434,11 +576,13 @@ def assert_standard_contract(
     base_branch: str = "main",
     node_gates: Iterable[str] = (),
     require_approval: bool = True,
+    builds_once: bool | None = None,
 ) -> None:
     """Every invariant a StandardPipeline must satisfy. Repo-specific checks go alongside.
 
     ``repo`` is ``owner/name``; ``node_gates`` names the gates that run the CDK CLI or import
-    aws_cdk and therefore need Node."""
+    aws_cdk and therefore need Node. ``builds_once`` (default: on when the pipeline has an
+    assembly step or any gate reads the assembly) adds ``assert_builds_once``."""
     name = repo.partition("/")[2]
     assert name, f"repo must be 'owner/name', got {repo!r}"
     assert_lambda_compute(template)
@@ -462,11 +606,16 @@ def assert_standard_contract(
             "PR-check projects exist but pull_request_checks is off"
         )
     assert_gates_have_node(gates, node_gates)
+    if builds_once is None:
+        builds_once = bool(_assembly_actions(template)) or any(g.uses_assembly for g in gates)
+    if builds_once:
+        assert_builds_once(template, gates, deploy_stage)
 
 
 __all__ = [
     "CDK_INTERNAL_WILDCARDS",
     "assert_artifact_bucket",
+    "assert_builds_once",
     "assert_ci_env_on_repo_command_projects",
     "assert_deploy_closed",
     "assert_deploy_open",
@@ -486,4 +635,5 @@ __all__ = [
     "pr_projects",
     "projects",
     "step_commands",
+    "step_mounts",
 ]

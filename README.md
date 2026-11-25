@@ -39,41 +39,51 @@ each after its own `pip install`, so the template that passed the checks is not 
 that ships. With it, the application is synthesized once and every consumer reads that artifact.
 
 ```python
-from specter_pipeline import Assembly, DeployStep, StandardPipeline
+from specter_pipeline import DeployStep, StandardPipeline
 from specter_pipeline.presets import python_cdk_assembly, python_cdk_gates
 
 GATES = python_cdk_gates(assembly=True)          # cdk-synth and access-analyzer read cdk.out
 StandardPipeline(
     self, "Pipeline", repo="Specter099/my-repo", connection_arn=connection_arn, gates=GATES,
     assembly=python_cdk_assembly(),                # pip install -r requirements.txt && cdk synth
-    deploy_step=DeployStep("app", ["cdk deploy --app cdk.out MyStack --require-approval never"]),
+    deploy_step=DeployStep("app", stacks=["MyStack"]),
     synth_commands=['cdk -a "python3 pipeline_app.py" synth'],
 )
 ```
 
+**What is guaranteed.** The construct writes the deploy itself. The deploy step:
+1. copies the assembly artifact to `/tmp/assembly`, after the runtime set-up and before any of your
+   commands run;
+2. runs your `install` and `commands`;
+3. runs `cdk deploy --app /tmp/assembly <stacks> <deploy_args>` as its last command.
+
+Nothing your commands do to `cdk.out` changes what that last command deploys. That includes a
+re-synth, `cdk diff`, or a `build` command in `cdk.json`. `deploy_args` (default
+`--require-approval never`) may not set `--app`, `--build` or `--output`.
+`assert_builds_once` checks this shape on the synthesized template, and the standard contract runs
+it whenever the pipeline has an assembly step.
+
+**What is a guard, not a guarantee.** With an assembly, the deploy step's `install` and `commands`
+may not mention the CDK CLI in any spelling (`cdk`, `aws-cdk`, `cdk@2`, `.../bin/cdk`). This is a
+plain text match, so loops, comments, backticks and wrappers cannot hide a second `cdk deploy`.
+A script or a shell variable is opaque to it: `./deploy.sh` could still run its own deploy. Keep
+deploy scripts free of CDK commands; the construct runs the deploy.
+
 * `Assembly` runs first in the Gates stage on Python+Node with the pinned CDK CLI. Its `cdk.out` is
   linked into every gate with `Gate(uses_assembly=True)` and into the deploy step. Gates that do not
   read it start at the same time, so the stage is no slower.
-* The deploy step is checked when the pipeline is synthesized, and refused unless every
-  `cdk deploy` in its `install` and `commands` passes exactly `--app cdk.out`. It is also refused for
-  any `cdk synth` (which would rewrite `cdk.out`), a `cd` before the deploy, or no direct
-  `cdk deploy` at all. A deploy script cannot be checked, so call `cdk deploy --app cdk.out` directly
-  and keep scripts for the work around it. Commands are split on every shell operator, and
-  `npx aws-cdk`, `cdk@2`, `bash -c` and subshells are seen through. Anything unparseable is refused.
-  `assert_builds_once` repeats the check on the synthesized template. The standard contract runs it
-  whenever the pipeline has an assembly step.
 * The assembly step takes no IAM permissions. Commit `cdk.context.json` instead of looking values up.
 * With `application_stage` there is nothing to add: the Synth output is what the stage deploys, and
-  `uses_assembly` gates read it. The stage's templates are under `cdk.out/assembly-<StageName>/`,
-  so pass `python_cdk_gates(assembly=True, assembly_dir="cdk.out/assembly-Prod")`. The preset's
-  Access Analyzer gate fails if its directory holds nested stage assemblies or no templates, so a
-  wrong directory cannot pass having scanned nothing.
+  `uses_assembly` gates read it.
+* The preset's Access Analyzer gate scans the top-level templates and every nested `assembly-*`
+  directory, so it covers a stage's stacks (`cdk.out/assembly-Prod/`) and an app's own stages. It
+  fails if it finds no templates at all.
 * On pull requests there is no pipeline assembly, so the PR project of a `uses_assembly` gate runs
   the assembly (or synth) commands first, with the assembly's (or synth's) memory. It also receives
   `Assembly.env` (or `synth_env`) beside the PR's code, so keep secrets out of both. The preset keeps
   a permission-free `cdk-synth` gate in assembly mode for this reason: every PR still synthesizes.
-* Not yet proven on a live pipeline: that `cdk deploy --app cdk.out` works when `cdk.out` is the
-  linked artifact (CDK Pipelines links it as a symlink and the CLI writes a lock file into it).
+* Not yet proven on a live pipeline: deploying from the `/tmp/assembly` copy on Lambda compute.
+  Try it once with `deploy_enabled=False`, then enable the deploy.
 
 Pull requests are validated by **`PullRequestChecks`**: one CodeBuild project per
 gate, triggered by a webhook, reporting a commit status per gate. This is a

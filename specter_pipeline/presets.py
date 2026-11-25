@@ -11,13 +11,14 @@ Build once: with ``assembly=True`` the checks read the cloud assembly the pipeli
 of synthesizing their own. Pair it with ``python_cdk_assembly()`` on a ``deploy_step`` pipeline::
 
     StandardPipeline(..., assembly=python_cdk_assembly(), gates=python_cdk_gates(assembly=True),
-                     deploy_step=DeployStep("app", ["cdk deploy --app cdk.out MyStack ..."]))
+                     deploy_step=DeployStep("app", stacks=["MyStack"]))
 
 The ``cdk-synth`` gate then only confirms the shared assembly exists (the assembly step is that
 synth; on a pull request its PR check synthesizes the PR, so a broken synth is still caught before
-merge), and ``access-analyzer`` scans the shared templates on the plain Python runtime. It fails
-if the directory holds no templates or holds nested stage assemblies instead, so it cannot pass
-having scanned nothing.
+merge), and ``access-analyzer`` scans the shared templates on the plain Python runtime.
+
+``access-analyzer`` scans the top-level templates and every nested ``assembly-*`` directory (where
+an ``application_stage`` pipeline's application stacks live), and fails if it found none.
 
 Tool versions (bandit, pip-audit, boto3, cfn-flip) match the shared workflow; the CDK CLI is
 pinned by this package instead (``DEFAULT_CDK_CLI_VERSION``), because the CLI must support the
@@ -70,18 +71,20 @@ ACCESS_ANALYZER_SHA256 = (
 DEFAULT_BANDIT_EXCLUDES = ("./.venv", "./cdk.out", "./lambda_layer")
 
 
-def assembly_scan_guard(template_dir: str) -> list[str]:
-    """Fail unless ``template_dir`` holds templates and no nested stage assemblies (an
-    application_stage pipeline's top-level cdk.out holds only the pipeline stack)."""
+def scan_every_assembly(template_dir: str, scan: str) -> list[str]:
+    """Run ``scan --template-dir <dir>`` on ``template_dir`` and on every nested ``assembly-*``
+    directory under it (an application_stage pipeline's stacks live in
+    ``cdk.out/assembly-<Stage>/``, an app's own Stages likewise), skipping directories without
+    templates. Fails if no directory had any, so the gate cannot pass having scanned nothing."""
     d = shlex.quote(template_dir)
-    nested = shlex.quote(
-        f"{template_dir} holds nested stage assemblies; "
-        "scan cdk.out/assembly-<StageName> (assembly_dir=...)"
-    )
-    empty = shlex.quote(f"no templates in {template_dir}")
+    empty = shlex.quote(f"no CloudFormation templates under {template_dir}")
     return [
-        f"if ls -d {d}/assembly-* >/dev/null 2>&1; then echo {nested}; exit 1; fi",
-        f"ls {d}/*.template.json >/dev/null 2>&1 || {{ echo {empty}; exit 1; }}",
+        f"{{ printf '%s\\n' {d}; find {d} -mindepth 1 -type d -name 'assembly-*'; }} | sort -u > /tmp/aa/dirs",
+        (
+            'found=0; while IFS= read -r dir; do ls "$dir"/*.template.json >/dev/null 2>&1 || continue; '
+            f'found=1; {scan} --template-dir "$dir" || exit 1; done < /tmp/aa/dirs; '
+            f'[ "$found" = 1 ] || {{ echo {empty}; exit 1; }}'
+        ),
     ]
 
 
@@ -90,12 +93,16 @@ def access_analyzer_commands(
 ) -> list[str]:
     url = f"https://raw.githubusercontent.com/{ACCESS_ANALYZER_REPO}/{ACCESS_ANALYZER_COMMIT}/{ACCESS_ANALYZER_SCRIPT}"
     return [
-        *(["cdk synth --quiet"] if synth else assembly_scan_guard(template_dir)),
+        *(["cdk synth --quiet"] if synth else []),
         # A dedicated directory and `python3 -I` keep /tmp (HOME, holding everything else) off sys.path.
         "mkdir -p /tmp/aa",
         f"curl -fsSL -o /tmp/aa/check_no_public_access.py {url}",
         f'echo "{ACCESS_ANALYZER_SHA256}  /tmp/aa/check_no_public_access.py" | sha256sum -c -',
-        f"python3 -I /tmp/aa/check_no_public_access.py --template-dir {shlex.quote(template_dir)} --aws-region {aws_region} --fail-on-public-access",
+        *scan_every_assembly(
+            template_dir,
+            "python3 -I /tmp/aa/check_no_public_access.py "
+            f"--aws-region {shlex.quote(aws_region)} --fail-on-public-access",
+        ),
     ]
 
 
@@ -116,7 +123,8 @@ def python_cdk_gates(
     """The shared review checks as pipeline gates.
 
     ``assembly=True`` builds once: ``cdk-synth`` and ``access-analyzer`` read the pipeline's
-    assembly from ``assembly_dir`` instead of synthesizing. On a ``deploy_step`` pipeline that is ``cdk.out``;
+    assembly from ``assembly_dir`` (default ``cdk.out``, right for both deploy modes) instead of
+    synthesizing. On a ``deploy_step`` pipeline that is ``cdk.out``;
     with ``application_stage`` the stage's templates are in ``cdk.out/assembly-<StageName>``.
 
     ``env`` is added to the steps that run CDK or the tests (for example

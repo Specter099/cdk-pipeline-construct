@@ -20,7 +20,8 @@ Design rules baked in:
 * The artifact bucket has an explicit ``{purpose}-{account}-{region}-an`` name.
 * Build once: the cloud assembly that is deployed is the one the gates inspect. With
   ``application_stage`` that is the Synth output; with ``deploy_step`` an ``Assembly`` step
-  builds it at the start of the Gates stage and the deploy runs ``cdk deploy --app cdk.out``.
+  builds it at the start of the Gates stage, and the deploy step snapshots it and deploys the
+  snapshot with a command the construct writes (``DeployStep(stacks=[...])``).
 """
 
 from __future__ import annotations
@@ -45,8 +46,10 @@ from .gate import (
     Gate,
     PostDeployStep,
     _Step,
-    assembly_deploy_violations,
     compute_type,
+    deploy_command,
+    mentions_cdk_cli,
+    snapshot_commands,
 )
 from .pull_request import PullRequestChecks
 from .runtimes import (
@@ -96,9 +99,11 @@ def _codebuild_step(
     extra_policies: Sequence[iam.PolicyStatement] = (),
     additional_inputs: dict[str, pipelines.IFileSetProducer] | None = None,
     primary_output_directory: str | None = None,
+    before: Sequence[str] = (),
+    after: Sequence[str] = (),
 ) -> pipelines.CodeBuildStep:
-    """The one way a step becomes a CodeBuild action: runtime prelude, optional CDK CLI,
-    the step's install and commands, CI env, its IAM, Lambda compute."""
+    """The one way a step becomes a CodeBuild action: runtime prelude, ``before``, optional CDK
+    CLI, the step's install and commands, ``after``; CI env, its IAM, Lambda compute."""
     return pipelines.CodeBuildStep(
         step_id,
         input=source,
@@ -106,9 +111,11 @@ def _codebuild_step(
         primary_output_directory=primary_output_directory,
         commands=join(
             prelude(spec.runtime, node_version),
+            before,
             cdk_cli_install(cdk_cli_version) if cdk_cli_version else (),
             spec.install,
             spec.commands,
+            after,
         ),
         env=spec.environment,
         role_policy_statements=[*extra_policies, *spec.policy_statements],
@@ -165,15 +172,21 @@ class StandardPipeline(Construct):
             )
         if deploy_step is not None and assembly is None and any(g.uses_assembly for g in gates):
             raise ValueError("a gate has uses_assembly=True but the pipeline has no assembly")
+        if deploy_step is not None and assembly is None and deploy_step.stacks:
+            raise ValueError("DeployStep(stacks=...) deploys an Assembly; the pipeline has none")
         if assembly is not None and deploy_step is not None:
-            problems = assembly_deploy_violations(
-                [*deploy_step.install, *deploy_step.commands], assembly.output_dir
-            )
-            if problems:
+            if not deploy_step.stacks:
                 raise ValueError(
-                    f"deploy step {deploy_step.name!r} must deploy exactly the assembly the gates "
-                    "checked: " + "; ".join(problems)
+                    f"deploy step {deploy_step.name!r}: with an assembly, name the stacks "
+                    "(DeployStep(stacks=[...])) and the construct deploys the checked assembly"
                 )
+            for command in [*deploy_step.install, *deploy_step.commands]:
+                if mentions_cdk_cli(command):
+                    raise ValueError(
+                        f"deploy step {deploy_step.name!r}: {command!r} uses the CDK CLI. With an "
+                        "assembly the construct runs the only `cdk deploy`; any other CDK command "
+                        "here could deploy or synthesize something the gates never checked"
+                    )
 
         deploy_stage_name = (
             application_stage.stage_name if application_stage else DEPLOY_WAVE
@@ -309,6 +322,14 @@ class StandardPipeline(Construct):
                 node_version=node_version,
                 cdk_cli_version=cdk_cli_version,
                 additional_inputs=assembly_inputs,
+                # Build once: snapshot the checked assembly before any repo command runs, and
+                # deploy that snapshot with a command the construct owns.
+                before=snapshot_commands(assembly.output_dir) if assembly else (),
+                after=(
+                    [deploy_command(deploy_step.stacks, deploy_step.deploy_args)]
+                    if assembly
+                    else ()
+                ),
                 extra_policies=[
                     # `cdk deploy` assumes the CDK bootstrap roles (deploy,
                     # file/image publishing, lookup); nothing else.

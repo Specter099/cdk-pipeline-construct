@@ -19,11 +19,12 @@ from __future__ import annotations
 
 import json
 import re
+import shlex
 from collections.abc import Iterable, Sequence
 
 from aws_cdk.assertions import Template
 
-from .gate import Gate, assembly_deploy_violations
+from .gate import SNAPSHOT_DIR, Gate, mentions_cdk_cli, snapshot_commands
 from .pipeline import artifact_bucket_purpose
 from .runtimes import Runtime
 
@@ -275,14 +276,49 @@ def assert_deploy_ordering(
         )
 
 
+#: The pinned CDK CLI install the construct itself adds (runtimes.cdk_cli_install).
+_CLI_LINES = (re.compile(r"npm install -g --prefix \S+ aws-cdk@[\w.-]+"), re.compile(r"cdk --version"))
+
+
+def _assert_deploys_snapshot(step: str, commands: list[str], mount: str) -> None:
+    """The deploy step copies the linked assembly before any repo command, deploys only that
+    copy as its last command, and runs the CDK CLI nowhere else."""
+    snap = snapshot_commands(mount)
+    starts = [i for i in range(len(commands)) if commands[i : i + len(snap)] == snap]
+    assert len(starts) == 1, f"{step} does not snapshot the assembly at {mount!r} exactly once"
+    first_own = starts[0] + len(snap)
+    last = commands[-1]
+    tokens = shlex.split(last)
+    assert tokens[:4] == ["cdk", "deploy", "--app", SNAPSHOT_DIR], (
+        f"{step} does not deploy the assembly snapshot last: {last!r}"
+    )
+    owned = {"--app", "-a", "--build", "--output", "-o"}
+    assert sum(t.split("=", 1)[0] in owned for t in tokens) == 1, (
+        f"{step} deploy overrides --app, --build or --output: {last!r}"
+    )
+    for i, command in enumerate(commands[:-1]):
+        if starts[0] <= i < first_own or any(r.fullmatch(command) for r in _CLI_LINES):
+            continue
+        assert not mentions_cdk_cli(command), (
+            f"{step} uses the CDK CLI outside the construct's deploy: {command!r}"
+        )
+    # Only the runtime prelude may run before the snapshot: the construct puts the snapshot
+    # ahead of its own CLI install, which precedes every repo command.
+    cli = [i for i, c in enumerate(commands) if _CLI_LINES[0].fullmatch(c)]
+    assert cli and starts[0] < cli[0], (
+        f"{step} runs commands between its prelude and the assembly snapshot"
+    )
+
+
 def assert_builds_once(
     template: Template, gates: Sequence[Gate], deploy_stage: str = "Deploy"
 ) -> None:
     """The templates the gates inspect are the templates that are deployed.
 
     ``deploy_step`` pipelines: one assembly step in Gates; every gate with
-    ``uses_assembly=True`` and the deploy action read its artifact, and every ``cdk deploy``
-    in the deploy step passes ``--app`` pointing at the directory that artifact is linked to.
+    ``uses_assembly=True`` and the deploy action read its artifact; the deploy step copies it
+    before running anything else, deploys only that copy as its last command, and uses the CDK
+    CLI nowhere else.
     ``application_stage`` pipelines: those gates read the Synth output, which is what the
     stage's CloudFormation actions deploy."""
     actions = {a["Name"]: a for a in _stage(template, "Gates")["Actions"]}
@@ -306,8 +342,7 @@ def assert_builds_once(
         )
         mount = step_mounts(template, deploy["Name"]).get(artifact)
         assert mount, f"{deploy['Name']} does not link {artifact!r} into its directory"
-        problems = assembly_deploy_violations(step_commands(template, deploy["Name"]), mount)
-        assert not problems, f"{deploy['Name']} does not deploy the assembly: " + "; ".join(problems)
+        _assert_deploys_snapshot(deploy["Name"], step_commands(template, deploy["Name"]), mount)
         for g in gates:
             if g.uses_assembly:
                 assert actions[f"Gate-{g.name}"]["RunOrder"] > producers[0]["RunOrder"], (

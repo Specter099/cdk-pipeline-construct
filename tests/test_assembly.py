@@ -12,17 +12,17 @@ from test_pipeline import GATES, build
 
 from specter_pipeline import Assembly, DeployStep, Gate, PostDeployStep, Runtime
 from specter_pipeline import testing as c
-from specter_pipeline.gate import CdkCall, assembly_deploy_violations, cdk_calls
+from specter_pipeline.gate import SNAPSHOT_DIR, deploy_command, mentions_cdk_cli
 from specter_pipeline.presets import (
-    assembly_scan_guard,
     python_cdk_assembly,
     python_cdk_gates,
+    scan_every_assembly,
 )
 
 REPO = "Specter099/demo"
 SCAN = Gate("scan", ["ls cdk.out"], uses_assembly=True)
 ASM_GATES = [*GATES, SCAN]
-DEPLOY = DeployStep("app", ["cdk deploy --app cdk.out AppStack --require-approval never"])
+DEPLOY = DeployStep("app", stacks=["AppStack"])
 
 
 def asm_build(**overrides) -> Template:
@@ -49,69 +49,41 @@ def inputs(action: dict) -> set[str]:
     return {i["Name"] for i in action.get("InputArtifacts", [])}
 
 
-# --- does the deploy step deploy the assembly? ------------------------------------------------
+# --- the CDK CLI guard -------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize(
-    "commands",
+    "command",
     [
-        ["cdk deploy --app cdk.out AppStack --require-approval never"],
-        ["cdk deploy --app ./cdk.out/ AppStack"],
-        ["cdk -a cdk.out deploy AppStack"],
-        ["CDK_X=1 npx -y cdk deploy --app=cdk.out AppStack"],
-        ["echo cdk deploy is next", "cdk deploy -a cdk.out AppStack"],
-        ["cdk deploy -a cdk.out AppStack && cd /tmp"],  # cd after the deploy is harmless
-        # the pipeline's own prelude must not count as a CDK invocation
-        ["npm install -g --prefix /tmp/nodejs aws-cdk@2.1149.0", "cdk --version",
-         "cdk deploy -a cdk.out AppStack"],
+        # every spelling and hiding place from both reviews
+        "cdk deploy B", "cdk synth", "cdk diff A", "cdk ls", "cdk destroy A", "cdk watch",
+        "npx aws-cdk deploy B", "npx cdk@2 deploy B", "/tmp/nodejs/bin/cdk deploy B",
+        "$(npm bin)/cdk deploy B", "node node_modules/aws-cdk/bin/cdk deploy B",
+        "bash -lc 'cdk deploy B'", "echo 'cdk deploy B' | sh", "eval cdk deploy B",
+        "(cdk deploy B)", "{ cdk deploy B; }", "! cdk deploy B", "echo `cdk deploy B`",
+        "if true; then cdk deploy B; fi", "for s in B C; do cdk deploy $s; done",
+        "until cdk deploy B; do sleep 5; done", "timeout 600 cdk deploy B",
+        "time -p cdk deploy B", "env -u X cdk deploy B", "poetry run cdk deploy B",
+        "uv run cdk deploy B", "yarn cdk deploy B", "npm exec -- cdk deploy B",
+        "true # comment\ncdk deploy B", "curl https://x/y#frag && cdk deploy B",
+        "cdk --require-approval never deploy B", "npm install -g aws-cdk@2",
+        "pip install x;cdk deploy B",
     ],
 )
-def test_deploying_the_assembly_is_accepted(commands):
-    assert assembly_deploy_violations(commands, "cdk.out") == []
+def test_the_cli_guard_sees_the_cdk_cli_anywhere(command):
+    assert mentions_cdk_cli(command)
 
 
 @pytest.mark.parametrize(
-    "commands,reason",
+    "command",
     [
-        # a second deploy, however the commands are joined
-        (["cdk deploy --app cdk.out A; cdk deploy B"], "exactly `--app cdk.out`"),
-        (["cdk deploy --app cdk.out A&&cdk deploy B"], "exactly `--app cdk.out`"),
-        (["cdk deploy --app cdk.out A\ncdk deploy B"], "exactly `--app cdk.out`"),
-        (["cdk deploy --app cdk.out A & cdk deploy B"], "exactly `--app cdk.out`"),
-        (["cdk deploy --app cdk.out A || cdk deploy B"], "exactly `--app cdk.out`"),
-        (["cdk deploy --app cdk.out A | tee log; cdk deploy B"], "exactly `--app cdk.out`"),
-        # more than one --app: which one wins is the CLI's business, not ours
-        (["cdk deploy B --app 'python3 app.py' --app cdk.out"], "exactly `--app cdk.out`"),
-        (["cdk deploy --app 'python3 app.py' B"], "exactly `--app cdk.out`"),
-        # other spellings of the CLI
-        (["npx aws-cdk deploy B"], "exactly `--app cdk.out`"),
-        (["npx cdk@2 deploy B"], "exactly `--app cdk.out`"),
-        (["/tmp/nodejs/bin/cdk deploy B"], "exactly `--app cdk.out`"),
-        (["bash -c 'cdk deploy B'"], "exactly `--app cdk.out`"),
-        (["eval cdk deploy B"], "exactly `--app cdk.out`"),
-        (["(cdk deploy B)"], "exactly `--app cdk.out`"),
-        # re-synthesizing rewrites the linked artifact
-        (["cdk synth && cdk deploy --app cdk.out B"], "runs `cdk synth`"),
-        (["rm -rf cdk.out && cdk synth && cdk deploy --app cdk.out B"], "runs `cdk synth`"),
-        (["npx cdk synthesize", "cdk deploy -a cdk.out B"], "runs `cdk synth`"),
-        # a relative --app after a cd is some other directory
-        (["cd infra && cdk deploy --app cdk.out B"], "changed directory"),
-        (["cd infra", "cdk deploy --app cdk.out B"], "changed directory"),
-        # nothing to check, or nothing parseable: fail closed
-        (["./scripts/deploy.sh"], "no `cdk deploy --app cdk.out` found"),
-        (["make deploy"], "no `cdk deploy --app cdk.out` found"),
-        (['echo "unbalanced', "cdk deploy -a cdk.out A"], "cannot parse"),
+        "ls cdk.out", "cat cdk.json", "pip install aws-cdk-lib==2.170.0", "pip install cdk-nag",
+        "python -m cdk_nag", "npm i cdk8s", "./scripts/pre-deploy.sh", "echo my-cdk-app",
+        "pip install -r requirements.txt",
     ],
 )
-def test_anything_else_is_refused(commands, reason):
-    problems = assembly_deploy_violations(commands, "cdk.out")
-    assert problems and any(reason in p for p in problems), problems
-
-
-def test_cdk_calls_reads_subcommand_and_apps():
-    assert cdk_calls("cdk -c k=v --app cdk.out deploy A") == [CdkCall("deploy", ("cdk.out",))]
-    assert cdk_calls("cdk --version") == [CdkCall(None, ())]
-    assert cdk_calls("npm install -g aws-cdk@2") == []
+def test_the_cli_guard_ignores_files_and_libraries(command):
+    assert not mentions_cdk_cli(command)
 
 
 # --- step validation ---------------------------------------------------------------------------
@@ -139,7 +111,7 @@ def test_assembly_needs_python_and_node():
         Assembly(runtime=Runtime.PYTHON)
 
 
-@pytest.mark.parametrize("bad", ["/abs", "../up", "a/../b", "", "with space", ".", "./", "a/.."])
+@pytest.mark.parametrize("bad", ["/abs", "../up", "a/../b", "", "with space", ".", "./", "a/..", "--app", "-rf", ".hidden/.."])
 def test_assembly_output_dir_must_be_relative(bad):
     with pytest.raises(ValueError, match="relative path"):
         Assembly(output_dir=bad)
@@ -182,42 +154,75 @@ def test_a_gate_cannot_read_an_assembly_the_pipeline_does_not_build():
 @pytest.mark.parametrize(
     "command",
     [
-        "cdk deploy AppStack --require-approval never",
-        "cdk synth && cdk deploy --app cdk.out AppStack",
-        "cdk deploy --app cdk.out A&&cdk deploy B",
+        "cdk deploy --app cdk.out AppStack",
+        "cdk diff AppStack",
+        "true # note\ncdk deploy B",
+        "for s in A B; do cdk deploy --app cdk.out $s; done",
+        "timeout 600 cdk synth",
     ],
 )
-def test_the_pipeline_refuses_a_deploy_step_that_does_not_deploy_the_assembly(command):
-    with pytest.raises(ValueError, match="must deploy exactly the assembly"):
-        asm_build(deploy_step=DeployStep("app", [command]))
+def test_the_pipeline_refuses_the_cdk_cli_in_deploy_commands(command):
+    with pytest.raises(ValueError, match="uses the CDK CLI"):
+        asm_build(deploy_step=DeployStep("app", [command], stacks=["AppStack"]))
 
 
 def test_install_commands_are_checked_too():
-    with pytest.raises(ValueError, match="runs `cdk synth`"):
-        asm_build(deploy_step=DeployStep("app", DEPLOY.commands, install=["cdk synth"]))
+    with pytest.raises(ValueError, match="uses the CDK CLI"):
+        asm_build(deploy_step=DeployStep("app", stacks=["AppStack"], install=["cdk synth"]))
 
 
-def test_a_deploy_script_is_refused_because_it_cannot_be_checked():
-    # The README promises the deploy is checked; a script would hide a re-synth.
-    with pytest.raises(ValueError, match="a script cannot be checked"):
+def test_an_assembly_pipeline_needs_named_stacks():
+    with pytest.raises(ValueError, match="name the stacks"):
         asm_build(deploy_step=DeployStep("app", ["./scripts/deploy.sh"]))
 
 
-def test_script_work_can_sit_next_to_a_direct_deploy():
+def test_stacks_need_an_assembly():
+    with pytest.raises(ValueError, match="the pipeline has none"):
+        build(application_stage=None, deploy_step=DEPLOY)
+
+
+@pytest.mark.parametrize("arg", ["--app", "-a", "--build", "--output=x", "-o"])
+def test_deploy_args_cannot_take_over_the_deploy(arg):
+    with pytest.raises(ValueError, match="set by the construct"):
+        DeployStep("app", stacks=["A"], deploy_args=[arg, "x"])
+
+
+@pytest.mark.parametrize("stack", ["", "-rf", "A B", "A;rm", "$(x)"])
+def test_stack_names_are_validated(stack):
+    with pytest.raises(ValueError, match="invalid stack name"):
+        DeployStep("app", stacks=[stack])
+
+
+def test_without_stacks_a_deploy_step_still_needs_commands():
+    with pytest.raises(ValueError, match="has no commands"):
+        DeployStep("app")
+
+
+def test_script_work_can_run_before_the_construct_deploy():
     t = asm_build(
-        deploy_step=DeployStep(
-            "app", ["./scripts/pre-deploy.sh", *DEPLOY.commands, "./scripts/smoke.sh"]
-        )
+        deploy_step=DeployStep("app", ["./scripts/pre-deploy.sh"], stacks=["AppStack"])
     )
+    cmds = c.step_commands(t, "Deploy-app")
+    assert cmds.index("./scripts/pre-deploy.sh") < len(cmds) - 1
     c.assert_standard_contract(t, repo=REPO, gates=ASM_GATES, node_gates=["synth-check", "lint"])
 
 
-def test_a_custom_output_dir_is_honoured_end_to_end():
-    t = asm_build(
-        assembly=Assembly(output_dir="build/cdk.out"),
-        deploy_step=DeployStep("app", ["cdk deploy -a build/cdk.out AppStack"]),
-    )
-    assert "build/cdk.out" in c.step_mounts(t, "Deploy-app").values()
+def test_the_deploy_snapshots_first_and_deploys_the_snapshot_last(tpl):
+    cmds = c.step_commands(tpl, "Deploy-app")
+    snap = next(i for i, x in enumerate(cmds) if x.startswith(f"rm -rf {SNAPSHOT_DIR}"))
+    cli = next(i for i, x in enumerate(cmds) if "aws-cdk@" in x)
+    assert snap < cli < cmds.index("pip install -r requirements.txt") if "pip install -r requirements.txt" in cmds else snap < cli
+    assert "cp -R cdk.out/. /tmp/assembly/" in cmds[snap]
+    assert cmds[-1] == "cdk deploy --app /tmp/assembly AppStack --require-approval never"
+    assert cmds[-1] == deploy_command(["AppStack"], ["--require-approval", "never"])
+
+
+@pytest.mark.parametrize("raw,norm", [("cdk.out/", "cdk.out"), ("./cdk.out", "cdk.out"), ("build/cdk.out", "build/cdk.out")])
+def test_output_dir_is_stored_normalised_and_works_end_to_end(raw, norm):
+    a = Assembly(output_dir=raw)
+    assert a.output_dir == norm
+    t = asm_build(assembly=a)
+    assert norm in c.step_mounts(t, "Deploy-app").values()
     c.assert_builds_once(t, ASM_GATES)
 
 
@@ -271,7 +276,7 @@ def test_contract_checks_build_once_whenever_there_is_an_assembly_step():
     """No gate reads the assembly, but the deploy still must: the contract notices the step."""
     doc = copy.deepcopy(asm_build(gates=GATES).to_json())
     _deploy_without_app(doc["Resources"])
-    with pytest.raises(AssertionError, match="does not deploy the assembly"):
+    with pytest.raises(AssertionError, match="does not deploy the assembly snapshot"):
         c.assert_standard_contract(
             Template.from_json(doc), repo=REPO, gates=GATES, node_gates=["synth-check", "lint"]
         )
@@ -345,7 +350,8 @@ def test_preset_assembly_mode_reads_the_shared_templates():
     assert aa.uses_assembly and aa.runtime is Runtime.PYTHON
     assert not any("cdk synth" in x for x in aa.commands)
     assert not any("requirements.txt" in x or "aws-cdk@" in x for x in aa.install)
-    assert any("--template-dir cdk.out " in x for x in aa.commands)
+    assert any("find cdk.out -mindepth 1" in x for x in aa.commands)
+    assert any('--template-dir "$dir"' in x for x in aa.commands)
     assert any("sha256sum -c" in x for x in aa.commands), "script must still be verified"
     assert not aa.runs_on_pull_requests
 
@@ -363,51 +369,70 @@ def test_preset_default_is_unchanged():
 
 
 def test_preset_assembly_dir_reaches_every_command():
-    gates = {g.name: g for g in python_cdk_gates(assembly=True, assembly_dir="cdk.out/assembly-Prod")}
-    assert any("--template-dir cdk.out/assembly-Prod " in x for x in gates["access-analyzer"].commands)
-    assert gates["cdk-synth"].commands == ["test -f cdk.out/assembly-Prod/manifest.json"]
+    gates = {g.name: g for g in python_cdk_gates(assembly=True, assembly_dir="build/cdk.out")}
+    assert any("find build/cdk.out " in x for x in gates["access-analyzer"].commands)
+    assert gates["cdk-synth"].commands == ["test -f build/cdk.out/manifest.json"]
 
 
 def test_preset_template_dir_is_quoted():
     (aa,) = [g for g in python_cdk_gates(assembly=True, assembly_dir="cdk out; rm -rf ~")
              if g.name == "access-analyzer"]
-    assert any("--template-dir 'cdk out; rm -rf ~' " in x for x in aa.commands)
-    assert "ls -d 'cdk out; rm -rf ~'/assembly-*" in aa.commands[0]
-    assert "ls 'cdk out; rm -rf ~'/*.template.json" in aa.commands[1]
+    assert any("find 'cdk out; rm -rf ~' -mindepth 1" in x for x in aa.commands)
 
 
-@pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
-def test_the_scan_guard_never_expands_the_directory_name(tmp_path):
-    marker = tmp_path / "pwned"
-    script = "\n".join(assembly_scan_guard(f"$(touch {marker})"))
-    subprocess.run(["bash", "-c", script], check=False, cwd=tmp_path, capture_output=True, text=True)
-    assert not marker.exists()
-
-
-def _guard(tmp_path, layout):
+def _scan(tmp_path, layout, template_dir="cdk.out"):
     for rel in layout:
         f = tmp_path / rel
         f.parent.mkdir(parents=True, exist_ok=True)
         f.write_text("{}")
-    script = "set -e\n" + "\n".join(assembly_scan_guard("cdk.out"))
-    return subprocess.run(["bash", "-c", script], check=False, cwd=tmp_path, capture_output=True, text=True)
+    (tmp_path / "aa").mkdir(exist_ok=True)
+    cmds = [x.replace("/tmp/aa", str(tmp_path / "aa"))
+            for x in scan_every_assembly(template_dir, "echo SCAN")]
+    return subprocess.run(["bash", "-ec", "\n".join(cmds)], check=False, cwd=tmp_path,
+                          capture_output=True, text=True)
 
 
 @pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
 @pytest.mark.parametrize(
-    "layout,ok,says",
+    "layout,ok,scanned",
     [
-        (["cdk.out/manifest.json", "cdk.out/AppStack.template.json"], True, ""),
-        (["cdk.out/manifest.json"], False, "no templates"),
-        # an application_stage pipeline's top level: the pipeline stack plus nested stages
-        (["cdk.out/PipelineStack.template.json", "cdk.out/assembly-Prod/AppStack.template.json"],
-         False, "nested stage assemblies"),
+        (["cdk.out/manifest.json", "cdk.out/AppStack.template.json"], True, ["cdk.out"]),
+        # an application_stage pipeline: pipeline stack on top, the application in its stage
+        (["cdk.out/Pipe.template.json", "cdk.out/assembly-Prod/App.template.json"],
+         True, ["cdk.out", "cdk.out/assembly-Prod"]),
+        # an app with its own stages and no top-level stacks
+        (["cdk.out/manifest.json", "cdk.out/assembly-Dev/A.template.json",
+          "cdk.out/assembly-Prod/assembly-Prod-Inner/B.template.json"],
+         True, ["cdk.out/assembly-Dev", "cdk.out/assembly-Prod/assembly-Prod-Inner"]),
+        (["cdk.out/manifest.json"], False, []),
+        ([], False, []),
     ],
 )
-def test_the_scan_guard_refuses_to_scan_nothing(tmp_path, layout, ok, says):
-    result = _guard(tmp_path, layout)
+def test_access_analyzer_scans_every_assembly_and_refuses_to_scan_nothing(tmp_path, layout, ok, scanned):
+    result = _scan(tmp_path, layout)
     assert (result.returncode == 0) is ok, result.stdout + result.stderr
-    assert says in result.stdout
+    got = [line.split("--template-dir ", 1)[1] for line in result.stdout.splitlines() if line.startswith("SCAN")]
+    assert got == scanned
+    if not ok:
+        assert "no CloudFormation templates" in result.stdout
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+def test_a_failing_scan_fails_the_gate(tmp_path):
+    for rel in ["cdk.out/A.template.json", "cdk.out/assembly-P/B.template.json"]:
+        (tmp_path / rel).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / rel).write_text("{}")
+    (tmp_path / "aa").mkdir()
+    cmds = [x.replace("/tmp/aa", str(tmp_path / "aa")) for x in scan_every_assembly("cdk.out", "false")]
+    r = subprocess.run(["bash", "-ec", "\n".join(cmds)], check=False, cwd=tmp_path, capture_output=True, text=True)
+    assert r.returncode != 0
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+def test_the_scan_never_expands_the_directory_name(tmp_path):
+    marker = tmp_path / "pwned"
+    _scan(tmp_path, [], template_dir=f"$(touch {marker})")
+    assert not marker.exists()
 
 
 def test_preset_pipeline_in_assembly_mode_satisfies_the_contract():
@@ -449,11 +474,37 @@ def _drop_assembly_input(action):
     action["InputArtifacts"] = action["InputArtifacts"][:1]
 
 
-def _deploy_without_app(res):
+def _edit_deploy(res, edit):
     props = _project(res, "Deploy-app")
     spec = json.loads(props["Source"]["BuildSpec"])
-    spec["phases"]["build"]["commands"][-1] = "cdk deploy AppStack --require-approval never"
+    edit(spec["phases"]["build"]["commands"])
     props["Source"]["BuildSpec"] = json.dumps(spec)
+
+
+def _deploy_without_app(res):
+    _edit_deploy(res, lambda cmds: cmds.__setitem__(-1, "cdk deploy AppStack --require-approval never"))
+
+
+def _second_cli_use(res):
+    _edit_deploy(res, lambda cmds: cmds.insert(-1, "for s in B; do cdk deploy $s; done"))
+
+
+def _no_snapshot(res):
+    _edit_deploy(res, lambda cmds: [cmds.remove(x) for x in list(cmds) if SNAPSHOT_DIR in x and not x.startswith("cdk ")])
+
+
+def _snapshot_after_repo_commands(res):
+    def move(cmds):
+        snap = [x for x in cmds if x.startswith(("test -f cdk.out/", f"rm -rf {SNAPSHOT_DIR}"))]
+        for x in snap:
+            cmds.remove(x)
+        for x in snap:
+            cmds.insert(-1, x)
+    _edit_deploy(res, move)
+
+
+def _deploy_with_build(res):
+    _edit_deploy(res, lambda cmds: cmds.__setitem__(-1, cmds[-1] + " --build 'cdk synth'"))
 
 
 def _deploy_without_mount(res):
@@ -476,7 +527,11 @@ def _scan_in_parallel_with_assembly(res):
     "change,message",
     [
         (lambda r: _drop_assembly_input(_action(r, "Deploy", "Deploy-app")), "does not read the assembly"),
-        (_deploy_without_app, "does not deploy the assembly"),
+        (_deploy_without_app, "does not deploy the assembly snapshot last"),
+        (_second_cli_use, "uses the CDK CLI outside"),
+        (_no_snapshot, "does not snapshot"),
+        (_snapshot_after_repo_commands, "between its prelude and the assembly snapshot"),
+        (_deploy_with_build, "overrides --app, --build or --output"),
         (_deploy_without_mount, "does not link"),
         (lambda r: _drop_assembly_input(_action(r, "Gates", "Gate-scan")), "does not read the deployed"),
         (_scan_in_parallel_with_assembly, "does not wait for the assembly"),

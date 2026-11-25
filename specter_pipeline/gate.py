@@ -78,9 +78,12 @@ class _Step:
         object.__setattr__(self, "install", list(self.install))
         object.__setattr__(self, "policy_statements", tuple(self.policy_statements))
         object.__setattr__(self, "env", dict(self.env))
-        if not self.commands:
+        if not self.commands and self._needs_commands():
             raise ValueError(f"{self._kind} {self.name!r} has no commands")
         compute_type(self.memory_gb)  # validates
+
+    def _needs_commands(self) -> bool:
+        return True
 
     @property
     def environment(self) -> dict[str, str]:
@@ -131,8 +134,9 @@ class Assembly(_Step):
     Only for ``deploy_step`` pipelines: with ``application_stage`` the pipeline's own Synth
     step already builds the assembly that is deployed. The step gets Node and the pinned CDK
     CLI. Its ``output_dir`` (default ``cdk.out``) becomes an artifact that is mounted at the
-    same path for every gate with ``uses_assembly=True`` and for the deploy step, whose
-    ``cdk deploy`` must then read it (``cdk deploy --app cdk.out ...``).
+    same path for every gate with ``uses_assembly=True`` and for the deploy step. The deploy
+    step copies it before any of its own commands run and deploys that copy, with a ``cdk
+    deploy`` command the construct writes (``DeployStep(stacks=[...])``).
     """
 
     name: str = "Assemble"
@@ -152,15 +156,19 @@ class Assembly(_Step):
             )
         if self.runtime is not Runtime.PYTHON_NODE:
             raise ValueError("the assembly step runs the CDK CLI and needs Runtime.PYTHON_NODE")
-        norm = posixpath.normpath(self.output_dir) if self.output_dir else ""
+        raw = self.output_dir
+        norm = posixpath.normpath(raw) if raw else ""
+        # Stored normalised: the value becomes a CodeBuild artifact directory and the target of
+        # CDK Pipelines' `ln -s`, which fails on "cdk.out/" or "./cdk.out".
         if (
-            not re.fullmatch(r"[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)*/?", self.output_dir)
-            or norm in (".", "")
-            or ".." in self.output_dir.split("/")
+            not re.fullmatch(r"(\./)?[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)*/?", raw or "")
+            or ".." in raw.split("/")
+            or not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]*(/[A-Za-z0-9_.-]+)*", norm)
         ):
             raise ValueError(
-                f"assembly output_dir must be a relative path below the source, got {self.output_dir!r}"
+                f"assembly output_dir must be a relative path below the source, got {raw!r}"
             )
+        object.__setattr__(self, "output_dir", norm)
         if self.name.startswith(("Gate-", "Deploy-", "Post-", "Approve-")):
             raise ValueError(f"assembly name {self.name!r} collides with the pipeline's step names")
 
@@ -178,12 +186,39 @@ class DeployStep(_Step):
 
     The step's role must be allowed to assume the CDK bootstrap roles (the
     construct grants ``sts:AssumeRole`` on ``cdk-*`` roles for this account).
+
+    With an ``Assembly`` (build once) give ``stacks`` instead of a deploy command: the
+    construct deploys exactly the assembly the gates checked, with
+    ``cdk deploy --app <snapshot> <stacks> <deploy_args>``. ``commands`` are then optional
+    pre-deploy work and may not use the CDK CLI.
     """
 
+    commands: Sequence[str] = ()
     runtime: Runtime = Runtime.PYTHON_NODE
     memory_gb: int = 4
+    stacks: Sequence[str] = ()
+    deploy_args: Sequence[str] = ("--require-approval", "never")
 
     _kind: ClassVar[str] = "deploy step"
+
+    def __post_init__(self) -> None:
+        for field in ("stacks", "deploy_args"):
+            if isinstance(getattr(self, field), str):
+                raise TypeError(f"deploy step {self.name!r}: {field} is a list of strings")
+            object.__setattr__(self, field, tuple(getattr(self, field)))
+        super().__post_init__()
+        for stack in self.stacks:
+            if not re.fullmatch(r"[A-Za-z0-9*][A-Za-z0-9_*/.-]*", stack):
+                raise ValueError(f"deploy step {self.name!r}: invalid stack name {stack!r}")
+        for arg in self.deploy_args:
+            flag = arg.split("=", 1)[0]
+            if flag in _OWNED_DEPLOY_FLAGS:
+                raise ValueError(
+                    f"deploy step {self.name!r}: {flag} is set by the construct, not deploy_args"
+                )
+
+    def _needs_commands(self) -> bool:
+        return not self.stacks
 
 
 @dataclasses.dataclass(frozen=True)
@@ -196,155 +231,39 @@ class PostDeployStep(_Step):
     _kind: ClassVar[str] = "post-deploy step"
 
 
-# --- does a deploy step deploy the assembly, and only the assembly? ----------------------------
+# --- build once: the deploy step deploys a snapshot of the assembly --------------------------
 
-#: A CDK CLI command word: cdk, aws-cdk, or either pinned with @version (npx cdk@2 ...).
-_CDK_WORD = re.compile(r"(aws-)?cdk(@\S*)?")
-#: Words that run the next word as the command.
-_WRAPPERS = frozenset({"npx", "exec", "env", "time", "command", "nohup", "sudo", "xargs"})
-_SHELLS = frozenset({"bash", "sh", "zsh", "dash", "ksh"})
-_CHDIR = frozenset({"cd", "pushd", "popd"})
-#: CDK options that take a value, so the value is not mistaken for the subcommand.
-_CDK_VALUE_OPTS = frozenset(
-    {"-a", "--app", "-c", "--context", "-o", "--output", "--profile", "-p", "--plugin",
-     "-r", "--role-arn", "--ca-bundle-path", "--proxy", "--build", "--toolkit-stack-name"}
-)
-_SYNTH = frozenset({"synth", "synthesize"})
+#: Where the deploy step copies the assembly before running any repo command.
+SNAPSHOT_DIR = "/tmp/assembly"
+
+#: Flags the construct sets on the deploy itself. --build and --output would run or redirect a
+#: synthesis; --app is the snapshot.
+_OWNED_DEPLOY_FLAGS = frozenset({"--app", "-a", "--build", "--output", "-o"})
+
+#: The CDK CLI in any spelling a shell could run: cdk, aws-cdk, cdk@2, .../bin/cdk, in a loop,
+#: subshell, backticks or wrapper. Not cdk.out, cdk.json, aws-cdk-lib, cdk_nag or cdk8s.
+_CDK_CLI = re.compile(r"(?<![\w.-])(aws-)?cdk(@[\w.^~*-]*)?(?![\w.-])")
 
 
-@dataclasses.dataclass(frozen=True)
-class CdkCall:
-    """One CDK CLI invocation found in a shell command."""
-
-    subcommand: str | None
-    apps: tuple[str, ...]
+def mentions_cdk_cli(command: str) -> bool:
+    """True when ``command`` could run the CDK CLI. A plain text match, not a shell parse, so
+    nothing a shell can express hides it; it cannot see into scripts or variables."""
+    return bool(_CDK_CLI.search(command))
 
 
-class UnparseableCommand(ValueError):
-    pass
+def snapshot_commands(mount: str) -> list[str]:
+    """Copy the linked assembly to SNAPSHOT_DIR. Runs before any repo command, so nothing the
+    step does to ``mount`` afterwards (a re-synth, `cdk diff`, a cdk.json "build") changes what
+    is deployed. Fails if the assembly is missing or empty."""
+    src = shlex.quote(f"{mount}/.")
+    manifest = shlex.quote(f"{mount}/manifest.json")
+    return [
+        f'test -f {manifest} || {{ echo "no cloud assembly at {mount}"; exit 1; }}',
+        f"rm -rf {SNAPSHOT_DIR} && mkdir -p {SNAPSHOT_DIR} && cp -R {src} {SNAPSHOT_DIR}/",
+    ]
 
 
-def _segments(command: str) -> list[list[str]]:
-    """Simple commands, split on every shell control operator (``;`` ``&`` ``&&`` ``||`` ``|``
-    ``(`` ``)``, newlines, unspaced or not). Quoted strings stay single words."""
-    lexer = shlex.shlex(command.replace("\n", " ; "), posix=True, punctuation_chars=True)
-    lexer.whitespace_split = True
-    try:
-        tokens = list(lexer)
-    except ValueError as err:
-        raise UnparseableCommand(f"cannot parse shell command {command!r}: {err}") from None
-    segments: list[list[str]] = [[]]
-    for tok in tokens:
-        if tok and all(ch in "();<>|&" for ch in tok):
-            segments.append([])
-        else:
-            segments[-1].append(tok)
-    return [seg for seg in segments if seg]
-
-
-def _command_word(seg: list[str]) -> tuple[str, list[str]]:
-    """The word a simple command runs (past VAR=x assignments and wrappers such as npx), and
-    its arguments."""
-    i = 0
-    while i < len(seg):
-        word = seg[i]
-        if "=" in word and not word.startswith("-") and word.split("=", 1)[0].isidentifier():
-            i += 1
-            continue
-        name = word.rsplit("/", 1)[-1]
-        if name in _WRAPPERS:
-            i += 1
-            while i < len(seg) and seg[i].startswith("-"):
-                i += 2 if seg[i] in ("-p", "--package") else 1
-            continue
-        return name, seg[i + 1 :]
-    return "", []
-
-
-def shell_calls(command: str) -> list[tuple[str, list[str]]]:
-    """(command word, args) for every simple command, descending into ``bash -c '...'`` and
-    ``eval``."""
-    out: list[tuple[str, list[str]]] = []
-    for seg in _segments(command):
-        word, args = _command_word(seg)
-        if word in _SHELLS and "-c" in args and args.index("-c") + 1 < len(args):
-            out += shell_calls(args[args.index("-c") + 1])
-        elif word == "eval":
-            out += shell_calls(" ".join(args))
-        else:
-            out.append((word, args))
-    return out
-
-
-def _cdk_call(word: str, args: list[str]) -> CdkCall | None:
-    if not _CDK_WORD.fullmatch(word):
-        return None
-    sub: str | None = None
-    apps: list[str] = []
-    k = 0
-    while k < len(args):
-        arg = args[k]
-        if arg in ("-a", "--app"):
-            if k + 1 < len(args):
-                apps.append(args[k + 1])
-            k += 2
-            continue
-        if arg.startswith("--app="):
-            apps.append(arg.split("=", 1)[1])
-        elif arg in _CDK_VALUE_OPTS:
-            k += 2
-            continue
-        elif sub is None and not arg.startswith("-"):
-            sub = arg
-        k += 1
-    return CdkCall(sub, tuple(apps))
-
-
-def cdk_calls(command: str) -> list[CdkCall]:
-    """Every CDK CLI invocation in a shell command, in order."""
-    return [c for word, args in shell_calls(command) if (c := _cdk_call(word, args))]
-
-
-def assembly_deploy_violations(commands: Sequence[str], output_dir: str) -> list[str]:
-    """Why ``commands`` (run in order in one shell, as a CodeBuild phase does) might deploy
-    anything other than the assembly at ``output_dir``. Empty means: at least one ``cdk deploy``,
-    every one reading exactly ``--app <output_dir>``, no ``cdk synth``, no change of directory
-    before a deploy. Anything that cannot be parsed is a violation (fail closed)."""
-    want = posixpath.normpath(output_dir)
-    problems: list[str] = []
-    deploys = 0
-    moved: str | None = None
-    for command in commands:
-        try:
-            calls = shell_calls(command)
-        except UnparseableCommand as err:
-            problems.append(str(err))
-            continue
-        for word, args in calls:
-            if word in _CHDIR:
-                moved = command
-            call = _cdk_call(word, args)
-            if call is None:
-                continue
-            if call.subcommand in _SYNTH:
-                problems.append(
-                    f"{command!r} runs `cdk synth`, which rewrites {output_dir} "
-                    "after the gates checked it"
-                )
-            elif call.subcommand == "deploy":
-                deploys += 1
-                if len(call.apps) != 1 or posixpath.normpath(call.apps[0]) != want:
-                    problems.append(
-                        f"{command!r} must pass exactly `--app {output_dir}` to `cdk deploy`"
-                    )
-                elif moved is not None:
-                    problems.append(
-                        f"{command!r} deploys after {moved!r} changed directory, so "
-                        f"--app {output_dir} would not be the assembly"
-                    )
-    if not deploys:
-        problems.append(
-            f"no `cdk deploy --app {output_dir}` found; call it directly in the deploy step's "
-            "commands (a script cannot be checked)"
-        )
-    return problems
+def deploy_command(stacks: Sequence[str], deploy_args: Sequence[str]) -> str:
+    return " ".join(
+        ["cdk", "deploy", "--app", SNAPSHOT_DIR, *map(shlex.quote, stacks), *map(shlex.quote, deploy_args)]
+    )

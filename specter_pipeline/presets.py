@@ -43,6 +43,8 @@ together. Not reproduced (and why):
 
 from __future__ import annotations
 
+import posixpath
+import re
 import shlex
 from collections.abc import Mapping, Sequence
 
@@ -238,3 +240,104 @@ def python_cdk_assembly(
         memory_gb=memory_gb,
         output_dir=output_dir,
     )
+
+
+# --- Terraform: static checks that need no AWS access ----------------------------------------
+
+#: Checkov runs offline with its built-in policies; pinned like the other pip-installed tools.
+CHECKOV = "checkov==3.4.4"
+
+#: TFLint has no committed hash yet (its releases are on GitHub, which this package's maintainers
+#: verify separately): pass ``tflint=(version, sha256)`` from tflint's ``checksums.txt`` to add it.
+TFLINT_URL = "https://github.com/terraform-linters/tflint/releases/download/v{version}/tflint_linux_amd64.zip"
+
+
+def _terraform_root(root: str) -> str:
+    norm = posixpath.normpath(root)
+    if (
+        not re.fullmatch(r"[A-Za-z0-9_.][A-Za-z0-9_./-]*", root)
+        or root.startswith("/")
+        or ".." in root.split("/")
+        or norm.startswith("-")
+    ):
+        raise ValueError(f"terraform root must be a relative path below the source, got {root!r}")
+    return norm
+
+
+def terraform_gates(
+    *,
+    roots: Sequence[str] = (".",),
+    checkov: bool = True,
+    tflint: tuple[str, str] | None = None,
+    env: Mapping[str, str] | None = None,
+) -> list[Gate]:
+    """Static checks for Terraform root modules: format, validate, Checkov, optional TFLint.
+
+    None of them has AWS permissions or reads state, so all of them run on pull requests (the
+    PR-check role holds only logs and the connection token). ``validate`` initialises with
+    ``-backend=false`` and ``-lockfile=readonly``: the root must commit ``.terraform.lock.hcl``
+    and providers must match its hashes, so a PR cannot swap a provider in silently. It does
+    download providers from the public Terraform registry.
+    """
+    dirs = [_terraform_root(r) for r in roots]
+    if not dirs or len(set(dirs)) != len(dirs):
+        raise ValueError(f"terraform roots must be non-empty and distinct, got {list(roots)}")
+    extra = dict(env or {})
+    q = [shlex.quote(d) for d in dirs]
+
+    gates = [
+        Gate(
+            "tf-fmt",
+            [f"terraform -chdir={d} fmt -check -recursive -diff" for d in q],
+            Runtime.TERRAFORM,
+            env=extra,
+        ),
+        Gate(
+            "tf-validate",
+            [
+                cmd
+                for d, raw in zip(q, dirs)
+                for cmd in (
+                    (
+                        f"test -f {shlex.quote(raw + '/.terraform.lock.hcl')} || "
+                        f"{{ echo {shlex.quote(f'{raw}: commit .terraform.lock.hcl')}; exit 1; }}"
+                    ),
+                    f"terraform -chdir={d} init -backend=false -input=false -lockfile=readonly -no-color",
+                    f"terraform -chdir={d} validate -no-color",
+                )
+            ],
+            Runtime.TERRAFORM,
+            env=extra,
+        ),
+    ]
+    if checkov:
+        gates.append(
+            Gate(
+                "tf-checkov",
+                [f"checkov -d {d} --framework terraform --quiet --compact" for d in q],
+                Runtime.PYTHON,
+                install=[f"pip install {CHECKOV}"],
+                env=extra,
+            )
+        )
+    if tflint is not None:
+        version, sha256 = tflint
+        if not re.fullmatch(r"\d+\.\d+\.\d+", version) or not re.fullmatch(r"[0-9a-f]{64}", sha256):
+            raise ValueError("tflint is (version 'X.Y.Z', 64-hex sha256 of tflint_linux_amd64.zip)")
+        gates.append(
+            Gate(
+                "tf-lint",
+                [f"tflint --chdir={d} --init && tflint --chdir={d}" for d in q],
+                Runtime.TERRAFORM,
+                install=[
+                    f"curl -fsSL -o /tmp/tflint.zip {TFLINT_URL.format(version=version)}",
+                    f'echo "{sha256}  /tmp/tflint.zip" | sha256sum -c -',
+                    "mkdir -p /tmp/tflint/bin",
+                    "python3 -I -c \"import zipfile; zipfile.ZipFile('/tmp/tflint.zip').extract('tflint', '/tmp/tflint/bin')\"",
+                    "chmod 0755 /tmp/tflint/bin/tflint",
+                    "export PATH=/tmp/tflint/bin:$PATH",
+                ],
+                env=extra,
+            )
+        )
+    return gates

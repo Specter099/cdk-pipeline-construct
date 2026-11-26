@@ -49,7 +49,13 @@ from .runtimes import (
     terraform_prelude,
 )
 from .terraform import CHECKOV as TF_CHECKOV
-from .terraform import TerraformRoot, apply_commands, plan_check_commands, plan_commands
+from .terraform import (
+    TerraformRoot,
+    apply_commands,
+    plan_check_commands,
+    plan_commands,
+    secret_base_arn,
+)
 
 #: The exact actions a PR-check role may hold (measured on a synthesized pipeline): its own
 #: logs, the report permissions CodeBuild adds for the project's own report group, and the
@@ -337,13 +343,24 @@ def _assembly_actions(template: Template) -> list[dict]:
     return [a for a in _stage(template, "Gates")["Actions"] if a.get("OutputArtifacts")]
 
 
-def assert_gates_present(template: Template, gates: Sequence[Gate]) -> None:
-    """Exactly these gates (plus at most one assembly step), in parallel: every gate that does
-    not read the assembly shares one RunOrder, and so does every gate that does."""
+def assert_gates_present(
+    template: Template, gates: Sequence[Gate], plans: Iterable[str] = ()
+) -> None:
+    """Exactly these gates (plus at most one assembly step, and exactly the Terraform ``plans``
+    named, e.g. ``Plan-main``), in parallel: every gate that does not read the assembly shares
+    one RunOrder, and so does every gate that does."""
     actions = _stage(template, "Gates")["Actions"]
+    expected_plans = set(plans)
     producers = _assembly_actions(template)
+    plan_steps = {a["Name"] for a in producers if a["Name"] in expected_plans}
+    assert plan_steps == expected_plans, (
+        f"Terraform plan steps differ: expected {sorted(expected_plans)}, found {sorted(plan_steps)}"
+    )
+    producers = [a for a in producers if a["Name"] not in expected_plans]
     assert len(producers) <= 1, f"more than one step produces an artifact in Gates: {producers}"
-    by_name = {a["Name"]: a for a in actions if a not in producers}
+    by_name = {
+        a["Name"]: a for a in actions if a not in producers and a["Name"] not in expected_plans
+    }
     expected = {f"Gate-{g.name}": g for g in gates}
     assert set(by_name) == set(expected), (
         f"gates differ: missing={sorted(set(expected) - set(by_name))} "
@@ -1028,6 +1045,7 @@ def assert_applies_plan(template: Template, root: TerraformRoot, repo_name: str 
     for step in (plan_name, deploy_name):
         env = _env_of(template, step)
         expected = {k: ("PLAINTEXT", v) for k, v in root.environment.items()}
+        expected |= {k: ("SECRETS_MANAGER", arn) for k, arn in root.secrets.items()}
         bucket = env.pop("TF_STATE_BUCKET", None)
         assert bucket is not None, f"{step} has no TF_STATE_BUCKET"
         assert bucket[1] == {"Ref": bucket_lid}, f"{step} points TF_STATE_BUCKET elsewhere"
@@ -1066,6 +1084,37 @@ def assert_applies_plan(template: Template, root: TerraformRoot, repo_name: str 
         assert not _grants(template, roles[check_name], action, whole), (
             f"{check_name} can reach the state bucket"
         )
+
+    # The root's provider secrets: readable by its own Plan and Deploy, by no other role.
+    allowed = {roles[plan_name], roles[deploy_name]}
+    every_role = set(template.find_resources("AWS::IAM::Role"))
+    for secret in sorted({secret_base_arn(a) for a in root.secrets.values()}):
+        for role in sorted(allowed):
+            assert _grants(template, role, "secretsmanager:GetSecretValue", secret), (
+                f"{role} cannot read the secret {secret}"
+            )
+        for role in sorted(every_role - allowed):
+            assert not _grants(template, role, "secretsmanager:GetSecretValue", secret), (
+                f"{role} can read {root.name}'s secret {secret}"
+            )
+
+
+def _roots(terraform) -> list[TerraformRoot]:
+    if terraform is None:
+        return []
+    return [terraform] if isinstance(terraform, TerraformRoot) else list(terraform)
+
+
+def assert_terraform_order(
+    template: Template, roots: Sequence[TerraformRoot], deploy_stage: str = "Deploy"
+) -> None:
+    """With several roots: every Deploy-<name> strictly after the approval and after the one
+    before it, in the order given (one apply at a time, never in parallel)."""
+    actions = {a["Name"]: a for a in _stage(template, deploy_stage)["Actions"]}
+    orders = [actions[f"Deploy-{r.name}"]["RunOrder"] for r in roots]
+    assert orders == sorted(orders) and len(set(orders)) == len(orders), (
+        f"Terraform applies are not strictly in the order given: {[r.name for r in roots]} -> {orders}"
+    )
 
 
 #: Bucket-level actions that could weaken the state bucket (open it, stop versioning, expire
@@ -1281,7 +1330,7 @@ def assert_standard_contract(
     assembly: Assembly | None = None,
     deploy_step: DeployStep | None = None,
     post_deploy: Sequence[PostDeployStep] = (),
-    terraform: TerraformRoot | None = None,
+    terraform: TerraformRoot | Sequence[TerraformRoot] | None = None,
 ) -> None:
     """Every invariant a StandardPipeline must satisfy. Repo-specific checks go alongside.
 
@@ -1342,10 +1391,10 @@ def assert_standard_contract(
             Runtime.NODE if builds_from_assembly else deploy_step.runtime
         )
         runtimes[f"PreDeploy-{deploy_step.name}"] = deploy_step.runtime
-    if terraform is not None:
-        expected_ec2 |= {f"Plan-{terraform.name}", f"Deploy-{terraform.name}"}
-        runtimes[f"Plan-{terraform.name}"] = Runtime.TERRAFORM
-        runtimes[f"Deploy-{terraform.name}"] = Runtime.TERRAFORM
+    for root in _roots(terraform):
+        expected_ec2 |= {f"Plan-{root.name}", f"Deploy-{root.name}"}
+        runtimes[f"Plan-{root.name}"] = Runtime.TERRAFORM
+        runtimes[f"Deploy-{root.name}"] = Runtime.TERRAFORM
     if deploy_step is not None and deploy_step.ec2 is not None:
         expected_ec2.add(f"Deploy-{deploy_step.name}")
         pre = f"PreDeploy-{deploy_step.name}"
@@ -1354,13 +1403,12 @@ def assert_standard_contract(
     assert_lambda_compute(template, expected_ec2, runtimes, pr_prefix=name)
     assert_ci_env_on_repo_command_projects(template)
     assert_stage_order(template, deploy_stage)
+    roots = _roots(terraform)
     checked_gates = list(gates)
-    if terraform is not None:
+    for root in roots:
         # The construct's plan check reads the plan artifact, like an assembly gate.
-        checked_gates.append(
-            Gate(f"tf-plan-check-{terraform.name}", ["true"], uses_assembly=True)
-        )
-    assert_gates_present(template, checked_gates)
+        checked_gates.append(Gate(f"tf-plan-check-{root.name}", ["true"], uses_assembly=True))
+    assert_gates_present(template, checked_gates, plans=[f"Plan-{r.name}" for r in roots])
     assert_deploy_ordering(template, deploy_stage, require_approval=require_approval)
     if deploy_enabled:
         assert_deploy_open(template)
@@ -1378,9 +1426,11 @@ def assert_standard_contract(
             "PR-check projects exist but pull_request_checks is off"
         )
     assert_gates_have_node(gates, node_gates)
-    if terraform is not None:
-        assert_applies_plan(template, terraform, name)
+    for root in roots:
+        assert_applies_plan(template, root, name)
+    if roots:
         assert_state_bucket(template, name)
+        assert_terraform_order(template, roots, deploy_stage)
         builds_once = False if builds_once is None else builds_once
     if builds_once is None:
         builds_once = bool(_assembly_actions(template)) or any(g.uses_assembly for g in gates)
@@ -1409,6 +1459,7 @@ __all__ = [
     "assert_stage_order",
     "assert_standard_contract",
     "assert_state_bucket",
+    "assert_terraform_order",
     "pipeline",
     "pr_projects",
     "projects",

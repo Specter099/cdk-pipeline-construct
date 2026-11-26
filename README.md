@@ -289,6 +289,35 @@ Deploy: Approve -> Deploy-main (EC2: terraform apply tfplan) -> post-deploy step
 * Not yet proven on a real account: the state bucket permissions, including the very first run with
   no state, and EC2 compute itself. Test both once with `deploy_enabled=False`.
 
+## Terraform: several roots, and credentials for other providers
+
+Step 4. `terraform=` also takes a list:
+
+```python
+GH = "arn:aws:secretsmanager:us-east-1:111122223333:secret:github-token-AbC123"
+ROOTS = [
+    TerraformRoot("network", name="network", plan_policy_statements=[...], apply_policy_statements=[...]),
+    TerraformRoot("github", name="github", secrets={"GITHUB_TOKEN": GH}),
+]
+StandardPipeline(..., gates=terraform_gates(roots=["network", "github"]), terraform=ROOTS)
+```
+
+* Every root plans and is checked in the Gates stage. Then one approval covers all of them, and the
+  applies run one at a time, in the order given. Each root has its own state key and lock in the
+  repo's one state bucket, and its own Plan and Deploy roles.
+* **Roots must be independent.** All plans are made before any apply. A root that reads another
+  root's outputs (`terraform_remote_state`) would be planned against the outputs from before this
+  release's applies, and Terraform would not flag it. Put dependent roots in separate pipelines,
+  or release them in two steps.
+* `secrets` maps environment variable names to Secrets Manager secret ARNs. Each ARN must be
+  complete, with its random suffix; CodeBuild's `:json-key:version-stage:version-id` selectors are
+  allowed. They become CodeBuild Secrets Manager variables on that root's Plan and Deploy only.
+  Only those two roles may read the secret; the static gates, the PR checks and the plan check
+  never see it. Use it for providers such as GitHub (`GITHUB_TOKEN`) or Equinix
+  (`METAL_AUTH_TOKEN`).
+* The contract (`terraform=ROOTS`) checks each root as before, plus the apply order and that no
+  other role can read a root's secrets.
+
 ## Contract tests: `specter_pipeline.testing`
 
 Every consumer must prove the same things about its pipeline. Instead of copying a test file:

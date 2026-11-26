@@ -24,7 +24,10 @@ from collections.abc import Iterable, Sequence
 from aws_cdk import aws_codebuild as codebuild
 from aws_cdk.assertions import Template
 
+from .compute import EC2_IMAGE
 from .gate import (
+    Assembly,
+    DeployStep,
     Gate,
     mentions_cdk_cli,
     names_path,
@@ -33,14 +36,12 @@ from .gate import (
     split_deploy_command,
 )
 from .pipeline import artifact_bucket_purpose
-from .runtimes import Runtime, cdk_cli_install
-
-#: Settings CodeBuild rejects or ignores on Lambda compute.
-_UNSUPPORTED_ON_LAMBDA = (
-    "TimeoutInMinutes",
-    "QueuedTimeoutInMinutes",
-    "VpcConfig",
-    "FileSystemLocations",
+from .runtimes import (
+    NODE_LINUX_X64_SHA256,
+    Runtime,
+    cdk_cli_install,
+    node_tarball_prelude,
+    prelude,
 )
 
 #: The exact actions a PR-check role may hold (measured on a synthesized pipeline): its own
@@ -156,26 +157,90 @@ def _stage(template: Template, name: str) -> dict:
 # --- individual invariants ----------------------------------------------------------
 
 
-def assert_lambda_compute(template: Template) -> None:
-    """Every CodeBuild project, including CDK Pipelines' own, runs on Lambda compute."""
+def _project_step_name(props: dict) -> str:
+    """A project's pipeline step name ("Gate-x", "Deploy-app") or, for a PR check, its name."""
+    desc = str(props.get("Description", ""))
+    if desc.startswith("Pipeline step "):
+        return desc.rsplit("/", 1)[-1]
+    return str(props.get("Name", ""))
+
+
+def _construct_generated(props: dict) -> bool:
+    desc = str(props.get("Description", ""))
+    return desc.startswith(("Pipeline step ", "PR check "))
+
+
+def _buildspec_commands(props: dict) -> list[str] | None:
+    """The build-phase commands of a project's inline buildspec, or None if it has none we can
+    read. A buildspec holding CDK tokens is an Fn::Join; its non-literal parts read as TOKEN."""
+    spec = props.get("Source", {}).get("BuildSpec")
+    if isinstance(spec, dict) and "Fn::Join" in spec:
+        sep, parts = spec["Fn::Join"]
+        spec = sep.join(p if isinstance(p, str) else "TOKEN" for p in parts)
+    if not isinstance(spec, str):
+        return None
+    try:
+        cmds = json.loads(spec)["phases"]["build"]["commands"]
+    except (ValueError, KeyError, TypeError):
+        return None
+    return cmds if isinstance(cmds, list) else None
+
+
+def _ec2_preludes() -> list[list[str]]:
+    return [prelude(rt, v, ec2=True) for rt in Runtime for v in NODE_LINUX_X64_SHA256]
+
+
+def assert_lambda_compute(template: Template, ec2_steps: Iterable[str] = ()) -> None:
+    """Every CodeBuild project, including CDK Pipelines' own, runs on Lambda compute, except the
+    steps named in ``ec2_steps`` (pipeline step names such as ``Gate-tf-plan`` or PR-check
+    project names such as ``my-repo-pr-tf-plan``), which must run on EC2: the pinned standard
+    image, never privileged, with an explicit timeout. A step on EC2 that is not declared fails,
+    and so does a declared one that is missing or on Lambda."""
     found = projects(template)
     assert found, "no CodeBuild projects in the template"
+    declared = set(ec2_steps)
+    seen: list[str] = []
     for logical_id, res in found.items():
         props = res["Properties"]
-        assert props["Environment"]["Type"] == "LINUX_LAMBDA_CONTAINER", (
-            f"{logical_id} is not on Lambda compute"
-        )
-        assert not props["Environment"].get("PrivilegedMode"), (
-            f"{logical_id} is privileged (Docker is unsupported on Lambda compute)"
-        )
-        for key in _UNSUPPORTED_ON_LAMBDA:
-            assert key not in props, (
-                f"{logical_id} sets {key}, which Lambda compute does not support"
-            )
+        env = props["Environment"]
+        step = _project_step_name(props)
+        assert not env.get("PrivilegedMode"), f"{logical_id} is privileged"
+        for key in ("VpcConfig", "FileSystemLocations"):
+            assert key not in props, f"{logical_id} sets {key}"
         # NO_CACHE is CloudFormation's explicit default; anything else is real caching.
         assert props.get("Cache", {"Type": "NO_CACHE"}) == {"Type": "NO_CACHE"}, (
             f"{logical_id} enables caching"
         )
+        if step in declared:
+            seen.append(step)
+            assert env["Type"] == "LINUX_CONTAINER", f"{step} is declared EC2 but is not on EC2"
+            assert env["Image"] == EC2_IMAGE.image_id, (
+                f"{step} runs on {env['Image']}, not the pinned EC2 image {EC2_IMAGE.image_id}"
+            )
+            assert 5 <= int(props.get("TimeoutInMinutes", 0)) <= 480, (
+                f"{step} on EC2 has no explicit timeout"
+            )
+            assert env["ComputeType"].startswith("BUILD_GENERAL1_"), f"{step} on EC2 has a Lambda size"
+            # A project the construct generated must start with one of its own EC2 toolchain
+            # set-ups (pinned Node; Python 3.12 selected through pyenv): never the image's own.
+            if _construct_generated(props):
+                cmds = _buildspec_commands(props)
+                assert cmds is not None, f"{step}: cannot read its buildspec commands"
+                assert any(cmds[: len(p)] == p for p in _ec2_preludes()), (
+                    f"{step} on EC2 does not start with the pinned toolchain set-up: {cmds[:3]}"
+                )
+            continue
+        assert env["Type"] == "LINUX_LAMBDA_CONTAINER", (
+            f"{logical_id} ({step}) is not on Lambda compute and is not declared in ec2_steps"
+        )
+        for key in ("TimeoutInMinutes", "QueuedTimeoutInMinutes"):
+            assert key not in props, (
+                f"{logical_id} sets {key}, which Lambda compute does not support"
+            )
+    missing = declared - set(seen)
+    assert not missing, f"no CodeBuild project for EC2 steps {sorted(missing)}"
+    twice = sorted({n for n in seen if seen.count(n) > 1})
+    assert not twice, f"EC2 step names {twice} match more than one project; they are ambiguous"
 
 
 def assert_ci_env_on_repo_command_projects(template: Template) -> None:
@@ -293,17 +358,30 @@ def _project_of(template: Template, step_name: str) -> dict:
 def _assert_construct_deploy(template: Template, action: dict) -> None:
     """The deploy action runs exactly: snapshot the assembly, install the pinned CLI, deploy the
     snapshot with that CLI by absolute path from an empty directory. Nothing else: no other
-    buildspec key, phase or phase setting, no environment beyond CI=true, the Node image."""
+    buildspec key, phase or phase setting, no environment beyond CI=true, the Node Lambda image
+    with a Lambda size or the pinned EC2 image with an EC2 size."""
     step = action["Name"]
     assert not action.get("Configuration", {}).get("EnvironmentVariables"), (
         f"{step} sets action-level environment variables"
     )
     props = _project_of(template, step)
     env = props["Environment"]
-    assert env["Image"] == codebuild.LinuxLambdaBuildImage.AMAZON_LINUX_2023_NODE_22.image_id, (
-        f"{step} does not run on the Node Lambda image: {env['Image']}"
-    )
-    variables = {(v["Name"], v.get("Type", "PLAINTEXT"), v.get("Value")) for v in env.get("EnvironmentVariables", [])}
+    on_ec2 = env["Type"] == "LINUX_CONTAINER"
+    if on_ec2:
+        assert env["Image"] == EC2_IMAGE.image_id and env["ComputeType"].startswith("BUILD_GENERAL1_"), (
+            f"{step} is on EC2 but not on the pinned EC2 image and an EC2 size: {env}"
+        )
+    else:
+        assert env["Type"] == "LINUX_LAMBDA_CONTAINER" and env["ComputeType"].startswith("BUILD_LAMBDA_"), (
+            f"{step} is neither on Lambda nor on EC2: {env['Type']}"
+        )
+        assert env["Image"] == codebuild.LinuxLambdaBuildImage.AMAZON_LINUX_2023_NODE_22.image_id, (
+            f"{step} on Lambda does not run on the Node Lambda image: {env['Image']}"
+        )
+    variables = {
+        (v["Name"], v.get("Type", "PLAINTEXT"), v.get("Value"))
+        for v in env.get("EnvironmentVariables", [])
+    }
     assert variables == {("CI", "PLAINTEXT", "true")}, (
         f"{step} has environment variables besides a plaintext CI=true: {variables}"
     )
@@ -322,7 +400,12 @@ def _assert_construct_deploy(template: Template, action: dict) -> None:
         if (m := re.fullmatch(r"npm install -g --prefix \S+ aws-cdk@(\d+\.\d+\.\d+)", c))
     ]
     assert len(versions) == 1, f"{step} does not install a pinned CDK CLI version exactly once"
-    expected_head = [*snapshot_commands("."), *cdk_cli_install(versions[0])]
+    node: list[str] = []
+    if on_ec2:  # the pinned Node tarball runs the CLI, not the image's Node
+        heads = [node_tarball_prelude(v) for v in NODE_LINUX_X64_SHA256]
+        node = next((h for h in heads if cmds[: len(h)] == h), [])
+        assert node, f"{step} on EC2 does not install the pinned, hash-checked Node first"
+    expected_head = [*node, *snapshot_commands("."), *cdk_cli_install(versions[0])]
     assert cmds[:-1] == expected_head, (
         f"{step} runs commands besides the snapshot, the CLI install and the deploy: {cmds[:-1]}"
     )
@@ -490,6 +573,10 @@ def assert_pr_checks(
             f"PR filter {pattern!r} is not anchored"
         )
         assert "PUSH" not in by_type["EVENT"], "PR checks must not fire on push"
+        assert "ConcurrentBuildLimit" not in props, (
+            "a PR check has a concurrency limit: CodeBuild drops builds over it, leaving a PR "
+            "without its status"
+        )
         policy = props["Triggers"]["PullRequestBuildPolicy"]
         assert policy["RequiresCommentApproval"] == "FORK_PULL_REQUESTS", (
             "fork PRs must need an approval comment"
@@ -577,15 +664,38 @@ def assert_standard_contract(
     node_gates: Iterable[str] = (),
     require_approval: bool = True,
     builds_once: bool | None = None,
+    ec2_steps: Iterable[str] = (),
+    assembly: Assembly | None = None,
+    deploy_step: DeployStep | None = None,
 ) -> None:
     """Every invariant a StandardPipeline must satisfy. Repo-specific checks go alongside.
 
     ``repo`` is ``owner/name``; ``node_gates`` names the gates that run the CDK CLI or import
     aws_cdk and therefore need Node. ``builds_once`` (default: on when the pipeline has an
-    assembly step or any gate reads the assembly) adds ``assert_builds_once``."""
+    assembly step or any gate reads the assembly) adds ``assert_builds_once``.
+
+    EC2 compute is inferred from the steps: gates with ``ec2=`` (and their PR checks), and, when
+    passed, an ``assembly`` with ``ec2=`` (``Assemble`` and the PR checks of ``uses_assembly``
+    gates, which synthesize first) and a ``deploy_step`` with ``ec2=`` (``Deploy-<name>`` and
+    ``PreDeploy-<name>``). ``ec2_steps`` names any other EC2 project."""
     name = repo.partition("/")[2]
     assert name, f"repo must be 'owner/name', got {repo!r}"
-    assert_lambda_compute(template)
+    expected_ec2 = set(ec2_steps)
+    assembly_on_ec2 = assembly is not None and assembly.ec2 is not None
+    if assembly_on_ec2:
+        expected_ec2.add(assembly.name)
+    for g in gates:
+        if g.ec2 is not None:
+            expected_ec2.add(f"Gate-{g.name}")
+        pr_on_ec2 = g.ec2 is not None or (g.uses_assembly and assembly_on_ec2)
+        if pr_on_ec2 and pull_request_checks and g.runs_on_pull_requests:
+            expected_ec2.add(f"{name}-pr-{g.name}")
+    if deploy_step is not None and deploy_step.ec2 is not None:
+        expected_ec2.add(f"Deploy-{deploy_step.name}")
+        pre = f"PreDeploy-{deploy_step.name}"
+        if any(_project_step_name(r["Properties"]) == pre for r in projects(template).values()):
+            expected_ec2.add(pre)
+    assert_lambda_compute(template, expected_ec2)
     assert_ci_env_on_repo_command_projects(template)
     assert_stage_order(template, deploy_stage)
     assert_gates_present(template, gates)

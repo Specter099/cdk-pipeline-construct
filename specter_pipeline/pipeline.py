@@ -40,6 +40,7 @@ from aws_cdk import aws_sns_subscriptions as subscriptions
 from aws_cdk import pipelines
 from constructs import Construct
 
+from .compute import Ec2, build_environment, build_timeout
 from .gate import (
     BASE_ENV,
     Assembly,
@@ -47,7 +48,6 @@ from .gate import (
     Gate,
     PostDeployStep,
     _Step,
-    compute_type,
     deploy_command,
     mentions_cdk_cli,
     names_path,
@@ -85,10 +85,10 @@ def artifact_bucket_purpose(name: str) -> str:
     return purpose
 
 
-def _environment(runtime: Runtime, memory_gb: int) -> codebuild.BuildEnvironment:
-    return codebuild.BuildEnvironment(
-        build_image=runtime.image, compute_type=compute_type(memory_gb)
-    )
+def _environment(
+    runtime: Runtime, memory_gb: int, ec2: Ec2 | None = None
+) -> codebuild.BuildEnvironment:
+    return build_environment(runtime, memory_gb, ec2)
 
 
 def _codebuild_step(
@@ -110,14 +110,15 @@ def _codebuild_step(
         additional_inputs=additional_inputs or None,
         primary_output_directory=primary_output_directory,
         commands=join(
-            prelude(spec.runtime, node_version),
+            prelude(spec.runtime, node_version, ec2=spec.ec2 is not None),
             cdk_cli_install(cdk_cli_version) if cdk_cli_version else (),
             spec.install,
             spec.commands,
         ),
         env=spec.environment,
         role_policy_statements=[*extra_policies, *spec.policy_statements],
-        build_environment=_environment(spec.runtime, spec.memory_gb),
+        build_environment=_environment(spec.runtime, spec.memory_gb, spec.ec2),
+        timeout=build_timeout(spec.ec2),
     )
 
 
@@ -363,6 +364,8 @@ class StandardPipeline(Construct):
                         f"Deploy-{deploy_step.name}",
                         input=assemble,
                         commands=join(
+                            # On EC2, the pinned Node (not the image's) runs the CLI.
+                            prelude(Runtime.NODE, node_version, ec2=deploy_step.ec2 is not None),
                             snapshot_commands("."),
                             cdk_cli_install(cdk_cli_version),
                             [deploy_command(deploy_step.stacks, deploy_step.deploy_args)],
@@ -370,7 +373,10 @@ class StandardPipeline(Construct):
                         # Only CI=true: the step's env could steer the CLI (NODE_OPTIONS ...).
                         env=dict(BASE_ENV),
                         role_policy_statements=[assume_bootstrap],
-                        build_environment=_environment(Runtime.NODE, deploy_step.memory_gb),
+                        build_environment=_environment(
+                            Runtime.NODE, deploy_step.memory_gb, deploy_step.ec2
+                        ),
+                        timeout=build_timeout(deploy_step.ec2),
                     )
                 )
             else:
@@ -445,4 +451,5 @@ class StandardPipeline(Construct):
                 ),
                 assembly_env=(assembly.env if assembly else dict(synth_env or {})),
                 assembly_memory_gb=assembly.memory_gb if assembly else synth_memory_gb,
+                assembly_ec2=assembly.ec2 if assembly else None,
             )

@@ -32,7 +32,8 @@ from aws_cdk import aws_codebuild as codebuild
 from aws_cdk import aws_iam as iam
 from constructs import Construct
 
-from .gate import BASE_ENV, Gate, compute_type
+from .compute import Ec2, build_environment, build_timeout
+from .gate import BASE_ENV, Gate
 from .runtimes import DEFAULT_NODE_VERSION, Runtime, join, prelude
 
 
@@ -51,6 +52,7 @@ class PullRequestChecks(Construct):
         assembly_commands: Sequence[str] = (),
         assembly_env: Mapping[str, str] | None = None,
         assembly_memory_gb: int = 4,
+        assembly_ec2: Ec2 | None = None,
     ) -> None:
         super().__init__(scope, construct_id)
         owner, _, repo_name = repo.partition("/")
@@ -71,6 +73,15 @@ class PullRequestChecks(Construct):
             memory_gb = (
                 max(gate.memory_gb, assembly_memory_gb) if gate.uses_assembly else gate.memory_gb
             )
+            # A synthesis that needs EC2 in the pipeline needs it on the PR too, at least as big,
+            # with time for the synthesis and the gate.
+            # A Lambda side counts as its EC2 equal: at least its memory, up to Lambda's limit.
+            if gate.uses_assembly and (assembly_ec2 is not None or gate.ec2 is not None):
+                synth = assembly_ec2 or Ec2.at_least(assembly_memory_gb)
+                own = gate.ec2 or Ec2.at_least(gate.memory_gb)
+                ec2 = synth.larger(own)
+            else:
+                ec2 = gate.ec2
             pre = list(assembly_commands) if gate.uses_assembly else []
             env = (
                 {**BASE_ENV, **(assembly_env or {}), **gate.env}
@@ -99,10 +110,8 @@ class PullRequestChecks(Construct):
                         ).and_base_ref_is(f"^refs/heads/{re.escape(base_branch)}$")
                     ],
                 ),
-                environment=codebuild.BuildEnvironment(
-                    build_image=runtime.image,
-                    compute_type=compute_type(memory_gb),
-                ),
+                environment=build_environment(runtime, memory_gb, ec2),
+                timeout=build_timeout(ec2),
                 environment_variables={
                     key: codebuild.BuildEnvironmentVariable(value=value)
                     for key, value in env.items()
@@ -113,7 +122,7 @@ class PullRequestChecks(Construct):
                         "phases": {
                             "build": {
                                 "commands": join(
-                                    prelude(runtime, node_version),
+                                    prelude(runtime, node_version, ec2=ec2 is not None),
                                     pre,
                                     gate.install,
                                     gate.commands,

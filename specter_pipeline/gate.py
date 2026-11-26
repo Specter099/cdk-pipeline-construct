@@ -19,18 +19,10 @@ import shlex
 from collections.abc import Mapping, Sequence
 from typing import ClassVar
 
-from aws_cdk import aws_codebuild as codebuild
 from aws_cdk import aws_iam as iam
 
+from .compute import Ec2, compute_type
 from .runtimes import NODE_HOME, Runtime
-
-_COMPUTE = {
-    1: codebuild.ComputeType.LAMBDA_1GB,
-    2: codebuild.ComputeType.LAMBDA_2GB,
-    4: codebuild.ComputeType.LAMBDA_4GB,
-    8: codebuild.ComputeType.LAMBDA_8GB,
-    10: codebuild.ComputeType.LAMBDA_10GB,
-}
 
 #: Environment every step gets. CI=true makes scripts such as ci-local.sh use
 #: the ambient interpreter instead of building their own .venv.
@@ -45,15 +37,6 @@ def validate_name(kind: str, name: str) -> None:
         )
 
 
-def compute_type(memory_gb: int) -> codebuild.ComputeType:
-    try:
-        return _COMPUTE[memory_gb]
-    except KeyError:
-        raise ValueError(
-            f"Lambda compute memory must be one of {sorted(_COMPUTE)} GB, got {memory_gb}"
-        ) from None
-
-
 @dataclasses.dataclass(frozen=True)
 class _Step:
     """Fields and validation every step shares. Subclasses change defaults only."""
@@ -65,6 +48,9 @@ class _Step:
     env: Mapping[str, str] = dataclasses.field(default_factory=dict)
     memory_gb: int = 2
     policy_statements: Sequence[iam.PolicyStatement] = ()
+    #: Run on EC2 compute instead of Lambda (see ``compute.Ec2``). Keyword-only, so it does not
+    #: shift the positional order of any step's fields.
+    ec2: Ec2 | None = dataclasses.field(default=None, kw_only=True)
 
     _kind: ClassVar[str] = "step"
 
@@ -80,7 +66,10 @@ class _Step:
         object.__setattr__(self, "env", dict(self.env))
         if not self.commands and self._needs_commands():
             raise ValueError(f"{self._kind} {self.name!r} has no commands")
-        compute_type(self.memory_gb)  # validates
+        if self.ec2 is not None and not isinstance(self.ec2, Ec2):
+            raise TypeError(f"{self._kind} {self.name!r}: ec2 must be an Ec2(...) or None")
+        if self.ec2 is None:
+            compute_type(self.memory_gb)  # validates; on EC2 the size sets memory instead
 
     def _needs_commands(self) -> bool:
         return True

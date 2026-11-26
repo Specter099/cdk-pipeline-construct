@@ -936,3 +936,53 @@ def test_an_ssm_parameter_is_read_as_unknown():
                                              "Default": "/config/bucket-arn"}
     with pytest.raises(AssertionError, match="OtherRole can write the Terraform state"):
         c.assert_applies_plan(Template.from_json(doc), ROOT)
+
+
+# --- step 3 follow-ups from PR #6's last verification (P1-P4) ----------------------------------
+
+
+def test_a_managed_policy_from_another_stack_is_external():
+    import aws_cdk as cdk
+    from test_pipeline import ENV
+
+    def extra(stack):
+        other = cdk.Stack(stack.node.root, "Shared", env=ENV)
+        mp = iam.ManagedPolicy(other, "MP", statements=[iam.PolicyStatement(
+            actions=["sqs:SendMessage"], resources=["*"])])
+        iam.Role(stack, "R", assumed_by=iam.ServicePrincipal("lambda.amazonaws.com"), managed_policies=[mp])
+    t = _stack_with(extra)
+    c.assert_standard_contract(t, post_deploy=[POST], repo=REPO, gates=GATES, terraform=ROOT)
+
+
+def test_a_policy_on_an_existing_bucket_named_outright_passes():
+    from aws_cdk import aws_s3 as s3
+
+    def extra(stack):
+        b = s3.Bucket.from_bucket_name(stack, "Site", "my-existing-site")
+        pol = s3.BucketPolicy(stack, "SitePolicy", bucket=b)
+        pol.document.add_statements(iam.PolicyStatement(
+            actions=["s3:GetObject"], resources=["arn:aws:s3:::my-existing-site/*"],
+            principals=[iam.ServicePrincipal("cloudfront.amazonaws.com")]))
+    c.assert_state_bucket(_stack_with(extra), "demo")
+
+
+@pytest.mark.parametrize("arn", ["arn:aws:iam::000000000000:policy/state-writer",
+                                 {"Fn::Join": ["", ["arn:aws:iam::", {"Ref": "AWS::AccountId"},
+                                                    ":policy/state-writer"]]}])
+def test_a_template_managed_policy_named_by_arn_is_read(arn):
+    def change(res):
+        _add(res, "MP", "AWS::IAM::ManagedPolicy", {"ManagedPolicyName": "state-writer",
+                                                    "PolicyDocument": _doc(_put(_state_object(res)))})
+        _other_role(res, ManagedPolicyArns=[arn])
+    with pytest.raises(AssertionError, match="OtherRole can write the Terraform state"):
+        c.assert_applies_plan(mutated(change), ROOT)
+
+
+def test_a_deny_on_a_parameter_never_excuses_even_with_a_star_default():
+    doc = copy.deepcopy(tf_build().to_json())
+    _other_role(doc["Resources"], Policies=[{"PolicyName": "p", "PolicyDocument": _doc(
+        {"Effect": "Allow", "Action": "s3:*", "Resource": "*"},
+        {"Effect": "Deny", "Action": "s3:*", "Resource": {"Ref": "P"}})}])
+    doc.setdefault("Parameters", {})["P"] = {"Type": "String", "Default": "*"}
+    with pytest.raises(AssertionError, match="OtherRole can"):
+        c.assert_applies_plan(Template.from_json(doc), ROOT)

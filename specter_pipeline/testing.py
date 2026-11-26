@@ -599,7 +599,8 @@ def _sub_text(body: str, variables: dict, ctx: _Ctx, unknown: str = "*") -> str:
         if lid in ctx.distinct:
             return f"<{lid}.{attr}>" if attr else f"<{lid}>"
         if not attr and lid in ctx.params:
-            return ctx.params[lid] if ctx.params[lid] is not None else unknown
+            # a default can be overridden at deploy time: never trust it to exclude anything
+            return ctx.params[lid] if ctx.params[lid] is not None and unknown == "*" else unknown
         if lid.startswith("AWS::") and unknown == "*":
             return "*"
         return unknown
@@ -634,7 +635,7 @@ def _resource_text(resource, ctx: _Ctx | None = None, unknown: str = "*") -> str
             return "<" + resource["Ref"] + ">"
         if "Ref" in resource and resource["Ref"] in ctx.params:
             value = ctx.params[resource["Ref"]]
-            return value if value is not None else unknown
+            return value if value is not None and unknown == "*" else unknown
         if "Ref" in resource and str(resource["Ref"]).startswith("AWS::") and unknown == "*":
             return "*"
         if "Fn::ImportValue" in resource:
@@ -815,12 +816,15 @@ def _policy_principals(template: Template) -> list[tuple[str, list]]:
                     found[pid].extend(stmts)
 
     managed: dict[str, list] = {}
+    managed_names: dict[str, str] = {}
     for cfn in ("AWS::IAM::Policy", "AWS::IAM::ManagedPolicy"):
         for lid, res in template.find_resources(cfn).items():
             props = res.get("Properties", {}) or {}
             stmts = _doc_statements(props.get("PolicyDocument"))
             if cfn == "AWS::IAM::ManagedPolicy":
                 managed[lid] = stmts
+                if isinstance(props.get("ManagedPolicyName"), str):
+                    managed_names[props["ManagedPolicyName"]] = lid
             for kind in _PRINCIPALS:
                 if kind in props:
                     attach(lid, kind, props[kind], stmts)
@@ -846,8 +850,15 @@ def _policy_principals(template: Template) -> list[tuple[str, list]]:
                     continue
                 # A policy ARN, literal or built the way CDK writes AWS-managed ones
                 # (Join/Sub with the partition), is from outside the template: unreadable.
-                if _MANAGED_ARN.fullmatch(_resource_text(arn)):
+                text = _resource_text(arn)
+                if _MANAGED_ARN.fullmatch(text):
+                    # by ARN: one of this template's, by name (P3), or external and unread
+                    name = text.rsplit("/", 1)[-1]
+                    if name in managed_names:
+                        found[pid].extend(managed[managed_names[name]])
                     continue
+                if isinstance(arn, dict) and set(arn) == {"Fn::ImportValue"}:
+                    continue  # another stack's policy: external and unread, like an ARN
                 # Anything else may be any template managed policy: take their Allows (never
                 # their Denies, which may not apply), or an unknown statement if there are none.
                 for stmts in managed.values():
@@ -927,6 +938,8 @@ def assert_state_bucket(template: Template, name: str) -> None:
         bucket = pp.get("Bucket")
         if isinstance(bucket, dict) and bucket.get("Ref") in others:
             continue  # another bucket's policy
+        if isinstance(bucket, str) and not bucket.startswith(str(props.get("BucketNamePrefix"))):
+            continue  # an existing bucket named outright, which cannot be the state bucket
         # The state bucket's, or one we cannot tie to a bucket: it may only deny.
         ours = bucket == {"Ref": lid}
         for st in _as_list(pp.get("PolicyDocument", {}).get("Statement", [])):

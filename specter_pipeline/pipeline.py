@@ -110,7 +110,7 @@ def _codebuild_step(
         additional_inputs=additional_inputs or None,
         primary_output_directory=primary_output_directory,
         commands=join(
-            prelude(spec.runtime, node_version),
+            prelude(spec.runtime, node_version, ec2=spec.ec2 is not None),
             cdk_cli_install(cdk_cli_version) if cdk_cli_version else (),
             spec.install,
             spec.commands,
@@ -364,6 +364,8 @@ class StandardPipeline(Construct):
                         f"Deploy-{deploy_step.name}",
                         input=assemble,
                         commands=join(
+                            # On EC2, the pinned Node (not the image's) runs the CLI.
+                            prelude(Runtime.NODE, node_version, ec2=deploy_step.ec2 is not None),
                             snapshot_commands("."),
                             cdk_cli_install(cdk_cli_version),
                             [deploy_command(deploy_step.stacks, deploy_step.deploy_args)],

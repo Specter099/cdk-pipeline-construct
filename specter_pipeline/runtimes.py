@@ -51,9 +51,20 @@ class Runtime(enum.Enum):
         return codebuild.LinuxLambdaBuildImage.AMAZON_LINUX_2023_PYTHON_3_12
 
 
-def python_prelude() -> list[str]:
-    """Create ``/tmp/venv`` and activate it, with the image's pip config off."""
+#: The Python every step's venv is built from. Lambda's python3.12 image provides it as
+#: ``python3``; on EC2 the standard image carries several, so the venv is built from this exact
+#: interpreter and the build stops if the image lacks it.
+PYTHON_VERSION = "3.12"
+
+
+def python_prelude(*, ec2: bool = False) -> list[str]:
+    """Create ``/tmp/venv`` and activate it, with the image's pip config off. On EC2 the venv is
+    built from ``python3.12`` explicitly (fails closed if the image has none)."""
+    interpreter = f"python{PYTHON_VERSION}" if ec2 else "python3"
+    missing = f"this image has no {interpreter}; EC2 steps need it"
+    check = [f'command -v {interpreter} >/dev/null || {{ echo "{missing}"; exit 1; }}'] if ec2 else []
     return [
+        *check,
         # Image-level pip settings override the venv; drop every PIP_* variable.
         'for v in $(env | grep -oE "^PIP_[A-Z_]+"); do unset "$v"; done',
         "unset PYTHONPATH PYTHONUSERBASE",
@@ -64,7 +75,7 @@ def python_prelude() -> list[str]:
         # Found by running real builds on Lambda compute. Give it a private dir.
         f"mkdir -m 700 -p {_JSII_CACHE}",
         f"export JSII_RUNTIME_PACKAGE_CACHE_ROOT={_JSII_CACHE}",
-        f"python3 -m venv {_VENV}",
+        f"{interpreter} -m venv {_VENV}",
         f". {_VENV}/bin/activate",
     ]
 
@@ -114,13 +125,19 @@ def cdk_cli_install(version: str = DEFAULT_CDK_CLI_VERSION) -> list[str]:
     ]
 
 
-def prelude(runtime: Runtime, node_version: str = DEFAULT_NODE_VERSION) -> list[str]:
-    """Commands that make ``runtime`` ready, run before a step's own commands."""
+def prelude(
+    runtime: Runtime, node_version: str = DEFAULT_NODE_VERSION, *, ec2: bool = False
+) -> list[str]:
+    """Commands that make ``runtime`` ready, run before a step's own commands.
+
+    On EC2 the standard image's own Node and Python are not used: Node is the same pinned,
+    hash-checked tarball as on Lambda (also for ``Runtime.NODE``), and the venv is built from
+    ``python3.12``. So a step gets the same toolchain on both computes."""
     if runtime is Runtime.PYTHON:
-        return python_prelude()
+        return python_prelude(ec2=ec2)
     if runtime is Runtime.NODE:
-        return []
-    return [*node_tarball_prelude(node_version), *python_prelude()]
+        return node_tarball_prelude(node_version) if ec2 else []
+    return [*node_tarball_prelude(node_version), *python_prelude(ec2=ec2)]
 
 
 def join(*groups: Sequence[str]) -> list[str]:

@@ -26,6 +26,8 @@ from aws_cdk.assertions import Template
 
 from .compute import EC2_IMAGE
 from .gate import (
+    Assembly,
+    DeployStep,
     Gate,
     mentions_cdk_cli,
     names_path,
@@ -34,14 +36,11 @@ from .gate import (
     split_deploy_command,
 )
 from .pipeline import artifact_bucket_purpose
-from .runtimes import Runtime, cdk_cli_install
-
-#: Settings CodeBuild rejects or ignores on Lambda compute.
-_UNSUPPORTED_ON_LAMBDA = (
-    "TimeoutInMinutes",
-    "QueuedTimeoutInMinutes",
-    "VpcConfig",
-    "FileSystemLocations",
+from .runtimes import (
+    NODE_LINUX_X64_SHA256,
+    Runtime,
+    cdk_cli_install,
+    node_tarball_prelude,
 )
 
 #: The exact actions a PR-check role may hold (measured on a synthesized pipeline): its own
@@ -174,7 +173,7 @@ def assert_lambda_compute(template: Template, ec2_steps: Iterable[str] = ()) -> 
     found = projects(template)
     assert found, "no CodeBuild projects in the template"
     declared = set(ec2_steps)
-    seen: set[str] = set()
+    seen: list[str] = []
     for logical_id, res in found.items():
         props = res["Properties"]
         env = props["Environment"]
@@ -187,7 +186,7 @@ def assert_lambda_compute(template: Template, ec2_steps: Iterable[str] = ()) -> 
             f"{logical_id} enables caching"
         )
         if step in declared:
-            seen.add(step)
+            seen.append(step)
             assert env["Type"] == "LINUX_CONTAINER", f"{step} is declared EC2 but is not on EC2"
             assert env["Image"] == EC2_IMAGE.image_id, (
                 f"{step} runs on {env['Image']}, not the pinned EC2 image {EC2_IMAGE.image_id}"
@@ -203,8 +202,10 @@ def assert_lambda_compute(template: Template, ec2_steps: Iterable[str] = ()) -> 
             assert key not in props, (
                 f"{logical_id} sets {key}, which Lambda compute does not support"
             )
-    missing = declared - seen
+    missing = declared - set(seen)
     assert not missing, f"no CodeBuild project for EC2 steps {sorted(missing)}"
+    twice = sorted({n for n in seen if seen.count(n) > 1})
+    assert not twice, f"EC2 step names {twice} match more than one project; they are ambiguous"
 
 
 def assert_ci_env_on_repo_command_projects(template: Template) -> None:
@@ -329,11 +330,22 @@ def _assert_construct_deploy(template: Template, action: dict) -> None:
     )
     props = _project_of(template, step)
     env = props["Environment"]
-    assert env["Image"] in (
-        codebuild.LinuxLambdaBuildImage.AMAZON_LINUX_2023_NODE_22.image_id,
-        EC2_IMAGE.image_id,
-    ), f"{step} does not run on the Node Lambda image or the pinned EC2 image: {env['Image']}"
-    variables = {(v["Name"], v.get("Type", "PLAINTEXT"), v.get("Value")) for v in env.get("EnvironmentVariables", [])}
+    on_ec2 = env["Type"] == "LINUX_CONTAINER"
+    if on_ec2:
+        assert env["Image"] == EC2_IMAGE.image_id and env["ComputeType"].startswith("BUILD_GENERAL1_"), (
+            f"{step} is on EC2 but not on the pinned EC2 image and an EC2 size: {env}"
+        )
+    else:
+        assert env["Type"] == "LINUX_LAMBDA_CONTAINER" and env["ComputeType"].startswith("BUILD_LAMBDA_"), (
+            f"{step} is neither on Lambda nor on EC2: {env['Type']}"
+        )
+        assert env["Image"] == codebuild.LinuxLambdaBuildImage.AMAZON_LINUX_2023_NODE_22.image_id, (
+            f"{step} on Lambda does not run on the Node Lambda image: {env['Image']}"
+        )
+    variables = {
+        (v["Name"], v.get("Type", "PLAINTEXT"), v.get("Value"))
+        for v in env.get("EnvironmentVariables", [])
+    }
     assert variables == {("CI", "PLAINTEXT", "true")}, (
         f"{step} has environment variables besides a plaintext CI=true: {variables}"
     )
@@ -352,7 +364,12 @@ def _assert_construct_deploy(template: Template, action: dict) -> None:
         if (m := re.fullmatch(r"npm install -g --prefix \S+ aws-cdk@(\d+\.\d+\.\d+)", c))
     ]
     assert len(versions) == 1, f"{step} does not install a pinned CDK CLI version exactly once"
-    expected_head = [*snapshot_commands("."), *cdk_cli_install(versions[0])]
+    node: list[str] = []
+    if on_ec2:  # the pinned Node tarball runs the CLI, not the image's Node
+        heads = [node_tarball_prelude(v) for v in NODE_LINUX_X64_SHA256]
+        node = next((h for h in heads if cmds[: len(h)] == h), [])
+        assert node, f"{step} on EC2 does not install the pinned, hash-checked Node first"
+    expected_head = [*node, *snapshot_commands("."), *cdk_cli_install(versions[0])]
     assert cmds[:-1] == expected_head, (
         f"{step} runs commands besides the snapshot, the CLI install and the deploy: {cmds[:-1]}"
     )
@@ -608,22 +625,35 @@ def assert_standard_contract(
     require_approval: bool = True,
     builds_once: bool | None = None,
     ec2_steps: Iterable[str] = (),
+    assembly: Assembly | None = None,
+    deploy_step: DeployStep | None = None,
 ) -> None:
     """Every invariant a StandardPipeline must satisfy. Repo-specific checks go alongside.
 
     ``repo`` is ``owner/name``; ``node_gates`` names the gates that run the CDK CLI or import
     aws_cdk and therefore need Node. ``builds_once`` (default: on when the pipeline has an
-    assembly step or any gate reads the assembly) adds ``assert_builds_once``. Gates with
-    ``ec2=`` are expected on EC2 (their PR checks too); name any other EC2 step, such as
-    ``Deploy-app`` or ``Assemble``, in ``ec2_steps``."""
+    assembly step or any gate reads the assembly) adds ``assert_builds_once``.
+
+    EC2 compute is inferred from the steps: gates with ``ec2=`` (and their PR checks), and, when
+    passed, an ``assembly`` with ``ec2=`` (``Assemble`` and the PR checks of ``uses_assembly``
+    gates, which synthesize first) and a ``deploy_step`` with ``ec2=`` (``Deploy-<name>`` and
+    ``PreDeploy-<name>``). ``ec2_steps`` names any other EC2 project."""
     name = repo.partition("/")[2]
     assert name, f"repo must be 'owner/name', got {repo!r}"
     expected_ec2 = set(ec2_steps)
+    assembly_on_ec2 = assembly is not None and assembly.ec2 is not None
+    if assembly_on_ec2:
+        expected_ec2.add(assembly.name)
     for g in gates:
         if g.ec2 is not None:
             expected_ec2.add(f"Gate-{g.name}")
-            if pull_request_checks and g.runs_on_pull_requests:
-                expected_ec2.add(f"{name}-pr-{g.name}")
+        pr_on_ec2 = g.ec2 is not None or (g.uses_assembly and assembly_on_ec2)
+        if pr_on_ec2 and pull_request_checks and g.runs_on_pull_requests:
+            expected_ec2.add(f"{name}-pr-{g.name}")
+    if deploy_step is not None and deploy_step.ec2 is not None:
+        expected_ec2.add(f"Deploy-{deploy_step.name}")
+        if assembly is not None and (deploy_step.install or deploy_step.commands):
+            expected_ec2.add(f"PreDeploy-{deploy_step.name}")
     assert_lambda_compute(template, expected_ec2)
     assert_ci_env_on_repo_command_projects(template)
     assert_stage_order(template, deploy_stage)

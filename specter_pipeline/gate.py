@@ -66,9 +66,10 @@ class _Step:
         object.__setattr__(self, "env", dict(self.env))
         if not self.commands and self._needs_commands():
             raise ValueError(f"{self._kind} {self.name!r} has no commands")
-        compute_type(self.memory_gb)  # validates
         if self.ec2 is not None and not isinstance(self.ec2, Ec2):
             raise TypeError(f"{self._kind} {self.name!r}: ec2 must be an Ec2(...) or None")
+        if self.ec2 is None:
+            compute_type(self.memory_gb)  # validates; on EC2 the size sets memory instead
 
     def _needs_commands(self) -> bool:
         return True

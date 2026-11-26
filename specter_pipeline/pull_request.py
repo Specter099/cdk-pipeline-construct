@@ -32,7 +32,7 @@ from aws_cdk import aws_codebuild as codebuild
 from aws_cdk import aws_iam as iam
 from constructs import Construct
 
-from .compute import Ec2, build_environment, build_timeout
+from .compute import PR_EC2_CONCURRENT_BUILDS, Ec2, build_environment, build_timeout
 from .gate import BASE_ENV, Gate
 from .runtimes import DEFAULT_NODE_VERSION, Runtime, join, prelude
 
@@ -73,8 +73,12 @@ class PullRequestChecks(Construct):
             memory_gb = (
                 max(gate.memory_gb, assembly_memory_gb) if gate.uses_assembly else gate.memory_gb
             )
-            # A synthesis that needs EC2 in the pipeline needs it on the PR too.
-            ec2 = gate.ec2 or (assembly_ec2 if gate.uses_assembly else None)
+            # A synthesis that needs EC2 in the pipeline needs it on the PR too, at least as big,
+            # with time for the synthesis and the gate.
+            if gate.uses_assembly and assembly_ec2 is not None:
+                ec2 = assembly_ec2.larger(gate.ec2)
+            else:
+                ec2 = gate.ec2
             pre = list(assembly_commands) if gate.uses_assembly else []
             env = (
                 {**BASE_ENV, **(assembly_env or {}), **gate.env}
@@ -105,6 +109,7 @@ class PullRequestChecks(Construct):
                 ),
                 environment=build_environment(runtime, memory_gb, ec2),
                 timeout=build_timeout(ec2),
+                concurrent_build_limit=PR_EC2_CONCURRENT_BUILDS if ec2 else None,
                 environment_variables={
                     key: codebuild.BuildEnvironmentVariable(value=value)
                     for key, value in env.items()
@@ -115,7 +120,7 @@ class PullRequestChecks(Construct):
                         "phases": {
                             "build": {
                                 "commands": join(
-                                    prelude(runtime, node_version),
+                                    prelude(runtime, node_version, ec2=ec2 is not None),
                                     pre,
                                     gate.install,
                                     gate.commands,

@@ -209,17 +209,28 @@ Gate("tf-plan", ["terraform plan -out=tfplan"], ec2=Ec2(size="medium", timeout_m
   action) and `PostDeployStep`. Everything else, including CDK Pipelines' own projects, stays on
   Lambda.
 * Sizes are CodeBuild's: `small` (2 vCPU, 3 GB), `medium` (4, 7), `large` (8, 15), `xlarge`,
-  `2xlarge`. `timeout_minutes` (5 to 480) is required in effect: choose it from the worst case,
-  because a timeout during an apply does the same damage as Lambda's limit.
-* The image is the pinned Amazon Linux 2023 standard image (`aws/codebuild/amazonlinux-x86_64-standard:5.0`),
-  never privileged. The runtime set-up is the same as on Lambda, so a step's commands do not change
-  when it moves.
-* An EC2 gate's PR check runs on EC2 too, and so does the PR check of a `uses_assembly` gate when the
-  assembly step is on EC2 (it synthesizes first).
+  `2xlarge`. `timeout_minutes` runs from 5 to 480 (CodePipeline's limit for a CodeBuild action) and
+  defaults to 60. Choose it from the worst case: a timeout during an apply does the same damage as
+  Lambda's limit. `memory_gb` is ignored on EC2; the size sets memory.
+* The image is Amazon Linux 2023 standard 6.0 (`aws/codebuild/amazonlinux-x86_64-standard:6.0`),
+  never privileged. The image's own Node and Python are not used. Node is the same pinned,
+  hash-checked tarball as on Lambda, including for `Runtime.NODE` and the deploy action. The venv is
+  built from `python3.12`, and the build stops if the image has none. So a step gets the same
+  toolchain on both computes. What differs: EC2 builds run as root with `HOME=/root`, and AWS
+  patches the image under the same tag.
+* An EC2 gate's PR check runs on EC2 too. The PR check of a `uses_assembly` gate synthesizes first,
+  so when the assembly step is on EC2 it gets the larger of the two sizes and both timeouts added
+  together (at most 480). EC2 PR checks are limited to 2 concurrent builds: they run the PR's code,
+  as root, for up to their timeout.
+* `DeployStep(ec2=...)` applies to its `PreDeploy` action as well as the deploy action.
 * Not yet: caching, VPC, Docker. The contract still refuses all three.
-* The contract expects EC2 exactly where it is declared. Gates with `ec2=` are inferred; name any
-  other EC2 step, such as `Deploy-app` or `Assemble`, in
-  `assert_standard_contract(..., ec2_steps=[...])`. An undeclared EC2 project fails.
+* The contract expects EC2 exactly where it is declared, and infers it from the steps. Gates with
+  `ec2=` are inferred automatically. Pass `assembly=` and `deploy_step=` to
+  `assert_standard_contract` and their EC2 steps are inferred too, including the PR checks of
+  `uses_assembly` gates. Name anything else in `ec2_steps=[...]`. An undeclared EC2 project fails,
+  and so does a declared name that matches more than one project.
+* Not yet proven on live EC2: that the 6.0 image provides `python3.12`. The first EC2 build says so
+  plainly if it does not.
 
 ## Development
 

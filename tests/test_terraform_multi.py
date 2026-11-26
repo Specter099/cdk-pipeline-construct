@@ -335,7 +335,7 @@ def test_a_missing_apply_is_an_assertion_not_a_key_error():
 # --- PR #7 verification follow-ups (L2, L3, L5, L6) -------------------------------------------
 
 
-@pytest.mark.parametrize("key", ["AWS_REGION", "AWS_DEFAULT_REGION", "AWS_MAX_ATTEMPTS", "AWS_RETRY_MODE"])
+@pytest.mark.parametrize("key", ["AWS_MAX_ATTEMPTS", "AWS_RETRY_MODE"])
 def test_env_may_tune_the_aws_sdk(key):
     TerraformRoot("x", env={key: "1"})
 
@@ -362,3 +362,25 @@ def test_a_gate_with_buildspec_secrets_fails_the_contract():
         p["Source"]["BuildSpec"] = json.dumps(spec)
     with pytest.raises(AssertionError, match="Gate-tf-validate reads Secrets Manager secrets"):
         c.assert_standard_contract(mutated(change), post_deploy=[POST], repo=REPO, gates=GATES, terraform=ROOTS)
+
+
+def test_the_region_is_the_stacks():
+    # init gives the backend region=$AWS_REGION, which CodeBuild sets to the stack's region
+    for key in ("AWS_REGION", "AWS_DEFAULT_REGION"):
+        with pytest.raises(ValueError, match="env may not set"):
+            TerraformRoot("x", env={key: "eu-west-1"})
+
+
+def test_tf_token_needs_a_host():
+    with pytest.raises(ValueError, match="TF_TOKEN_<host>"):
+        TerraformRoot("x", secrets={"TF_TOKEN_": GH})
+
+
+@pytest.mark.parametrize("resource", [{"Fn::GetAtt": ["Sec", "Id"]}, {"Fn::Sub": "${Sec.Id}"}])
+def test_a_named_template_secret_by_its_id_is_caught(resource):
+    def change(res):
+        res["Sec"] = {"Type": "AWS::SecretsManager::Secret", "Properties": {"Name": "gh-token"}}
+        _role_stmts(res, "Plan-network").append(
+            {"Effect": "Allow", "Action": "secretsmanager:GetSecretValue", "Resource": resource})
+    with pytest.raises(AssertionError, match="can read github's secret"):
+        c.assert_applies_plan(mutated(change), GITHUB, "demo", ROOTS)

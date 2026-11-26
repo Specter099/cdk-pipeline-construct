@@ -39,6 +39,9 @@ from .terraform import (
     secrets_policy,
 )
 
+#: Build states reported to the notification topic.
+_REPORTED = ("FAILED", "STOPPED", "TIMED_OUT", "FAULT")
+
 
 def drift_commands(root: TerraformRoot) -> list[str]:
     var_files = " ".join(f"-var-file={shlex.quote(v)}" for v in root.var_files)
@@ -90,10 +93,6 @@ class TerraformDriftChecks(Construct):
         super().__init__(scope, construct_id)
         owner, _, repo_name = repo.partition("/")
         self.projects: dict[str, codebuild.Project] = {}
-        rule = events.Rule(
-            self, "Schedule", schedule=events.Schedule.expression(schedule),
-            description=f"Terraform drift check for {repo}",
-        )
         for root in roots:
             project = codebuild.Project(
                 self,
@@ -145,7 +144,31 @@ class TerraformDriftChecks(Construct):
                 ),
             ):
                 project.add_to_role_policy(statement)
-            rule.add_target(targets.CodeBuildProject(project))
-            project.on_build_failed(f"Drift-{root.name}-Failed", target=targets.SnsTopic(topic))
+            # One schedule rule per root: an EventBridge rule takes at most 5 targets.
+            events.Rule(
+                self, f"Schedule-{root.name}", schedule=events.Schedule.expression(schedule),
+                description=f"Terraform drift check '{root.name}' for {repo}",
+                targets=[targets.CodeBuildProject(project)],
+            )
+            # A build that fails (drift, exit 2, or an error, exit 1) or is stopped is reported;
+            # the message says which root, and that the log tells drift from error.
+            events.Rule(
+                self, f"Drift-{root.name}-Failed",
+                description=f"Terraform drift check '{root.name}' for {repo} did not pass",
+                event_pattern=events.EventPattern(
+                    source=["aws.codebuild"],
+                    detail_type=["CodeBuild Build State Change"],
+                    detail={
+                        "build-status": list(_REPORTED),
+                        "project-name": [project.project_name],
+                    },
+                ),
+                targets=[targets.SnsTopic(topic, message=events.RuleTargetInput.from_text(
+                    f"Terraform drift check '{root.name}' for {repo} ended "
+                    f"{events.EventField.from_path('$.detail.build-status')}: drift, or an error "
+                    "before the check could finish. The build log says which: "
+                    f"{events.EventField.from_path('$.detail.build-id')}"
+                ))],
+            )
             self.projects[root.name] = project
 

@@ -253,9 +253,9 @@ Deploy: Approve -> Deploy-main (EC2: terraform apply tfplan) -> post-deploy step
   so a long apply is not killed half-way.
 * `TerraformRoot.env` and `secrets` may not set variables that redirect Terraform, the AWS SDK or
   CodeBuild: `TF_CLI_ARGS*`, `TF_WORKSPACE`, `TF_DATA_DIR`, `TF_CLI_CONFIG_FILE` and similar,
-  `TF_LOG*` (debug logs can print secrets), `AWS_*` other than the region and retry settings
-  (`AWS_REGION`, `AWS_DEFAULT_REGION`, `AWS_MAX_ATTEMPTS`, `AWS_RETRY_MODE`), `CODEBUILD_*`,
-  `PATH`, `HOME` and `CI`.
+  `TF_LOG*` (debug logs can print secrets), `AWS_*` other than the retry settings
+  (`AWS_MAX_ATTEMPTS`, `AWS_RETRY_MODE`), `CODEBUILD_*`, `PATH`, `HOME` and `CI`. The backend's
+  region is the stack's; a provider that needs another region sets it in its own block.
 * `assert_standard_contract(..., terraform=ROOT)` checks all of this, via `assert_applies_plan` and
   `assert_state_bucket`: exact command lists, environment variables, artifact wiring, and IAM with
   wildcards taken into account.
@@ -348,9 +348,21 @@ CodeBuild project per root, started by an EventBridge schedule:
 * It then runs `terraform plan -refresh-only -detailed-exitcode -lock=false`. Exit 2 means the real
   infrastructure differs from the state: the build fails and says so. `-lock=false` means a drift
   check never blocks a release.
-* Failed drift builds are published to the pipeline's notification topic.
+* A build that fails or stops is published to the pipeline's notification topic, with the root,
+  the build status and the build id. Drift (exit 2) and an error (exit 1, such as expired
+  credentials) both fail the build: the log says which.
+* Reports that are not drift:
+  * The check plans the branch head, not the last applied commit. A merged change waiting at the
+    approval that changes a root output or adds a `moved` block also exits 2.
+  * A check that runs while `Deploy-<root>` applies compares half-applied infrastructure with the
+    state from before the apply. Schedule the check away from release times.
+* One schedule rule per root, so there is no limit on the number of roots.
 * It runs on EC2 with the root's plan permissions, read-only access to its state object (no lock),
   and the root's provider secrets. It has no state write and no deploy rights.
+* Like `Plan-<root>`, it runs the branch's code with those credentials before anyone approves a
+  release. Unlike Plan it is a standalone project: anyone allowed `codebuild:StartBuild` on it can
+  pass another source version or a buildspec override and run any code with its role. Grant
+  `StartBuild` on the drift projects as you would grant the plan role itself.
 * Pass `drift=True` to `assert_standard_contract` to check all of this, via `assert_drift_checks`.
 
 ## Contract tests: `specter_pipeline.testing`

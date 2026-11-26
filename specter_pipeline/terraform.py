@@ -75,9 +75,9 @@ _RESERVED_ENV = frozenset(
 #: (which CodeBuild refuses at deploy time anyway).
 _RESERVED_PREFIXES = ("TF_CLI_ARGS", "AWS_", "CODEBUILD_")
 #: AWS SDK settings that only tune it (region and retries), not credentials or endpoints.
-_ALLOWED_AWS = frozenset(
-    {"AWS_REGION", "AWS_DEFAULT_REGION", "AWS_MAX_ATTEMPTS", "AWS_RETRY_MODE"}
-)
+#: Not the region: init gives the backend "region=$AWS_REGION", the stack's region, which CodeBuild
+#: sets; a root that needs another provider region sets it in the provider block.
+_ALLOWED_AWS = frozenset({"AWS_MAX_ATTEMPTS", "AWS_RETRY_MODE"})
 
 
 def _root_path(path: str) -> str:
@@ -142,10 +142,10 @@ class TerraformRoot:
         for key, arn in self.secrets.items():
             # upper-case, or Terraform's TF_TOKEN_<host> credential (host in lower case)
             named = re.fullmatch(r"[A-Z_][A-Z0-9_]*|TF_TOKEN_[A-Za-z0-9_]+", key)
-            if not named or key in self.env or key in BASE_ENV:
+            if not named or key == "TF_TOKEN_" or key in self.env or key in BASE_ENV:
                 raise ValueError(
                     f"terraform root {self.name!r}: secret name {key!r} must be an upper-case "
-                    "variable name not also in env"
+                    "variable name (or TF_TOKEN_<host>) not also in env"
                 )
             if key.startswith("TF_VAR_"):
                 raise ValueError(

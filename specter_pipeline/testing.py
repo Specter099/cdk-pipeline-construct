@@ -605,7 +605,7 @@ def _sub_text(body: str, variables: dict, ctx: _Ctx, unknown: str = "*") -> str:
         if name in variables:
             return _resource_text(variables[name], ctx, unknown)
         lid, _, attr = name.partition(".")
-        if not attr and lid in ctx.secret_arns:
+        if lid in ctx.secret_arns and attr in ("", "Id"):
             return ctx.secret_arns[lid]
         if lid in ctx.distinct:
             return f"<{lid}.{attr}>" if attr else f"<{lid}>"
@@ -642,6 +642,9 @@ def _resource_text(resource, ctx: _Ctx | None = None, unknown: str = "*") -> str
                 return _sub_text(sub[0], sub[1], ctx, unknown)
         if "Ref" in resource and resource["Ref"] in ctx.secret_arns:
             return ctx.secret_arns[resource["Ref"]]
+        if "Fn::GetAtt" in resource and resource["Fn::GetAtt"][0] in ctx.secret_arns:
+            # the secret's Id is its ARN, like its Ref
+            return ctx.secret_arns[resource["Fn::GetAtt"][0]]
         if "Fn::GetAtt" in resource and resource["Fn::GetAtt"][0] in ctx.distinct:
             return "<" + ".".join(resource["Fn::GetAtt"]) + ">"
         if "Ref" in resource and resource["Ref"] in ctx.distinct:
@@ -1136,7 +1139,7 @@ def assert_applies_plan(
         drift check when there is one (which never takes the lock)."""
         found = {_role_of(template, f"Plan-{r.name}"), _role_of(template, f"Deploy-{r.name}")}
         if drift:
-            found.add(_drift_project(template, r)["ServiceRole"]["Fn::GetAtt"][0])
+            found.add(_drift_project(template, r, repo_name)["ServiceRole"]["Fn::GetAtt"][0])
         return found
 
     lock = [_state_targets(bucket_lid, props, root.state_key + ".tflock")]
@@ -1190,32 +1193,52 @@ def _roots(terraform) -> list[TerraformRoot]:
     return [terraform] if isinstance(terraform, TerraformRoot) else list(terraform)
 
 
-def _drift_project(template: Template, root: TerraformRoot) -> dict:
+def _drift_project(template: Template, root: TerraformRoot, repo_name: str | None = None) -> dict:
+    """The root's drift project: named ``{repo}-drift-{root}`` (any repo when not given)."""
     found = [
         r["Properties"] for r in projects(template).values()
-        if str(r["Properties"].get("Name", "")).endswith(f"-drift-{root.name}")
+        if (
+            str(r["Properties"].get("Name", "")) == f"{repo_name}-drift-{root.name}"
+            if repo_name
+            else str(r["Properties"].get("Name", "")).endswith(f"-drift-{root.name}")
+        )
     ]
     assert len(found) == 1, f"expected one drift project for {root.name}, found {len(found)}"
     return found[0]
 
 
-def assert_drift_checks(template: Template, roots: Sequence[TerraformRoot], repo_name: str) -> None:
-    """Each root has a scheduled, read-only drift check: EC2 with the pinned Terraform set-up and
-    exactly the construct's drift commands, no webhook, started by a schedule rule, failures
-    published to SNS, and a role that can read the state but not write it or take the lock."""
-    rules = template.find_resources("AWS::Events::Rule")
+def assert_drift_checks(
+    template: Template,
+    roots: Sequence[TerraformRoot],
+    repo_name: str,
+    repo: str | None = None,
+    branch: str | None = None,
+) -> None:
+    """Each root has a scheduled, read-only drift check: EC2 with the pinned Terraform set-up;
+    exactly the construct's buildspec (only the build commands, and the root's secrets) and
+    exactly the root's variables plus the state bucket; the pipeline's repo and branch through
+    its connection (when ``repo``/``branch`` are given); no webhook; started by an enabled
+    schedule rule; failed or stopped builds published to an SNS topic by an enabled rule; and a
+    role that can read the state but not write it or take the lock."""
+    rules = {k: r["Properties"] for k, r in template.find_resources("AWS::Events::Rule").items()}
+    enabled = {k: p for k, p in rules.items() if p.get("State", "ENABLED") == "ENABLED"}
     scheduled = {
         json.dumps(tg["Arn"])
-        for r in rules.values() if r["Properties"].get("ScheduleExpression")
-        for tg in r["Properties"].get("Targets", [])
+        for p in enabled.values() if p.get("ScheduleExpression")
+        for tg in p.get("Targets", [])
     }
+    topics = set(template.find_resources("AWS::SNS::Topic"))
     failure_rules = [
-        r for r in rules.values()
-        if "FAILED" in json.dumps(r["Properties"].get("EventPattern", {}))
+        p for p in enabled.values()
+        if {"FAILED", "STOPPED"} <= set(
+            p.get("EventPattern", {}).get("detail", {}).get("build-status", [])
+        )
+        and any(tg.get("Arn", {}).get("Ref") in topics for tg in p.get("Targets", []))
     ]
+    connection = _stage(template, "Source")["Actions"][0]["Configuration"].get("ConnectionArn")
     bucket_lid, bucket = _state_bucket(template, repo_name)
     for root in roots:
-        props = _drift_project(template, root)
+        props = _drift_project(template, root, repo_name)
         lid = next(
             k for k, r in projects(template).items()
             if r["Properties"].get("Name") == props.get("Name")
@@ -1238,15 +1261,42 @@ def assert_drift_checks(template: Template, roots: Sequence[TerraformRoot], repo
         assert rest == secrets_buildspec(root), (
             f"drift check {root.name} buildspec has more than its commands and secrets: {sorted(rest)}"
         )
+        assert set(spec.get("phases", {})) == {"build"}, (
+            f"drift check {root.name} buildspec has phases besides build"
+        )
+        assert set(spec["phases"]["build"]) == {"commands"}, (
+            f"drift check {root.name} build phase has extra settings"
+        )
+        variables = {
+            v["Name"]: (v.get("Type", "PLAINTEXT"), v.get("Value"))
+            for v in env.get("EnvironmentVariables", [])
+        }
+        want = {k: ("PLAINTEXT", v) for k, v in root.environment.items()}
+        want["TF_STATE_BUCKET"] = ("PLAINTEXT", {"Ref": bucket_lid})
+        assert variables == want, (
+            f"drift check {root.name} environment differs from the root's: {variables}"
+        )
+        source = props.get("Source", {})
+        assert source.get("Type") == "GITHUB" and source.get("Auth") == {
+            "Type": "CODECONNECTIONS", "Resource": connection
+        }, f"drift check {root.name} does not check out through the pipeline's connection"
+        if repo is not None:
+            assert source.get("Location") == f"https://github.com/{repo}.git", (
+                f"drift check {root.name} checks out {source.get('Location')}, not {repo}"
+            )
+        if branch is not None:
+            assert props.get("SourceVersion") == branch, (
+                f"drift check {root.name} checks out {props.get('SourceVersion')!r}, not {branch!r}"
+            )
         assert not any(
             v.get("Type") == "SECRETS_MANAGER" for v in env.get("EnvironmentVariables", [])
         ), f"drift check {root.name} passes secrets as project variables (CDK grants <arn>*)"
         assert json.dumps({"Fn::GetAtt": [lid, "Arn"]}) in scheduled, (
             f"drift check {root.name} is not started by a schedule"
         )
-        assert any(lid in json.dumps(r["Properties"].get("EventPattern", {})) for r in failure_rules), (
-            f"drift check {root.name} failures are not published"
-        )
+        assert any(
+            p["EventPattern"]["detail"].get("project-name") == [{"Ref": lid}] for p in failure_rules
+        ), f"drift check {root.name} failures are not published"
         role = props["ServiceRole"]["Fn::GetAtt"][0]
         state = _state_targets(bucket_lid, bucket["Properties"], root.state_key)
         lock = _state_targets(bucket_lid, bucket["Properties"], root.state_key + ".tflock")
@@ -1587,7 +1637,7 @@ def assert_standard_contract(
     for root in roots:
         assert_applies_plan(template, root, name, roots, drift=drift)
     if drift:
-        assert_drift_checks(template, roots, name)
+        assert_drift_checks(template, roots, name, repo, base_branch)
     # Secrets reach only the Plan, Deploy and drift check of a root that declares them.
     holders = {f"{kind}-{r.name}" for r in roots if r.secrets for kind in ("Plan", "Deploy")}
     holders |= {f"{name}-drift-{r.name}" for r in roots if r.secrets}

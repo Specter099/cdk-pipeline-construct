@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 
 from aws_cdk import aws_codebuild as codebuild
 from aws_cdk.assertions import Template
@@ -117,10 +117,28 @@ def projects(template: Template) -> dict:
     return template.find_resources("AWS::CodeBuild::Project")
 
 
+def _read_buildspec(props: dict) -> dict | None:
+    """A project's inline buildspec as a dict, or None if it has none we can read. A buildspec
+    holding CDK tokens is an Fn::Join; its non-literal parts read as TOKEN."""
+    spec = props.get("Source", {}).get("BuildSpec")
+    try:
+        if isinstance(spec, dict) and "Fn::Join" in spec:
+            sep, parts = spec["Fn::Join"]
+            spec = sep.join(p if isinstance(p, str) else "TOKEN" for p in parts)
+        if not isinstance(spec, str):
+            return None
+        parsed = json.loads(spec)
+    except (ValueError, TypeError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
 def _step_buildspec(template: Template, step_name: str) -> dict:
     for res in projects(template).values():
         if str(res["Properties"].get("Description", "")).endswith(f"/{step_name}"):
-            return json.loads(res["Properties"]["Source"]["BuildSpec"])
+            spec = _read_buildspec(res["Properties"])
+            assert spec is not None, f"cannot read the buildspec of {step_name!r}"
+            return spec
     raise AssertionError(f"no CodeBuild project for pipeline step {step_name!r}")
 
 
@@ -166,37 +184,61 @@ def _project_step_name(props: dict) -> str:
     return str(props.get("Name", ""))
 
 
-def _construct_generated(props: dict) -> bool:
-    desc = str(props.get("Description", ""))
-    return desc.startswith(("Pipeline step ", "PR check "))
+def _construct_generated(props: dict, pr_prefix: str | None = None) -> bool:
+    """CDK Pipelines' step projects (by description) and the PR checks (by their
+    ``{repo}-pr-`` name, which a reworded description cannot hide)."""
+    if str(props.get("Description", "")).startswith("Pipeline step "):
+        return True
+    if pr_prefix is not None:
+        return str(props.get("Name", "")).startswith(f"{pr_prefix}-pr-")
+    return str(props.get("Description", "")).startswith("PR check ")
 
 
 def _buildspec_commands(props: dict) -> list[str] | None:
-    """The build-phase commands of a project's inline buildspec, or None if it has none we can
-    read. A buildspec holding CDK tokens is an Fn::Join; its non-literal parts read as TOKEN."""
-    spec = props.get("Source", {}).get("BuildSpec")
-    if isinstance(spec, dict) and "Fn::Join" in spec:
-        sep, parts = spec["Fn::Join"]
-        spec = sep.join(p if isinstance(p, str) else "TOKEN" for p in parts)
-    if not isinstance(spec, str):
-        return None
+    """The build-phase commands of a project's inline buildspec, or None."""
+    spec = _read_buildspec(props)
     try:
-        cmds = json.loads(spec)["phases"]["build"]["commands"]
-    except (ValueError, KeyError, TypeError):
+        cmds = spec["phases"]["build"]["commands"]  # type: ignore[index]
+    except (KeyError, TypeError):
         return None
     return cmds if isinstance(cmds, list) else None
 
 
-def _ec2_preludes() -> list[list[str]]:
+def _ec2_preludes(runtimes: Iterable[Runtime] = tuple(Runtime)) -> list[list[str]]:
     return [
         prelude(rt, v, tf, ec2=True)
-        for rt in Runtime
+        for rt in runtimes
         for v in NODE_LINUX_X64_SHA256
         for tf in TERRAFORM_LINUX_SHA256
     ]
 
 
-def assert_lambda_compute(template: Template, ec2_steps: Iterable[str] = ()) -> None:
+#: Toolchain set-up that must only appear in a prelude, never after it.
+_TOOLCHAIN_MARKERS = (" -m venv ", "PYENV_VERSION", "/tmp/node.tgz", "/tmp/terraform.zip")
+
+
+def _assert_ec2_toolchain(step: str, cmds: list[str], runtime: Runtime | None) -> None:
+    """Known runtime: exactly that runtime's EC2 prelude first. Unknown: the longest matching
+    prelude first, and no toolchain set-up after it (so half of a two-runtime prelude cannot
+    pass as a one-runtime one with the rest done by hand)."""
+    if runtime is not None:
+        assert any(cmds[: len(p)] == p for p in _ec2_preludes([runtime])), (
+            f"{step} on EC2 does not start with the pinned {runtime.name} toolchain set-up: {cmds[:3]}"
+        )
+        return
+    matches = [p for p in _ec2_preludes() if cmds[: len(p)] == p]
+    assert matches, f"{step} on EC2 does not start with the pinned toolchain set-up: {cmds[:3]}"
+    rest = cmds[max(len(p) for p in matches):]
+    stray = [c for c in rest if any(m in c for m in _TOOLCHAIN_MARKERS)]
+    assert not stray, f"{step} on EC2 sets up a toolchain outside the pinned prelude: {stray}"
+
+
+def assert_lambda_compute(
+    template: Template,
+    ec2_steps: Iterable[str] = (),
+    runtimes: Mapping[str, Runtime] | None = None,
+    pr_prefix: str | None = None,
+) -> None:
     """Every CodeBuild project, including CDK Pipelines' own, runs on Lambda compute, except the
     steps named in ``ec2_steps`` (pipeline step names such as ``Gate-tf-plan`` or PR-check
     project names such as ``my-repo-pr-tf-plan``), which must run on EC2: the pinned standard
@@ -229,12 +271,10 @@ def assert_lambda_compute(template: Template, ec2_steps: Iterable[str] = ()) -> 
             assert env["ComputeType"].startswith("BUILD_GENERAL1_"), f"{step} on EC2 has a Lambda size"
             # A project the construct generated must start with one of its own EC2 toolchain
             # set-ups (pinned Node; Python 3.12 selected through pyenv): never the image's own.
-            if _construct_generated(props):
+            if _construct_generated(props, pr_prefix):
                 cmds = _buildspec_commands(props)
                 assert cmds is not None, f"{step}: cannot read its buildspec commands"
-                assert any(cmds[: len(p)] == p for p in _ec2_preludes()), (
-                    f"{step} on EC2 does not start with the pinned toolchain set-up: {cmds[:3]}"
-                )
+                _assert_ec2_toolchain(step, cmds, (runtimes or {}).get(step))
             continue
         assert env["Type"] == "LINUX_LAMBDA_CONTAINER", (
             f"{logical_id} ({step}) is not on Lambda compute and is not declared in ec2_steps"
@@ -687,21 +727,34 @@ def assert_standard_contract(
     name = repo.partition("/")[2]
     assert name, f"repo must be 'owner/name', got {repo!r}"
     expected_ec2 = set(ec2_steps)
+    runtimes: dict[str, Runtime] = {}
     assembly_on_ec2 = assembly is not None and assembly.ec2 is not None
+    if assembly is not None:
+        runtimes[assembly.name] = Runtime.PYTHON_NODE
     if assembly_on_ec2:
         expected_ec2.add(assembly.name)
     for g in gates:
+        runtimes[f"Gate-{g.name}"] = g.runtime
+        # a uses_assembly gate's PR check synthesizes first, on Python+Node
+        runtimes[f"{name}-pr-{g.name}"] = Runtime.PYTHON_NODE if g.uses_assembly else g.runtime
         if g.ec2 is not None:
             expected_ec2.add(f"Gate-{g.name}")
         pr_on_ec2 = g.ec2 is not None or (g.uses_assembly and assembly_on_ec2)
         if pr_on_ec2 and pull_request_checks and g.runs_on_pull_requests:
             expected_ec2.add(f"{name}-pr-{g.name}")
+    if deploy_step is not None:
+        builds_from_assembly = assembly is not None or bool(_assembly_actions(template))
+        # the construct-only deploy runs only the pinned Node; a legacy deploy its own runtime
+        runtimes[f"Deploy-{deploy_step.name}"] = (
+            Runtime.NODE if builds_from_assembly else deploy_step.runtime
+        )
+        runtimes[f"PreDeploy-{deploy_step.name}"] = deploy_step.runtime
     if deploy_step is not None and deploy_step.ec2 is not None:
         expected_ec2.add(f"Deploy-{deploy_step.name}")
         pre = f"PreDeploy-{deploy_step.name}"
         if any(_project_step_name(r["Properties"]) == pre for r in projects(template).values()):
             expected_ec2.add(pre)
-    assert_lambda_compute(template, expected_ec2)
+    assert_lambda_compute(template, expected_ec2, runtimes, pr_prefix=name)
     assert_ci_env_on_repo_command_projects(template)
     assert_stage_order(template, deploy_stage)
     assert_gates_present(template, gates)

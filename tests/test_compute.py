@@ -357,3 +357,73 @@ def test_memory_is_not_validated_against_lambda_sizes_on_ec2():
 def test_a_non_string_size_is_a_clear_error():
     with pytest.raises(ValueError, match="EC2 size"):
         Ec2(size=["small"])
+
+
+# --- second-round review: two-runtime preludes, PR-check identity, token buildspecs ------------
+
+PN = Gate("pn", ["cdk synth"], runtime=Runtime.PYTHON_NODE, ec2=Ec2("small", 30))
+PN_GATES = [*GATES, PN]
+
+
+def _drop(pred):
+    return lambda cmds: [cmds.remove(x) for x in list(cmds) if pred(x)]
+
+
+@pytest.mark.parametrize(
+    "edit",
+    [
+        _drop(lambda x: "venv" in x or "PIP_" in x or "PYTHON" in x or "jsii" in x or "pip" in x.lower()),
+        _drop(lambda x: "node" in x),
+    ],
+    ids=["python-half-removed", "node-half-removed"],
+)
+@pytest.mark.parametrize("step", ["Gate-pn", "demo-pr-pn"])
+def test_a_two_runtime_step_missing_half_its_toolchain_fails_the_contract(edit, step):
+    t = _edit_cmds(build(gates=PN_GATES), step, edit)
+    with pytest.raises(AssertionError, match="toolchain"):
+        c.assert_standard_contract(t, repo=REPO, gates=PN_GATES, deploy_stage="Prod", node_gates=[*NODE_GATES, "pn"])
+
+
+def test_without_known_runtimes_stray_toolchain_after_the_prelude_fails():
+    t = _edit_cmds(build(gates=PN_GATES), "Gate-pn",
+                   lambda cmds: cmds.insert(len(cmds) - 1, 'export PYENV_VERSION="$PYTHON_314_VERSION"'))
+    with pytest.raises(AssertionError, match="outside the pinned prelude"):
+        c.assert_lambda_compute(t, ["Gate-pn", "demo-pr-pn"])
+
+
+def test_a_pr_check_with_its_description_removed_is_still_held_to_the_toolchain():
+    doc = copy.deepcopy(build(gates=[*GATES, TF]).to_json())
+    for r in doc["Resources"].values():
+        if r["Type"] == "AWS::CodeBuild::Project" and r["Properties"].get("Name") == "demo-pr-tf-plan":
+            r["Properties"].pop("Description")
+            spec = json.loads(r["Properties"]["Source"]["BuildSpec"])
+            spec["phases"]["build"]["commands"] = ["python3 -m venv /tmp/venv", "terraform plan"]
+            r["Properties"]["Source"]["BuildSpec"] = json.dumps(spec)
+    with pytest.raises(AssertionError, match="toolchain"):
+        c.assert_lambda_compute(Template.from_json(doc), ["Gate-tf-plan", "demo-pr-tf-plan"], pr_prefix="demo")
+
+
+def test_a_consumer_project_described_as_a_pr_check_is_not_held_when_the_prefix_is_known():
+    doc = copy.deepcopy(build().to_json())
+    doc["Resources"]["Mine"] = {"Type": "AWS::CodeBuild::Project", "Properties": {
+        "Name": "mine", "Description": "PR check of my own", "ServiceRole": "x",
+        "Source": {"Type": "GITHUB", "BuildSpec": "buildspec.yml"}, "Artifacts": {"Type": "NO_ARTIFACTS"},
+        "Environment": {"Type": "LINUX_CONTAINER", "Image": EC2_IMAGE.image_id,
+                        "ComputeType": "BUILD_GENERAL1_SMALL"}, "TimeoutInMinutes": 30}}
+    c.assert_lambda_compute(Template.from_json(doc), ["mine"], pr_prefix="demo")
+
+
+def test_assert_builds_once_reads_token_buildspecs():
+    import aws_cdk as cdk
+
+    tok = cdk.Fn.import_value("X")
+    deploy = DeployStep("app", [f"echo {tok}"], stacks=["AppStack"])
+    scan = Gate("scan", [f"ls cdk.out && echo {tok}"], uses_assembly=True)
+    t = asm_build(deploy_step=deploy, gates=[*GATES, scan])
+    c.assert_standard_contract(t, repo=REPO, gates=[*GATES, scan], node_gates=NODE_GATES,
+                               deploy_step=deploy)
+
+
+@pytest.mark.parametrize("spec", [{"Fn::Join": ["", "notalist", "extra"]}, {"Fn::Join": "x"}, 42, "not json", "[1]"])
+def test_unreadable_buildspecs_read_as_none(spec):
+    assert c._read_buildspec({"Source": {"BuildSpec": spec}}) is None

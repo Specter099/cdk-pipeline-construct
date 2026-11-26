@@ -35,6 +35,9 @@ from aws_cdk import aws_iam as iam
 
 from .compute import Ec2
 from .gate import BASE_ENV, validate_name
+from .presets import (
+    checkov_commands,  # the same hardened Checkov run as the static gate
+)
 
 #: The saved plan and its renderings, written next to the root's configuration.
 PLAN_FILE = "tfplan"
@@ -43,6 +46,12 @@ PLAN_TEXT = "tfplan.txt"
 
 #: Checkov for the plan checks; the same pin as the static gate.
 CHECKOV = "checkov==3.4.4"
+
+#: Environment variables a root may not set: each redirects init, plan, apply or the state.
+_RESERVED_ENV = frozenset(
+    {"TF_WORKSPACE", "TF_DATA_DIR", "TF_STATE_BUCKET", "TF_CLI_CONFIG_FILE", "TF_PLUGIN_CACHE_DIR",
+     "TF_IN_AUTOMATION", "TF_INPUT", "TF_LOG_PATH", "TF_REGISTRY_DISCOVERY_RETRY"}
+)
 
 
 def _root_path(path: str) -> str:
@@ -61,10 +70,21 @@ def _root_path(path: str) -> str:
 class TerraformRoot:
     """One Terraform root module deployed by the pipeline.
 
-    The root must declare a partial S3 backend (``terraform { backend "s3" {} }``); the construct
-    supplies bucket, key, region, ``use_lockfile`` and ``encrypt`` at ``init``. It must commit
-    ``.terraform.lock.hcl``. ``plan_policy_statements`` are what refresh and plan need (read
-    access); ``apply_policy_statements`` what apply needs. State access is added by the construct.
+    The root must declare a partial S3 backend::
+
+        terraform {
+          backend "s3" {}
+        }
+
+    The construct supplies bucket, key, region, ``use_lockfile`` and ``encrypt`` at ``init``, and
+    both Plan and Deploy stop if ``init`` did not end up on that backend (a root without the
+    block would otherwise use local state and re-create everything on every run). It must commit
+    ``.terraform.lock.hcl`` (an empty file if it has no providers). ``plan_policy_statements`` are
+    what refresh and plan need (read access); ``apply_policy_statements`` what apply needs. State
+    access is added by the construct.
+
+    The state key is ``<name>/terraform.tfstate``: renaming a root starts it on empty state, so
+    the next plan would create everything again.
     """
 
     path: str = "."
@@ -87,6 +107,15 @@ class TerraformRoot:
             object.__setattr__(self, field, tuple(value))
         object.__setattr__(self, "var_files", tuple(_root_path(v) for v in self.var_files))
         object.__setattr__(self, "env", dict(self.env))
+        steering = sorted(
+            k for k in self.env
+            if k.startswith("TF_CLI_ARGS") or k in _RESERVED_ENV
+        )
+        if steering:
+            raise ValueError(
+                f"terraform root {self.name!r}: env may not set {steering}: they change what "
+                "init, plan or apply do, or where state goes"
+            )
         for field in ("plan_ec2", "apply_ec2"):
             if not isinstance(getattr(self, field), Ec2):
                 raise TypeError(f"terraform root {self.name!r}: {field} must be an Ec2(...)")
@@ -116,16 +145,34 @@ def init_command(root: TerraformRoot) -> str:
     )
 
 
+def backend_check(root: TerraformRoot) -> str:
+    """Fail unless init configured the S3 backend on the pipeline's bucket and this root's key."""
+    script = (
+        "import json, os, sys; b = json.load(open('.terraform/terraform.tfstate')).get('backend') or {}; "
+        "c = b.get('config') or {}; "
+        "ok = b.get('type') == 's3' and c.get('bucket') == os.environ['TF_STATE_BUCKET'] "
+        f"and c.get('key') == {root.state_key!r} and not c.get('workspace_key_prefix'); "
+        "ok or print('init did not configure the S3 backend on the pipeline state bucket: '"
+        " + 'declare terraform { backend \"s3\" {} } in the root'); sys.exit(0 if ok else 1)"
+    )
+    return f"python3 -I -c {shlex.quote(script)}"
+
+
 def plan_commands(root: TerraformRoot) -> list[str]:
     var_files = " ".join(f"-var-file={shlex.quote(v)}" for v in root.var_files)
-    lock = shlex.quote(f"{root.path}: commit .terraform.lock.hcl")
+    lock = shlex.quote(
+        f"{root.path}: commit .terraform.lock.hcl (an empty file if the root has no providers)"
+    )
     return [
         f"cd {shlex.quote(root.path)}",
         f"test -f .terraform.lock.hcl || {{ echo {lock}; exit 1; }}",
         init_command(root),
+        backend_check(root),
         f"terraform plan -input=false -no-color -lock-timeout=5m {var_files} -out={PLAN_FILE}".replace("  ", " "),
         f"terraform show -json {PLAN_FILE} > {PLAN_JSON}",
-        f"terraform show -no-color {PLAN_FILE} | tee {PLAN_TEXT}",
+        # Not `| tee`: a pipe would hide a failing show.
+        f"terraform show -no-color {PLAN_FILE} > {PLAN_TEXT}",
+        f"cat {PLAN_TEXT}",
         # Providers are re-fetched at apply against the lock file; keep the artifact small.
         "rm -rf .terraform",
     ]
@@ -133,11 +180,23 @@ def plan_commands(root: TerraformRoot) -> list[str]:
 
 def apply_commands(root: TerraformRoot) -> list[str]:
     """Exactly: into the root, re-initialise, apply the saved plan."""
+    stale = shlex.quote(
+        "apply failed. 'Saved plan is stale' means another run changed the state since this plan: "
+        "release again to plan afresh"
+    )
     return [
         f"cd {shlex.quote(root.path)}",
         f"test -f {PLAN_FILE} || {{ echo 'no saved plan in the artifact'; exit 1; }}",
         init_command(root),
-        f"terraform apply -input=false -no-color -lock-timeout=5m {PLAN_FILE}",
+        backend_check(root),
+        (
+            f"rc=0; terraform apply -input=false -no-color -lock-timeout=5m {PLAN_FILE} || rc=$?; "
+            # A failed state write leaves the real state in errored.tfstate, on this machine only.
+            'if [ "$rc" -ne 0 ] && [ -f errored.tfstate ]; then '
+            "terraform state push errored.tfstate && echo 'pushed errored.tfstate to the backend'; fi; "
+            f'if [ "$rc" -ne 0 ]; then echo {stale}; fi; '
+            '[ "$rc" -eq 0 ]'
+        ),
     ]
 
 
@@ -146,15 +205,20 @@ _DESTROY_CHECK = r"""
 import json, sys
 plan = json.load(open(sys.argv[1]))
 allow = sys.argv[2] == "allow"
-counts, destroys = {}, []
+if "format_version" not in plan or not isinstance(plan.get("resource_changes", []), list):
+    print("not a Terraform plan JSON")
+    sys.exit(1)
+counts, destroys, forgets = {}, [], []
 for rc in plan.get("resource_changes", []):
     actions = rc.get("change", {}).get("actions", [])
     key = "replace" if set(actions) >= {"delete", "create"} else "+".join(actions)
     counts[key] = counts.get(key, 0) + 1
     if "delete" in actions:
         destroys.append(f"{key}: {rc.get('address')}")
+    if "forget" in actions:
+        forgets.append(f"FORGET (removed from state, left running): {rc.get('address')}")
 print("plan summary:", ", ".join(f"{k}={v}" for k, v in sorted(counts.items())) or "no changes")
-for d in destroys:
+for d in destroys + forgets:
     print("  " + d)
 if destroys and not allow:
     print(f"{len(destroys)} resource(s) would be deleted or replaced; set allow_destroy=True to permit")
@@ -166,8 +230,11 @@ def plan_check_commands(root: TerraformRoot, plan_dir: str) -> list[str]:
     plan_json = shlex.quote(posixpath.join(plan_dir, PLAN_JSON))
     allow = "allow" if root.allow_destroy else "deny"
     return [
-        f"python3 -I -c {shlex.quote(_DESTROY_CHECK)} {plan_json} {allow}",
-        f"checkov -f {plan_json} --framework terraform_plan --quiet --compact",
+        # First: Checkov exits 0 on a missing or unreadable file.
+        f"python3 -I -c {shlex.quote('exec(' + repr(_DESTROY_CHECK) + ')')} {plan_json} {allow}",
+        *checkov_commands(
+            plan_dir, shlex.quote(plan_dir), f"-f {plan_json} --framework terraform_plan"
+        ),
     ]
 
 
@@ -175,11 +242,10 @@ def state_policy(bucket_arn: str, root: TerraformRoot, *, write_state: bool) -> 
     """Plan: read state, hold the lock. Apply: also write state. Nothing else in the bucket."""
     key = f"{bucket_arn}/{root.state_key}"
     statements = [
-        iam.PolicyStatement(
-            actions=["s3:ListBucket"],
-            resources=[bucket_arn],
-            conditions={"StringLike": {"s3:prefix": [f"{root.name}/*"]}},
-        ),
+        # No prefix condition: Terraform lists with prefix=env:/, and a HeadObject on a missing
+        # state key needs ListBucket to get 404 (first run) instead of 403. The bucket holds only
+        # this pipeline's state.
+        iam.PolicyStatement(actions=["s3:ListBucket"], resources=[bucket_arn]),
         iam.PolicyStatement(actions=["s3:GetObject"], resources=[key]),
         iam.PolicyStatement(
             actions=["s3:GetObject", "s3:PutObject", "s3:DeleteObject"], resources=[f"{key}.tflock"]

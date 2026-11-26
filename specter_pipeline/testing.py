@@ -17,6 +17,7 @@ pipeline; the comments say which.
 
 from __future__ import annotations
 
+import fnmatch
 import json
 import re
 from collections.abc import Iterable, Mapping, Sequence
@@ -47,7 +48,8 @@ from .runtimes import (
     python_prelude,
     terraform_prelude,
 )
-from .terraform import TerraformRoot, apply_commands, plan_commands
+from .terraform import CHECKOV as TF_CHECKOV
+from .terraform import TerraformRoot, apply_commands, plan_check_commands, plan_commands
 
 #: The exact actions a PR-check role may hold (measured on a synthesized pipeline): its own
 #: logs, the report permissions CodeBuild adds for the project's own report group, and the
@@ -543,73 +545,164 @@ def _role_of(template: Template, step: str) -> str:
     return _project_of(template, step)["ServiceRole"]["Fn::GetAtt"][0]
 
 
-def _state_resource(resource, root: TerraformRoot, suffix: str) -> bool:
-    text = json.dumps(resource)
-    return "TerraformState" in text and text.rstrip('"]}').endswith(f"{root.name}/terraform.tfstate{suffix}")
+def _resource_text(resource) -> str:
+    """An IAM resource as text: intrinsics become <LogicalId> / <LogicalId.Attr> placeholders."""
+    if isinstance(resource, str):
+        return resource
+    if isinstance(resource, dict):
+        if "Fn::Join" in resource:
+            sep, parts = resource["Fn::Join"]
+            return sep.join(_resource_text(p) for p in parts)
+        if "Fn::GetAtt" in resource:
+            return "<" + ".".join(resource["Fn::GetAtt"]) + ">"
+        if "Ref" in resource:
+            return "<" + resource["Ref"] + ">"
+    return json.dumps(resource)
 
 
-def assert_applies_plan(template: Template, root: TerraformRoot) -> None:
+def _grants(template: Template, role: str, action: str, target: str) -> bool:
+    """Whether any Allow statement on ``role`` covers ``action`` on ``target``, wildcards and all
+    (s3:* or s3:Put* on bucket/* or * covers s3:PutObject on bucket/key)."""
+    for _, stmt in _role_policy_statements(template, {role}):
+        if stmt.get("Effect", "Allow") != "Allow":
+            continue
+        if not any(fnmatch.fnmatchcase(action, a) for a in _as_list(stmt["Action"])):
+            continue
+        if any(fnmatch.fnmatchcase(target, _resource_text(r)) for r in _as_list(stmt["Resource"])):
+            return True
+    return False
+
+
+def _state_bucket(template: Template, name: str | None) -> tuple[str, dict]:
+    """The state bucket: prefix ``{name}-tfstate``, or with no name the one ``*-tfstate`` bucket."""
+    found = [
+        (lid, r)
+        for lid, r in template.find_resources("AWS::S3::Bucket").items()
+        if (
+            r["Properties"].get("BucketNamePrefix") == f"{name}-tfstate"
+            if name
+            else str(r["Properties"].get("BucketNamePrefix", "")).endswith("-tfstate")
+        )
+    ]
+    assert len(found) == 1, f"expected one Terraform state bucket ({name or '*'}-tfstate), found {len(found)}"
+    return found[0]
+
+
+def assert_state_bucket(template: Template, name: str) -> None:
+    """The state bucket: house name in the account-regional namespace, versioned, encrypted,
+    retained, private, state never expired, and a bucket policy that only denies."""
+    lid, res = _state_bucket(template, name)
+    props = res["Properties"]
+    assert res.get("DeletionPolicy") == "Retain", "state bucket is not retained"
+    assert props.get("BucketNamespace") == "account-regional", "state bucket is not account-regional"
+    assert props.get("VersioningConfiguration", {}).get("Status") == "Enabled", "state bucket is not versioned"
+    assert props.get("BucketEncryption"), "state bucket is not encrypted"
+    block = props.get("PublicAccessBlockConfiguration", {})
+    for flag in ("BlockPublicAcls", "BlockPublicPolicy", "IgnorePublicAcls", "RestrictPublicBuckets"):
+        assert block.get(flag) in (True, "true"), f"state bucket does not set {flag}"
+    for rule in props.get("LifecycleConfiguration", {}).get("Rules", []):
+        assert "ExpirationInDays" not in rule and "ExpirationDate" not in rule, (
+            "a lifecycle rule expires current state"
+        )
+    for pol in template.find_resources("AWS::S3::BucketPolicy").values():
+        if pol["Properties"].get("Bucket") == {"Ref": lid}:
+            for st in _as_list(pol["Properties"]["PolicyDocument"]["Statement"]):
+                assert st.get("Effect") == "Deny", f"state bucket policy allows something: {st}"
+
+
+def _env_of(template: Template, step: str) -> dict:
+    env = _project_of(template, step)["Environment"].get("EnvironmentVariables", [])
+    return {v["Name"]: (v.get("Type", "PLAINTEXT"), v.get("Value")) for v in env}
+
+
+def assert_applies_plan(template: Template, root: TerraformRoot, repo_name: str | None = None) -> None:
     """Plan once, check that plan, apply exactly that plan.
 
     ``Plan-<name>`` (EC2) produces the plan artifact. ``Gate-tf-plan-check-<name>`` and the
-    construct-only ``Deploy-<name>`` read that artifact and nothing else, after the plan. The
-    deploy runs on EC2 exactly the pinned Terraform set-up and ``apply_commands``. Only the deploy
-    role may write the state file; the plan role may read it and hold its lock; the plan-check role
-    has no access to the state bucket at all."""
+    construct-only ``Deploy-<name>`` read that artifact and nothing else, after the plan. Plan,
+    plan check and deploy run exactly the construct's command lists; Plan and Deploy see only the
+    root's env plus the state bucket. Only the deploy role may write or delete the state; the plan
+    role may read it and hold its lock; the plan-check role cannot reach the state bucket at all.
+
+    Note the plan artifact itself (``tfplan``, ``tfplan.json``) carries the prior state and any
+    sensitive values in clear text, and the pipeline's artifact bucket is readable by every step.
+    """
     gates = {a["Name"]: a for a in _stage(template, "Gates")["Actions"]}
     plan_name, check_name, deploy_name = (
         f"Plan-{root.name}", f"Gate-tf-plan-check-{root.name}", f"Deploy-{root.name}"
     )
     assert plan_name in gates, f"no {plan_name} action in Gates"
-    (out,) = gates[plan_name].get("OutputArtifacts", [{}]) or [{}]
-    artifact = out.get("Name")
-    assert artifact, f"{plan_name} produces no artifact"
+    outs = gates[plan_name].get("OutputArtifacts") or []
+    assert len(outs) == 1, f"{plan_name} produces no artifact"
+    artifact = outs[0]["Name"]
     assert check_name in gates, f"no {check_name} action in Gates"
     check = gates[check_name]
     assert [i["Name"] for i in check.get("InputArtifacts", [])] == [artifact], (
         f"{check_name} does not read exactly the plan artifact"
     )
     assert check["RunOrder"] > gates[plan_name]["RunOrder"], f"{check_name} does not wait for the plan"
-    assert any("plan_check" not in c and "tfplan.json" in c for c in step_commands(template, check_name)), (
-        f"{check_name} does not read the plan JSON"
-    )
 
     deploys = {a["Name"]: a for a in _stage(template, "Deploy")["Actions"]}
     assert deploy_name in deploys, f"no {deploy_name} action in Deploy"
     reads = [i["Name"] for i in deploys[deploy_name].get("InputArtifacts", [])]
     assert reads == [artifact], f"{deploy_name} reads {reads}: it must read the plan artifact only"
 
-    for step, ec2 in ((plan_name, root.plan_ec2), (deploy_name, root.apply_ec2)):
+    for step in (plan_name, deploy_name):
         env = _project_of(template, step)["Environment"]
         assert env["Type"] == "LINUX_CONTAINER" and env["Image"] == EC2_IMAGE.image_id, (
             f"{step} is not on EC2: Terraform must not be killed by Lambda's 15-minute limit"
         )
-    spec = json.loads(_project_of(template, deploy_name)["Source"]["BuildSpec"])
-    assert set(spec) <= {"version", "phases"} and set(spec["phases"]) == {"build"}, (
-        f"{deploy_name} buildspec has more than the build commands"
-    )
-    assert set(spec["phases"]["build"]) == {"commands"}, f"{deploy_name} build phase has extra settings"
-    cmds = spec["phases"]["build"]["commands"]
-    expected = [
-        [*python_prelude(ec2=True), *terraform_prelude(v), *apply_commands(root)]
-        for v in TERRAFORM_LINUX_SHA256
-    ]
-    assert cmds in expected, f"{deploy_name} runs more or other than applying the saved plan: {cmds}"
-    assert step_commands(template, plan_name)[-len(plan_commands(root)):] == plan_commands(root), (
-        f"{plan_name} does not end with the construct's plan commands"
-    )
 
+    # Exact command lists: nothing added, removed or reordered.
+    def exact(step: str, bodies: list[list[str]], artifacts: dict | None = None) -> None:
+        spec = _step_buildspec(template, step)
+        rest = {k: v for k, v in spec.items() if k not in ("version", "phases")}
+        assert rest == ({"artifacts": artifacts} if artifacts else {}), (
+            f"{step} buildspec has more than the build commands: {sorted(rest)}"
+        )
+        assert set(spec["phases"]) == {"build"}, f"{step} buildspec has phases besides build"
+        assert set(spec["phases"]["build"]) == {"commands"}, f"{step} build phase has extra settings"
+        assert spec["phases"]["build"]["commands"] in bodies, (
+            f"{step} runs more or other than the construct's commands"
+        )
+
+    tf_preludes = [
+        [*python_prelude(ec2=True), *terraform_prelude(v)] for v in TERRAFORM_LINUX_SHA256
+    ]
+    # The plan's output is the whole checkout (relative module paths) plus the saved plan.
+    exact(plan_name, [[*p, *plan_commands(root)] for p in tf_preludes],
+          artifacts={"base-directory": ".", "files": "**/*"})
+    exact(deploy_name, [[*p, *apply_commands(root)] for p in tf_preludes])
+    exact(check_name, [[*python_prelude(), f"pip install {TF_CHECKOV}",
+                        *plan_check_commands(root, root.path)]])
+
+    # Environment: the root's env plus the state bucket, nothing else.
+    bucket_lid, _ = _state_bucket(template, repo_name)
+    for step in (plan_name, deploy_name):
+        env = _env_of(template, step)
+        expected = {k: ("PLAINTEXT", v) for k, v in root.environment.items()}
+        bucket = env.pop("TF_STATE_BUCKET", None)
+        assert bucket is not None, f"{step} has no TF_STATE_BUCKET"
+        assert bucket[1] == {"Ref": bucket_lid}, f"{step} points TF_STATE_BUCKET elsewhere"
+        assert env == expected, f"{step} environment differs from the root's: {env}"
+
+    # IAM, with wildcards understood.
+    arn = f"<{bucket_lid}.Arn>"
+    state = f"{arn}/{root.state_key}"
     roles = {step: _role_of(template, step) for step in (plan_name, check_name, deploy_name)}
-    for step, role in roles.items():
-        for _, stmt in _role_policy_statements(template, {role}):
-            actions = set(_as_list(stmt["Action"]))
-            for resource in _as_list(stmt["Resource"]):
-                if step == check_name:
-                    assert "TerraformState" not in json.dumps(resource), (
-                        f"{check_name} can reach the state bucket"
-                    )
-                if _state_resource(resource, root, "") and "s3:PutObject" in actions:
-                    assert step == deploy_name, f"{step} can write the Terraform state"
+    assert _grants(template, roles[deploy_name], "s3:PutObject", state), (
+        f"{deploy_name} cannot write the state"
+    )
+    for step in (plan_name, check_name):
+        for action in ("s3:PutObject", "s3:DeleteObject", "s3:DeleteObjectVersion"):
+            assert not _grants(template, roles[step], action, state), (
+                f"{step} can write the Terraform state ({action})"
+            )
+    for action in ("s3:GetObject", "s3:ListBucket"):
+        for target in (arn, state):
+            assert not _grants(template, roles[check_name], action, target), (
+                f"{check_name} can reach the state bucket"
+            )
 
 
 def assert_no_pipeline_triggers(template: Template) -> None:
@@ -661,7 +754,7 @@ def assert_artifact_bucket(template: Template, name: str) -> None:
         assert b.get("BucketNamespace") == "account-regional", (
             f"{b['BucketNamePrefix']} is not in the account-regional namespace"
         )
-        assert b["PublicAccessBlockConfiguration"]["BlockPublicAcls"] in (True, "true"), (
+        assert b.get("PublicAccessBlockConfiguration", {}).get("BlockPublicAcls") in (True, "true"), (
             f"{b['BucketNamePrefix']} allows public access"
         )
     expected = artifact_bucket_purpose(name)
@@ -905,7 +998,8 @@ def assert_standard_contract(
         )
     assert_gates_have_node(gates, node_gates)
     if terraform is not None:
-        assert_applies_plan(template, terraform)
+        assert_applies_plan(template, terraform, name)
+        assert_state_bucket(template, name)
         builds_once = False if builds_once is None else builds_once
     if builds_once is None:
         builds_once = bool(_assembly_actions(template)) or any(g.uses_assembly for g in gates)
@@ -933,6 +1027,7 @@ __all__ = [
     "assert_source",
     "assert_stage_order",
     "assert_standard_contract",
+    "assert_state_bucket",
     "pipeline",
     "pr_projects",
     "projects",

@@ -264,7 +264,9 @@ class StandardPipeline(Construct):
                 versioned=True,
                 # State is never expired; old versions are kept 90 days for recovery.
                 lifecycle_rules=[
-                    s3.LifecycleRule(noncurrent_version_expiration=cdk.Duration.days(90))
+                    s3.LifecycleRule(noncurrent_version_expiration=cdk.Duration.days(90)),
+                    # Each lock cycle leaves a delete marker on <key>.tflock.
+                    s3.LifecycleRule(expired_object_delete_marker=True),
                 ],
                 removal_policy=cdk.RemovalPolicy.RETAIN,
             )

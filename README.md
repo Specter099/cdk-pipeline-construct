@@ -253,7 +253,9 @@ Deploy: Approve -> Deploy-main (EC2: terraform apply tfplan) -> post-deploy step
   so a long apply is not killed half-way.
 * `TerraformRoot.env` and `secrets` may not set variables that redirect Terraform, the AWS SDK or
   CodeBuild: `TF_CLI_ARGS*`, `TF_WORKSPACE`, `TF_DATA_DIR`, `TF_CLI_CONFIG_FILE` and similar,
-  `TF_LOG*` (debug logs can print secrets), `AWS_*`, `CODEBUILD_*`, `PATH`, `HOME` and `CI`.
+  `TF_LOG*` (debug logs can print secrets), `AWS_*` other than the region and retry settings
+  (`AWS_REGION`, `AWS_DEFAULT_REGION`, `AWS_MAX_ATTEMPTS`, `AWS_RETRY_MODE`), `CODEBUILD_*`,
+  `PATH`, `HOME` and `CI`.
 * `assert_standard_contract(..., terraform=ROOT)` checks all of this, via `assert_applies_plan` and
   `assert_state_bucket`: exact command lists, environment variables, artifact wiring, and IAM with
   wildcards taken into account.
@@ -306,6 +308,10 @@ StandardPipeline(..., gates=terraform_gates(roots=["network", "github"]), terraf
 * Every root plans and is checked in the Gates stage. Then one approval covers all of them, and the
   applies run one at a time, in the order given. Each root has its own state key and lock in the
   repo's one state bucket, and its own Plan and Deploy roles.
+* **Scope each root's S3 access.** A root's state and lock may be read only by its own Plan,
+  Deploy and drift check. So with several roots, a broad grant such as `s3:Get*` on `*` in one
+  root's `plan_policy_statements` fails the contract: it could read the other roots' state.
+  Name the buckets Terraform manages instead.
 * **Roots must be independent.** All plans are made before any apply. A root that reads another
   root's outputs (`terraform_remote_state`) would be planned against the outputs from before this
   release's applies, and Terraform would not flag it. Put dependent roots in separate pipelines,
@@ -323,6 +329,11 @@ StandardPipeline(..., gates=terraform_gates(roots=["network", "github"]), terraf
   * `TF_VAR_*` names are refused: Terraform writes input variable values into the saved plan,
     which every pipeline step can read. Use the provider's own environment variable.
   * Several roots may share a secret; each one's Plan and Deploy may read it.
+  * A secret encrypted with a customer-managed KMS key also needs `kms:Decrypt` on that key:
+    add it to the root's `plan_policy_statements` and `apply_policy_statements`. The default
+    `aws/secretsmanager` key needs nothing.
+  * Names are upper-case, except Terraform's `TF_TOKEN_<host>` credentials (for example
+    `TF_TOKEN_app_terraform_io`), which keep the lower-case host.
 * The contract (`terraform=ROOTS`) checks each root as before, plus the apply order, that only a
   root's own Plan and Deploy can read its state or touch its lock, and that only the roots
   declaring a secret can read it, with no wider secret grant on those roles.

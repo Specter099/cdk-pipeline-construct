@@ -573,9 +573,14 @@ class _Ctx:
 
     def __init__(self, template: Template) -> None:
         doc = template.to_json()
-        self.distinct = frozenset(template.find_resources("AWS::S3::Bucket")) | frozenset(
-            template.find_resources("AWS::SecretsManager::Secret")
-        )
+        secrets = template.find_resources("AWS::SecretsManager::Secret")
+        self.distinct = frozenset(template.find_resources("AWS::S3::Bucket")) | frozenset(secrets)
+        # a secret given a literal Name is known by its ARN: name plus a 6-character suffix
+        self.secret_arns = {
+            lid: f"arn:*:secretsmanager:*:*:secret:{name}-??????"
+            for lid, r in secrets.items()
+            if isinstance(name := (r.get("Properties") or {}).get("Name"), str)
+        }
         # a parameter is its default; without one, or when it names an SSM path (the value is
         # read at deploy time), it is unknown
         self.params = {
@@ -600,6 +605,8 @@ def _sub_text(body: str, variables: dict, ctx: _Ctx, unknown: str = "*") -> str:
         if name in variables:
             return _resource_text(variables[name], ctx, unknown)
         lid, _, attr = name.partition(".")
+        if not attr and lid in ctx.secret_arns:
+            return ctx.secret_arns[lid]
         if lid in ctx.distinct:
             return f"<{lid}.{attr}>" if attr else f"<{lid}>"
         if not attr and lid in ctx.params:
@@ -633,6 +640,8 @@ def _resource_text(resource, ctx: _Ctx | None = None, unknown: str = "*") -> str
                 return _sub_text(sub, {}, ctx, unknown)
             if isinstance(sub, list) and len(sub) == 2 and isinstance(sub[0], str) and isinstance(sub[1], dict):
                 return _sub_text(sub[0], sub[1], ctx, unknown)
+        if "Ref" in resource and resource["Ref"] in ctx.secret_arns:
+            return ctx.secret_arns[resource["Ref"]]
         if "Fn::GetAtt" in resource and resource["Fn::GetAtt"][0] in ctx.distinct:
             return "<" + ".".join(resource["Fn::GetAtt"]) + ">"
         if "Ref" in resource and resource["Ref"] in ctx.distinct:
@@ -649,7 +658,7 @@ def _resource_text(resource, ctx: _Ctx | None = None, unknown: str = "*") -> str
 
 class _EmptyCtx(_Ctx):
     def __init__(self) -> None:
-        self.distinct, self.params = frozenset(), {}
+        self.distinct, self.params, self.secret_arns = frozenset(), {}, {}
 
 
 _EMPTY_CTX = _EmptyCtx()
@@ -1579,6 +1588,14 @@ def assert_standard_contract(
         assert_applies_plan(template, root, name, roots, drift=drift)
     if drift:
         assert_drift_checks(template, roots, name)
+    # Secrets reach only the Plan, Deploy and drift check of a root that declares them.
+    holders = {f"{kind}-{r.name}" for r in roots if r.secrets for kind in ("Plan", "Deploy")}
+    holders |= {f"{name}-drift-{r.name}" for r in roots if r.secrets}
+    for res in projects(template).values():
+        spec = _read_buildspec(res["Properties"]) or {}
+        if spec.get("env", {}).get("secrets-manager"):
+            step = _project_step_name(res["Properties"])
+            assert step in holders, f"{step} reads Secrets Manager secrets in its buildspec"
     if roots:
         assert_state_bucket(template, name)
         assert_terraform_order(template, roots, deploy_stage)

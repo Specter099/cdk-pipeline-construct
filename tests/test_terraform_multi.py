@@ -5,7 +5,7 @@ import json
 
 import pytest
 from aws_cdk.assertions import Template
-from test_pipeline import build
+from test_pipeline import POST, build
 
 from specter_pipeline import TerraformRoot
 from specter_pipeline import testing as c
@@ -72,12 +72,12 @@ def test_one_state_bucket_and_one_key_per_root(tpl):
 
 
 def test_contract_passes(tpl):
-    c.assert_standard_contract(tpl, repo=REPO, gates=GATES, terraform=ROOTS)
+    c.assert_standard_contract(tpl, post_deploy=[POST], repo=REPO, gates=GATES, terraform=ROOTS)
 
 
 def test_a_single_root_still_works_as_before():
     t = build(application_stage=None, terraform=NET, gates=terraform_gates(roots=["net"]))
-    c.assert_standard_contract(t, repo=REPO, gates=terraform_gates(roots=["net"]), terraform=NET)
+    c.assert_standard_contract(t, post_deploy=[POST], repo=REPO, gates=terraform_gates(roots=["net"]), terraform=NET)
 
 
 @pytest.mark.parametrize(
@@ -192,3 +192,35 @@ def test_contract_rejects(change, root, message):
             c.assert_terraform_order(t, ROOTS)
         else:
             c.assert_applies_plan(t, root, "demo")
+
+
+_TRUST = {"Version": "2012-10-17", "Statement": [
+    {"Effect": "Allow", "Principal": {"Service": "lambda.amazonaws.com"}, "Action": "sts:AssumeRole"}]}
+
+
+def test_an_unrelated_role_with_aws_managed_policies_does_not_break_the_secret_check():
+    def change(res):
+        res["OtherRole"] = {"Type": "AWS::IAM::Role", "Properties": {
+            "AssumeRolePolicyDocument": _TRUST, "ManagedPolicyArns": ["arn:aws:iam::aws:policy/ReadOnlyAccess"]}}
+    t = mutated(change)
+    for r in ROOTS:
+        c.assert_applies_plan(t, r)
+
+
+@pytest.mark.parametrize(
+    "principal",
+    [
+        {"Type": "AWS::IAM::Group", "Properties": {"Policies": [{"PolicyName": "p", "PolicyDocument": {
+            "Version": "2012-10-17",
+            "Statement": [{"Effect": "Allow", "Action": "secretsmanager:*", "Resource": GH}]}}]}},
+        {"Type": "AWS::IAM::Role", "Properties": {"AssumeRolePolicyDocument": _TRUST, "Policies": [
+            {"PolicyName": "p", "PolicyDocument": {"Version": "2012-10-17", "Statement": [
+                {"Effect": "Allow", "NotAction": "s3:*", "Resource": "*"}]}}]}},
+    ],
+    ids=["group", "not-action-role"],
+)
+def test_any_other_principal_that_can_read_a_secret_fails(principal):
+    def change(res):
+        res["Other"] = principal
+    with pytest.raises(AssertionError, match="can read github's secret"):
+        c.assert_applies_plan(mutated(change), GITHUB)

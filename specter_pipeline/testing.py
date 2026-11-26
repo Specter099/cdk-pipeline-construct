@@ -1086,16 +1086,16 @@ def assert_applies_plan(template: Template, root: TerraformRoot, repo_name: str 
         )
 
     # The root's provider secrets: readable by its own Plan and Deploy, by no other role.
+    # Like the state sweep: the two allowed roles strictly, every other principal leniently.
     allowed = {roles[plan_name], roles[deploy_name]}
-    every_role = set(template.find_resources("AWS::IAM::Role"))
     for secret in sorted({secret_base_arn(a) for a in root.secrets.values()}):
         for role in sorted(allowed):
             assert _grants(template, role, "secretsmanager:GetSecretValue", secret), (
                 f"{role} cannot read the secret {secret}"
             )
-        for role in sorted(every_role - allowed):
-            assert not _grants(template, role, "secretsmanager:GetSecretValue", secret), (
-                f"{role} can read {root.name}'s secret {secret}"
+        for pid in _principals_granting(template, "secretsmanager:GetSecretValue", [secret]):
+            assert pid in allowed, (
+                f"{_step_of_role(template, pid)} can read {root.name}'s secret {secret}"
             )
 
 

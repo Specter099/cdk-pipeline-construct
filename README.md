@@ -235,12 +235,17 @@ Deploy: Approve -> Deploy-main (EC2: terraform apply tfplan) -> post-deploy step
 
   Plan and Deploy both stop if `init` did not end up on that backend. A root without the block
   would otherwise use local state on the build machine and create everything again on every run.
+  The check covers the backend type, bucket, key and workspace prefix. Other settings in the
+  root's backend block, such as a custom endpoint, `assume_role` or a profile, are code on main
+  and are not second-guessed.
 * `Plan-<name>` runs `plan -out=tfplan` and saves `show -json` and a text rendering. It can read
   state and hold the lock, but not write or delete state. Its output is the checkout plus the saved
   plan.
 * `Gate-tf-plan-check-<name>` reads only the plan, with no access to the state bucket. It fails on
   any delete or replace unless `allow_destroy=True`, prints `forget` entries (from `removed`
-  blocks) prominently, and runs Checkov's plan checks hardened as in the static gate.
+  blocks) prominently, and runs Checkov's plan checks hardened as in the static gate. Reviewed
+  inline `#checkov:skip=` comments apply here too: the checkout travels with the plan, and Checkov
+  reads them from it (`--repo-root-for-plan-enrichment`).
 * `Deploy-<name>` belongs to the construct. Its only input is the plan artifact. It re-initialises
   against the committed lock file and runs exactly `terraform apply tfplan`. Only this role can
   write state.

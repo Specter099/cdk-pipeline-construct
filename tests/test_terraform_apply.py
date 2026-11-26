@@ -81,12 +81,13 @@ def test_plan_and_apply_default_to_ec2():
 def test_plan_commands():
     cmds = plan_commands(TerraformRoot("infra", var_files=["prod.tfvars"]))
     assert cmds[0] == "cd infra"
-    assert "-lockfile=readonly" in cmds[2] and "use_lockfile=true" in cmds[2]
-    assert '"bucket=$TF_STATE_BUCKET"' in cmds[2] and "key=main/terraform.tfstate" in cmds[2]
-    assert cmds[3].startswith("python3 -I -c") and "TF_STATE_BUCKET" in cmds[3]  # backend guard
-    assert cmds[4] == "terraform plan -input=false -no-color -lock-timeout=5m -var-file=prod.tfvars -out=tfplan"
-    assert cmds[5] == "terraform show -json tfplan > tfplan.json"
-    assert cmds[6] == "terraform show -no-color tfplan > tfplan.txt"
+    assert cmds[2].startswith("test ! -e errored.tfstate")
+    assert "-lockfile=readonly" in cmds[3] and "use_lockfile=true" in cmds[3]
+    assert '"bucket=$TF_STATE_BUCKET"' in cmds[3] and "key=main/terraform.tfstate" in cmds[3]
+    assert cmds[4].startswith("python3 -I -c") and "TF_STATE_BUCKET" in cmds[4]  # backend guard
+    assert cmds[5] == "terraform plan -input=false -no-color -lock-timeout=5m -var-file=prod.tfvars -out=tfplan"
+    assert cmds[6] == "terraform show -json tfplan > tfplan.json"
+    assert cmds[7] == "terraform show -no-color tfplan > tfplan.txt"
     assert cmds[-1] == "rm -rf .terraform"
 
 
@@ -419,10 +420,117 @@ def test_contract_rejects_a_root_that_differs_from_the_template():
         (lambda r: _bucket(r).__setitem__("DeletionPolicy", "Delete"), "not retained"),
         (lambda r: _bucket(r)["Properties"]["LifecycleConfiguration"]["Rules"].append({"Status": "Enabled", "ExpirationInDays": 1}), "expires current state"),
         (lambda r: _bucket(r)["Properties"]["PublicAccessBlockConfiguration"].__setitem__("RestrictPublicBuckets", False), "RestrictPublicBuckets"),
-        (lambda r: _bucket_policy(r)["Properties"]["PolicyDocument"]["Statement"].append({"Effect": "Allow", "Principal": "*", "Action": "s3:GetObject", "Resource": "*"}), "allows something"),
+        (lambda r: _bucket_policy(r)["Properties"]["PolicyDocument"]["Statement"].append({"Effect": "Allow", "Principal": "*", "Action": "s3:GetObject", "Resource": "*"}), "may apply to the state bucket allows"),
         (lambda r: _bucket(r)["Properties"].__setitem__("BucketName", "x") or _bucket(r)["Properties"].pop("BucketNamePrefix"), "expected one Terraform state bucket"),
     ],
 )
 def test_assert_state_bucket_rejects(change, message):
     with pytest.raises(AssertionError, match=message):
         c.assert_state_bucket(mutated(change), "demo")
+
+
+# --- second verification round ------------------------------------------------------------------
+
+
+def _contract(t, root=ROOT):
+    c.assert_standard_contract(t, repo=REPO, gates=GATES, terraform=root)
+
+
+@pytest.mark.parametrize(
+    "stmt",
+    [
+        iam.PolicyStatement(actions=["s3:*"], resources=["arn:aws:s3:::*"]),
+        iam.PolicyStatement(actions=["s3:PutObject", "s3:DeleteObject"], resources=["arn:aws:s3:::*/*"]),
+        iam.PolicyStatement(actions=["s3:PutObject"], resources=["arn:aws:s3:::demo-tfstate-*/*"]),
+        iam.PolicyStatement(actions=["s3:putobject"], resources=["*"]),
+        iam.PolicyStatement(actions=["S3:*"], resources=["*"]),
+    ],
+    ids=["s3-star-any-bucket", "any-object", "tfstate-prefix", "lowercase-action", "uppercase-service"],
+)
+def test_a_plan_role_that_could_write_state_fails_through_the_public_api(stmt):
+    root = TerraformRoot("infra", plan_policy_statements=[stmt], apply_policy_statements=[APPLY_IAM])
+    with pytest.raises(AssertionError, match="Plan-main can write the Terraform state"):
+        _contract(tf_build(root=root), root)
+
+
+def test_a_broad_read_only_plan_role_is_valid():
+    root = TerraformRoot("infra", plan_policy_statements=[
+        iam.PolicyStatement(actions=["s3:Get*", "s3:List*", "ec2:Describe*"], resources=["*"])
+    ], apply_policy_statements=[APPLY_IAM])
+    _contract(tf_build(root=root), root)
+
+
+def _sub_bucket_write(res):
+    lid = next(k for k, x in res.items() if x["Type"] == "AWS::S3::Bucket"
+               and x["Properties"].get("BucketNamePrefix") == "demo-tfstate")
+    _role_policy(res, "Plan-main").append(
+        {"Effect": "Allow", "Action": "s3:PutObject", "Resource": {"Fn::Sub": "${" + lid + ".Arn}/*"}})
+
+
+def _other_role_writes(res):
+    _role_policy(res, "Gate-tf-validate").append(
+        {"Effect": "Allow", "Action": "s3:PutObject", "Resource": _state_key_resource(res)})
+
+
+def _action_env(step, stage):
+    def change(res):
+        _stage_actions(res, stage)[step]["Configuration"]["EnvironmentVariables"] = json.dumps(
+            [{"name": "TF_WORKSPACE", "value": "x", "type": "PLAINTEXT"}])
+    return change
+
+
+@pytest.mark.parametrize(
+    "change,message",
+    [
+        (_sub_bucket_write, "Plan-main can write"),  # an unrecognised intrinsic fails closed
+        (_other_role_writes, "Gate-tf-validate can write"),
+        (_action_env("Plan-main", "Gates"), "action-level environment"),
+        (_action_env("Deploy-main", "Deploy"), "action-level environment"),
+        (lambda r: _stage_actions(r, "Gates")["Plan-main"].__setitem__("InputArtifacts", [{"Name": "Synth_Output"}]), "not the source checkout"),
+        (lambda r: _project(r, "Gate-tf-plan-check-main")["Environment"]["EnvironmentVariables"].append({"Name": "X", "Type": "PLAINTEXT", "Value": "1"}), "besides CI=true"),
+    ],
+)
+def test_assert_applies_plan_rejects_round_two(change, message):
+    with pytest.raises(AssertionError, match=message):
+        c.assert_applies_plan(mutated(change), ROOT)
+
+
+@pytest.mark.parametrize(
+    "change,message",
+    [
+        (lambda r: [r.pop(k) for k in [k for k, x in r.items() if x["Type"] == "AWS::S3::BucketPolicy"
+                                        and x["Properties"]["Bucket"] == {"Ref": next(b for b, y in r.items() if y["Type"] == "AWS::S3::Bucket" and y["Properties"].get("BucketNamePrefix") == "demo-tfstate")}]], "no TLS-only deny"),
+        (lambda r: _bucket(r)["Properties"]["LifecycleConfiguration"]["Rules"][0]["NoncurrentVersionExpiration"].__setitem__("NoncurrentDays", 1), "keep at least 30"),
+        (lambda r: _bucket(r).__setitem__("UpdateReplacePolicy", "Delete"), "retained on replacement"),
+        (lambda r: r.__setitem__("Sneaky", {"Type": "AWS::S3::BucketPolicy", "Properties": {
+            "Bucket": {"Fn::Sub": "${x}"}, "PolicyDocument": {"Statement": [{"Effect": "Allow", "Principal": "*", "Action": "s3:*", "Resource": "*"}]}}}), "may apply to the state bucket allows"),
+    ],
+)
+def test_assert_state_bucket_rejects_round_two(change, message):
+    with pytest.raises(AssertionError, match=message):
+        c.assert_state_bucket(mutated(change), "demo")
+
+
+def test_the_plan_check_reads_inline_checkov_skips_from_the_checkout():
+    cmds = plan_check_commands(ROOT, "infra")
+    assert any("--repo-root-for-plan-enrichment infra" in x for x in cmds)
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+def test_plan_refuses_a_committed_errored_state(tmp_path):
+    (tmp_path / "errored.tfstate").write_text("{}")
+    cmd = plan_commands(TerraformRoot("."))[2]
+    r = subprocess.run(["bash", "-c", cmd], check=False, cwd=tmp_path, capture_output=True, text=True)
+    assert r.returncode != 0 and "errored.tfstate is committed" in r.stdout
+
+
+def test_deploy_removes_any_errored_state_before_applying():
+    cmds = apply_commands(ROOT)
+    assert cmds.index("rm -f errored.tfstate") == len(cmds) - 2
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+def test_backend_guard_explains_a_missing_backend(tmp_path):
+    r = subprocess.run(["bash", "-c", backend_check(TerraformRoot())], check=False, cwd=tmp_path,
+                       capture_output=True, text=True, env={"PATH": "/usr/bin:/bin", "TF_STATE_BUCKET": "B"})
+    assert r.returncode != 0 and "configured no backend" in r.stdout and "Traceback" not in r.stderr

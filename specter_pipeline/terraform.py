@@ -148,14 +148,19 @@ def init_command(root: TerraformRoot) -> str:
 def backend_check(root: TerraformRoot) -> str:
     """Fail unless init configured the S3 backend on the pipeline's bucket and this root's key."""
     script = (
-        "import json, os, sys; b = json.load(open('.terraform/terraform.tfstate')).get('backend') or {}; "
-        "c = b.get('config') or {}; "
-        "ok = b.get('type') == 's3' and c.get('bucket') == os.environ['TF_STATE_BUCKET'] "
-        f"and c.get('key') == {root.state_key!r} and not c.get('workspace_key_prefix'); "
-        "ok or print('init did not configure the S3 backend on the pipeline state bucket: '"
-        " + 'declare terraform { backend \"s3\" {} } in the root'); sys.exit(0 if ok else 1)"
+        "import json, os, sys\n"
+        "hint = 'declare an empty S3 backend in the root: terraform {\\n  backend \"s3\" {}\\n}'\n"
+        "try:\n"
+        "    b = json.load(open('.terraform/terraform.tfstate')).get('backend') or {}\n"
+        "except FileNotFoundError:\n"
+        "    print('init configured no backend, so state would stay on this machine. ' + hint); sys.exit(1)\n"
+        "c = b.get('config') or {}\n"
+        "ok = (b.get('type') == 's3' and c.get('bucket') == os.environ['TF_STATE_BUCKET']\n"
+        f"      and c.get('key') == {root.state_key!r} and not c.get('workspace_key_prefix'))\n"
+        "if not ok:\n"
+        "    print('init did not configure the S3 backend on the pipeline state bucket. ' + hint); sys.exit(1)\n"
     )
-    return f"python3 -I -c {shlex.quote(script)}"
+    return f"python3 -I -c {shlex.quote('exec(' + repr(script) + ')')}"
 
 
 def plan_commands(root: TerraformRoot) -> list[str]:
@@ -166,6 +171,8 @@ def plan_commands(root: TerraformRoot) -> list[str]:
     return [
         f"cd {shlex.quote(root.path)}",
         f"test -f .terraform.lock.hcl || {{ echo {lock}; exit 1; }}",
+        # A committed errored.tfstate would be pushed to the backend by Deploy's failure handling.
+        "test ! -e errored.tfstate || { echo 'errored.tfstate is committed; remove it'; exit 1; }",
         init_command(root),
         backend_check(root),
         f"terraform plan -input=false -no-color -lock-timeout=5m {var_files} -out={PLAN_FILE}".replace("  ", " "),
@@ -189,6 +196,8 @@ def apply_commands(root: TerraformRoot) -> list[str]:
         f"test -f {PLAN_FILE} || {{ echo 'no saved plan in the artifact'; exit 1; }}",
         init_command(root),
         backend_check(root),
+        # Only an errored.tfstate written by this apply may be pushed.
+        "rm -f errored.tfstate",
         (
             f"rc=0; terraform apply -input=false -no-color -lock-timeout=5m {PLAN_FILE} || rc=$?; "
             # A failed state write leaves the real state in errored.tfstate, on this machine only.
@@ -232,8 +241,13 @@ def plan_check_commands(root: TerraformRoot, plan_dir: str) -> list[str]:
     return [
         # First: Checkov exits 0 on a missing or unreadable file.
         f"python3 -I -c {shlex.quote('exec(' + repr(_DESTROY_CHECK) + ')')} {plan_json} {allow}",
+        # --repo-root-for-plan-enrichment: the checkout is in the plan artifact, so reviewed
+        # inline `#checkov:skip=` comments apply to the plan as they do to the static gate.
         *checkov_commands(
-            plan_dir, shlex.quote(plan_dir), f"-f {plan_json} --framework terraform_plan"
+            plan_dir,
+            shlex.quote(plan_dir),
+            f"-f {plan_json} --framework terraform_plan "
+            f"--repo-root-for-plan-enrichment {shlex.quote(plan_dir)}",
         ),
     ]
 

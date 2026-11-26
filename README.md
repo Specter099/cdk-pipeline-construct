@@ -180,7 +180,7 @@ GATES = terraform_gates(roots=["infra"])   # tf-fmt, tf-validate, tf-checkov
   every provider in it must list hashes: `init` would otherwise install an unhashed provider as
   "unauthenticated". The lock file must keep the layout `terraform init` writes: unindented
   `provider "host[:port]/namespace/name" {` blocks, a `hashes = [` list with at least one entry,
-  no comments and no other syntax. Regenerate it with `terraform providers lock` rather than
+  no comments inside a provider block and no other syntax. Regenerate it with `terraform providers lock` rather than
   editing it by hand; anything else is refused, so a comment cannot hide a missing hash. A committed `terraform.d/` or `.terraform/` is refused, because it could supply
   provider binaries.
 * `tf-checkov` runs pinned Checkov with its built-in policies, `--skip-download` (no platform calls)
@@ -199,6 +199,95 @@ GATES = terraform_gates(roots=["infra"])   # tf-fmt, tf-validate, tf-checkov
   changes providers has to change the lock file, so the change shows in its diff, but its plugins
   still run in the check. Keep the repo private, or require approval for PRs from forks (the
   default). Plan and apply, with state and credentials, come in step 3, on EC2 compute.
+
+## Terraform: plan once, apply exactly that plan
+
+Step 3. The pipeline is still CDK; the infrastructure is a Terraform root module.
+
+```python
+from specter_pipeline import StandardPipeline, TerraformRoot
+from specter_pipeline.presets import terraform_gates
+
+ROOT = TerraformRoot(
+    "infra",
+    plan_policy_statements=[...],    # what refresh and plan read
+    apply_policy_statements=[...],   # what apply creates and changes
+)
+StandardPipeline(..., gates=terraform_gates(roots=["infra"]), terraform=ROOT,
+                 synth_commands=['cdk -a "python3 pipeline_app.py" synth'])
+```
+
+```
+Gates:  Plan-main (EC2)  ->  Gate-tf-plan-check-main      + the static gates, in parallel
+Deploy: Approve -> Deploy-main (EC2: terraform apply tfplan) -> post-deploy steps
+```
+
+* The construct creates the state bucket: `{repo}-tfstate-{account}-{region}-an`, versioned,
+  encrypted, retained, with state never expired. Each root gets its own key and lock file
+  (`<name>/terraform.tfstate`), using Terraform's own S3 lock file (no DynamoDB). The root declares
+  a partial backend, and the construct supplies the rest at `init`:
+
+  ```hcl
+  terraform {
+    backend "s3" {}
+  }
+  ```
+
+  Plan and Deploy both stop if `init` did not end up on that backend. A root without the block
+  would otherwise use local state on the build machine and create everything again on every run.
+  The check covers the backend type, bucket, key and workspace prefix. Other settings in the
+  root's backend block, such as a custom endpoint, `assume_role` or a profile, are code on main
+  and are not second-guessed.
+* `Plan-<name>` runs `plan -out=tfplan` and saves `show -json` and a text rendering. It can read
+  state and hold the lock, but not write or delete state. Its output is the checkout plus the saved
+  plan.
+* `Gate-tf-plan-check-<name>` reads only the plan, with no access to the state bucket. It fails on
+  any delete or replace unless `allow_destroy=True`, prints `forget` entries (from `removed`
+  blocks) prominently, and runs Checkov's plan checks hardened as in the static gate. Reviewed
+  inline `#checkov:skip=` comments apply here too: the checkout travels with the plan, and Checkov
+  reads them from it (`--repo-root-for-plan-enrichment`).
+* `Deploy-<name>` belongs to the construct. Its only input is the plan artifact. It re-initialises
+  against the committed lock file and runs exactly `terraform apply tfplan`. Only this role can
+  write state.
+* Plan and apply run on EC2 (`plan_ec2`, `apply_ec2`; defaults are small with 60 and 120 minutes),
+  so a long apply is not killed half-way.
+* `TerraformRoot.env` may not set variables that redirect Terraform: `TF_CLI_ARGS*`,
+  `TF_WORKSPACE`, `TF_DATA_DIR`, `TF_CLI_CONFIG_FILE` and similar.
+* `assert_standard_contract(..., terraform=ROOT)` checks all of this, via `assert_applies_plan` and
+  `assert_state_bucket`: exact command lists, environment variables, artifact wiring, and IAM with
+  wildcards taken into account.
+  * The Plan, plan-check and Deploy roles are read strictly: no managed policies, no `NotAction`.
+  * Every other role, user and group, and any policy attached to a principal outside the
+    template, is read leniently. That covers inline and managed policies of the template,
+    `RolePolicy`/`UserPolicy`/`GroupPolicy`, `NotAction`/`NotResource`, explicit denies, and
+    `Fn::Sub`/`Fn::Join`/parameter defaults. A construction it cannot read (an `Fn::If`, an unknown
+    intrinsic, a parameter without a default or read from SSM) counts as reaching the state, and
+    never as a Deny or `NotResource` that excludes it. So a grant on
+    `Bucket.from_bucket_arn(CfnParameter)` with no default fails the contract: give the parameter
+    a default, or keep such grants out of the pipeline stack.
+  * Only the Deploy role may write the state or change the bucket (policy, versioning,
+    lifecycle, public access, encryption, deletion).
+  * **Not covered:** managed policies attached by a literal ARN (AWS-managed ones such as
+    `AdministratorAccess`, or another stack's) cannot be read from the template, and principals
+    in other stacks or accounts are not visible. Keep those off the state bucket in your account.
+
+**Operating notes.**
+* **Secrets in the plan:** the saved plan and `tfplan.json` contain the prior state and any
+  sensitive values in clear text, and the pipeline's artifact bucket is readable by every step.
+  Keep secrets out of Terraform variables where you can, for example by reading them at apply time
+  from Secrets Manager inside the resource that needs them.
+* **Stale plans:** a plan is applied only against the state it was made from. If another run
+  changes the state first (two releases close together), the later apply fails with "Saved plan
+  is stale"; release again to plan afresh. Retrying the stage re-applies the same stale plan.
+* **Failed state writes:** if apply fails after creating resources but before writing state,
+  Terraform saves `errored.tfstate`, and the Deploy step pushes it to the backend before failing.
+* **A stuck lock:** a cancelled Plan or Deploy can leave `<name>/terraform.tfstate.tflock`. Clear it
+  with `terraform force-unlock <id>` from a machine with the deploy role, or delete the lock object
+  once you are sure no run is in progress.
+* **Renaming a root starts it on empty state:** the key is `<name>/terraform.tfstate`. Move the
+  state object first.
+* Not yet proven on a real account: the state bucket permissions, including the very first run with
+  no state, and EC2 compute itself. Test both once with `deploy_enabled=False`.
 
 ## Contract tests: `specter_pipeline.testing`
 

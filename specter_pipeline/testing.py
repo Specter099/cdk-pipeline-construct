@@ -17,6 +17,7 @@ pipeline; the comments say which.
 
 from __future__ import annotations
 
+import fnmatch
 import json
 import re
 from collections.abc import Iterable, Mapping, Sequence
@@ -44,7 +45,11 @@ from .runtimes import (
     cdk_cli_install,
     node_tarball_prelude,
     prelude,
+    python_prelude,
+    terraform_prelude,
 )
+from .terraform import CHECKOV as TF_CHECKOV
+from .terraform import TerraformRoot, apply_commands, plan_check_commands, plan_commands
 
 #: The exact actions a PR-check role may hold (measured on a synthesized pipeline): its own
 #: logs, the report permissions CodeBuild adds for the project's own report group, and the
@@ -536,6 +541,542 @@ def assert_builds_once(
             )
 
 
+def _role_of(template: Template, step: str) -> str:
+    return _project_of(template, step)["ServiceRole"]["Fn::GetAtt"][0]
+
+
+_PSEUDO = ("AWS::Partition", "AWS::Region", "AWS::AccountId", "AWS::URLSuffix")
+
+
+class _Ctx:
+    """What the IAM matcher knows about the template: its buckets (whose Ref/GetAtt stay
+    placeholders) and its parameters (replaced by their default, or ``*`` without one)."""
+
+    def __init__(self, template: Template) -> None:
+        doc = template.to_json()
+        self.distinct = frozenset(template.find_resources("AWS::S3::Bucket"))
+        # a parameter is its default; without one, or when it names an SSM path (the value is
+        # read at deploy time), it is unknown
+        self.params = {
+            k: (v.get("Default")
+                if isinstance(v, dict) and isinstance(v.get("Default"), str)
+                and not str(v.get("Type", "")).startswith("AWS::SSM::")
+                else None)
+            for k, v in doc.get("Parameters", {}).items()
+        }
+
+
+#: What an unreadable value renders as when the question is "does this surely cover the
+#: resource?" (a Deny, a NotResource): it matches nothing, so the unknown never excuses.
+_NOTHING = "\x00"
+
+
+def _sub_text(body: str, variables: dict, ctx: _Ctx, unknown: str = "*") -> str:
+    def one(m: re.Match) -> str:
+        name = m.group(1)
+        if name.startswith("!"):
+            return "${" + name[1:] + "}"
+        if name in variables:
+            return _resource_text(variables[name], ctx, unknown)
+        lid, _, attr = name.partition(".")
+        if lid in ctx.distinct:
+            return f"<{lid}.{attr}>" if attr else f"<{lid}>"
+        if not attr and lid in ctx.params:
+            return ctx.params[lid] if ctx.params[lid] is not None else unknown
+        if lid.startswith("AWS::") and unknown == "*":
+            return "*"
+        return unknown
+
+    return re.sub(r"\$\{([^}]*)\}", one, body)
+
+
+def _resource_text(resource, ctx: _Ctx | None = None, unknown: str = "*") -> str:
+    """An IAM resource as a pattern. A Ref/GetAtt of a known bucket and an ``Fn::ImportValue``
+    (another stack's export, never this stack's state bucket) stay ``<...>`` placeholders that
+    match only themselves; a template parameter becomes its default (``*`` without one);
+    ``Fn::Join`` and ``Fn::Sub`` are rendered; pseudo parameters and any other intrinsic become
+    ``unknown`` (``*`` by default), so an unrecognised construction fails closed: it counts as a
+    match for an Allow, and with ``unknown=_NOTHING`` as no match for a Deny or NotResource."""
+    ctx = ctx or _EMPTY_CTX
+    if isinstance(resource, str):
+        return resource
+    if isinstance(resource, dict) and len(resource) == 1:
+        if "Fn::Join" in resource:
+            sep, parts = resource["Fn::Join"]
+            if isinstance(sep, str) and isinstance(parts, list):
+                return sep.join(_resource_text(p, ctx, unknown) for p in parts)
+        if "Fn::Sub" in resource:
+            sub = resource["Fn::Sub"]
+            if isinstance(sub, str):
+                return _sub_text(sub, {}, ctx, unknown)
+            if isinstance(sub, list) and len(sub) == 2 and isinstance(sub[0], str) and isinstance(sub[1], dict):
+                return _sub_text(sub[0], sub[1], ctx, unknown)
+        if "Fn::GetAtt" in resource and resource["Fn::GetAtt"][0] in ctx.distinct:
+            return "<" + ".".join(resource["Fn::GetAtt"]) + ">"
+        if "Ref" in resource and resource["Ref"] in ctx.distinct:
+            return "<" + resource["Ref"] + ">"
+        if "Ref" in resource and resource["Ref"] in ctx.params:
+            value = ctx.params[resource["Ref"]]
+            return value if value is not None else unknown
+        if "Ref" in resource and str(resource["Ref"]).startswith("AWS::") and unknown == "*":
+            return "*"
+        if "Fn::ImportValue" in resource:
+            return "<import:" + json.dumps(resource["Fn::ImportValue"], sort_keys=True) + ">"
+    return unknown
+
+
+class _EmptyCtx(_Ctx):
+    def __init__(self) -> None:
+        self.distinct, self.params = frozenset(), {}
+
+
+_EMPTY_CTX = _EmptyCtx()
+
+
+#: In a target form: any run of characters within one ARN segment (no ":" or "/"), and one
+#: digit (a slot of the 12-digit account number).
+_SEG = "\x01"
+_DIGIT = "\x02"
+
+
+def _globs_meet(a: str, b: str) -> bool:
+    """Whether some string matches both patterns: ``*`` any run, ``?`` one character, and
+    ``_SEG`` any run without ":" or "/" (IAM patterns use the first two; target forms all three)."""
+
+    def can(tok: str, c: str) -> bool:  # whether a non-star token can produce character c
+        return tok in ("?", c) or (tok == _DIGIT and c.isdigit())
+
+    seen: set[tuple[int, int]] = set()
+    stack = [(0, 0)]
+    while stack:
+        i, j = stack.pop()
+        if (i, j) in seen:
+            continue
+        seen.add((i, j))
+        if i == len(a) and j == len(b):
+            return True
+        sa = i < len(a) and a[i] in ("*", _SEG)
+        sb = j < len(b) and b[j] in ("*", _SEG)
+        if sa:
+            stack.append((i + 1, j))  # a's run ends
+        if sb:
+            stack.append((i, j + 1))  # b's run ends
+        if i == len(a) or j == len(b):
+            continue
+        # produce one character both sides accept
+        lits = [t for t in (a[i], b[j]) if t not in ("*", _SEG, "?", _DIGIT)]
+        c = lits[0] if lits else ("0" if _DIGIT in (a[i], b[j]) else "x")
+        ok_a = (a[i] == "*") or (a[i] == _SEG and c not in ":/") or can(a[i], c)
+        ok_b = (b[j] == "*") or (b[j] == _SEG and c not in ":/") or can(b[j], c)
+        if ok_a and ok_b:
+            stack.append((i if sa else i + 1, j if sb else j + 1))
+    return False
+
+
+def _covers(pattern: str, forms: list[str]) -> bool:
+    """Whether ``pattern`` surely matches the resource (any of its forms, read literally)."""
+    return any(fnmatch.fnmatchcase(f, pattern) for f in forms)
+
+
+def _matches_action(action: str, values) -> bool:
+    # an intrinsic in place of an action name is unknown: it may be anything
+    return any(not isinstance(v, str) or fnmatch.fnmatchcase(action, v.lower()) for v in _as_list(values))
+
+
+def _statement_allows(stmt, action: str, forms: list[str], ctx: _Ctx) -> bool:
+    """Whether one statement allows ``action`` on the resource with these ``forms``, as IAM
+    would: actions case-insensitive, wildcards, NotAction/NotResource honoured. Conditions are
+    ignored (they may hold). Anything unreadable (an ``Fn::If``, a non-string effect) allows."""
+    if not isinstance(stmt, dict) or any(k.startswith("Fn::") for k in stmt):
+        return True
+    effect = stmt.get("Effect", "Allow")
+    if effect == "Deny":
+        return False
+    if effect != "Allow" and isinstance(effect, str):
+        return False
+    a = action.lower()
+    if "NotAction" in stmt:
+        if _matches_action(a, stmt["NotAction"]) and all(isinstance(v, str) for v in _as_list(stmt["NotAction"])):
+            return False
+    elif not _matches_action(a, stmt.get("Action", [])):
+        return False
+    if "NotResource" in stmt:
+        # excluded only if an exclusion surely covers the resource
+        return not any(_covers(_resource_text(r, ctx, _NOTHING), forms) for r in _as_list(stmt["NotResource"])
+                       if isinstance(r, str | dict))
+    return any(_globs_meet(f, _resource_text(r, ctx)) for r in _as_list(stmt.get("Resource", [])) for f in forms)
+
+
+def _statement_denies(stmt, action: str, forms: list[str], ctx: _Ctx) -> bool:
+    """Whether an unconditional Deny surely covers ``action`` on the resource."""
+    if not isinstance(stmt, dict) or stmt.get("Effect") != "Deny" or stmt.get("Condition"):
+        return False
+    if "NotAction" in stmt or "NotResource" in stmt:
+        return False
+    actions = _as_list(stmt.get("Action", []))
+    if not all(isinstance(v, str) for v in actions) or not _matches_action(action.lower(), actions):
+        return False
+    return any(isinstance(r, str | dict) and _covers(_resource_text(r, ctx, _NOTHING), forms)
+               for r in _as_list(stmt.get("Resource", [])))
+
+
+def _allows(stmts: list, action: str, resources: list[list[str]], ctx: _Ctx) -> bool:
+    """Whether these statements allow ``action`` on any of ``resources`` (each a list of forms
+    of one real resource) and no unconditional Deny among them takes it back."""
+    return any(
+        any(_statement_allows(s, action, forms, ctx) for s in stmts)
+        and not any(_statement_denies(s, action, forms, ctx) for s in stmts)
+        for forms in resources
+    )
+
+
+def _resources(targets) -> list[list[str]]:
+    if isinstance(targets, str):
+        return [[targets]]
+    return [[t] if isinstance(t, str) else list(t) for t in targets]
+
+
+def _grants(template: Template, role: str, action: str, targets) -> bool:
+    """Whether a construct role (strict: no managed policies, no NotAction/NotResource) is
+    allowed ``action`` on any of ``targets`` (a resource, or a list of resources each given as a
+    list of its forms)."""
+    stmts = [st for _, st in _role_policy_statements(template, {role})]
+    return _allows(stmts, action, _resources(targets), _Ctx(template))
+
+
+#: A managed policy ARN from outside the template (any partition and account, any path).
+_MANAGED_ARN = re.compile(r"arn:[^:/]+:iam::[^:/]*:policy/[^*]+")
+
+_PRINCIPALS = {"Roles": ("AWS::IAM::Role", "RoleName"), "Users": ("AWS::IAM::User", "UserName"),
+               "Groups": ("AWS::IAM::Group", "GroupName")}
+_SINGLE = {"AWS::IAM::RolePolicy": ("Roles", "RoleName"), "AWS::IAM::UserPolicy": ("Users", "UserName"),
+           "AWS::IAM::GroupPolicy": ("Groups", "GroupName")}
+
+
+def _doc_statements(doc) -> list:
+    """A policy document's statements; an unreadable document is one unknown statement."""
+    if not isinstance(doc, dict):
+        return [None]
+    stmts = doc.get("Statement")
+    return [None] if stmts is None or not isinstance(stmts, dict | list) else _as_list(stmts)
+
+
+def _policy_principals(template: Template) -> list[tuple[str, list]]:
+    """(principal, statements) for every principal any policy in the template reaches. A
+    principal is a role, user or group of the template, or - when a policy's attachment cannot
+    be tied to one (a literal name from elsewhere, an intrinsic) - the policy itself."""
+    by_name: dict[tuple[str, str], str] = {}
+    found: dict[str, list] = {}
+    for kind, (cfn, name_prop) in _PRINCIPALS.items():
+        for pid, res in template.find_resources(cfn).items():
+            props = res.get("Properties", {}) or {}
+            found[pid] = []
+            if isinstance(props.get(name_prop), str):
+                by_name[(kind, props[name_prop])] = pid
+            for inline in _as_list(props.get("Policies", [])):
+                found[pid] += _doc_statements(inline.get("PolicyDocument") if isinstance(inline, dict) else None)
+
+    def targets(kind: str, ref) -> list[str] | None:
+        """The principals an attachment names, or None if it cannot be resolved."""
+        if isinstance(ref, str):
+            return [by_name[(kind, ref)]] if (kind, ref) in by_name else None
+        if isinstance(ref, dict) and set(ref) == {"Ref"} and ref["Ref"] in found:
+            return [ref["Ref"]]
+        if isinstance(ref, dict) and set(ref) == {"Fn::Sub"} and isinstance(ref["Fn::Sub"], str):
+            m = re.fullmatch(r"\$\{([A-Za-z0-9]+)\}", ref["Fn::Sub"])
+            if m and m.group(1) in found:
+                return [m.group(1)]
+        return None
+
+    def attach(lid: str, kind: str, refs, stmts: list) -> None:
+        for ref in _as_list(refs):
+            hit = targets(kind, ref)
+            if hit is None:
+                found.setdefault(lid, []).extend(stmts)  # reaches someone we cannot name
+            else:
+                for pid in hit:
+                    found[pid].extend(stmts)
+
+    managed: dict[str, list] = {}
+    for cfn in ("AWS::IAM::Policy", "AWS::IAM::ManagedPolicy"):
+        for lid, res in template.find_resources(cfn).items():
+            props = res.get("Properties", {}) or {}
+            stmts = _doc_statements(props.get("PolicyDocument"))
+            if cfn == "AWS::IAM::ManagedPolicy":
+                managed[lid] = stmts
+            for kind in _PRINCIPALS:
+                if kind in props:
+                    attach(lid, kind, props[kind], stmts)
+    for cfn, (kind, name_prop) in _SINGLE.items():
+        for lid, res in template.find_resources(cfn).items():
+            props = res.get("Properties", {}) or {}
+            attach(lid, kind, props.get(name_prop), _doc_statements(props.get("PolicyDocument")))
+    # managed policies a principal lists: Ref, GetAtt PolicyArn or Sub of a template policy;
+    # any other intrinsic may be any of them; a literal ARN is from elsewhere and unreadable
+    for kind, (cfn, _) in _PRINCIPALS.items():
+        for pid, res in template.find_resources(cfn).items():
+            for arn in _as_list((res.get("Properties", {}) or {}).get("ManagedPolicyArns", [])):
+                mid = None
+                if isinstance(arn, dict) and set(arn) == {"Ref"}:
+                    mid = arn["Ref"]
+                elif isinstance(arn, dict) and set(arn) == {"Fn::GetAtt"}:
+                    mid = arn["Fn::GetAtt"][0]
+                elif isinstance(arn, dict) and set(arn) == {"Fn::Sub"} and isinstance(arn["Fn::Sub"], str):
+                    m = re.fullmatch(r"\$\{([A-Za-z0-9]+)(?:\.PolicyArn)?\}", arn["Fn::Sub"])
+                    mid = m.group(1) if m else None
+                if mid in managed:
+                    found[pid].extend(managed[mid])
+                    continue
+                # A policy ARN, literal or built the way CDK writes AWS-managed ones
+                # (Join/Sub with the partition), is from outside the template: unreadable.
+                if _MANAGED_ARN.fullmatch(_resource_text(arn)):
+                    continue
+                # Anything else may be any template managed policy: take their Allows (never
+                # their Denies, which may not apply), or an unknown statement if there are none.
+                for stmts in managed.values():
+                    found[pid].extend(st for st in stmts if not (isinstance(st, dict) and st.get("Effect") == "Deny"))
+                if not managed:
+                    found[pid].append(None)
+    return sorted(found.items())
+
+
+def _principals_granting(template: Template, action: str, targets) -> list[str]:
+    """Every principal (see ``_policy_principals``) allowed ``action`` on any of ``targets``,
+    read leniently: whatever the template's IAM resources attach. Managed policies named by a
+    literal ARN (AWS-managed or from another stack) cannot be read and are not counted."""
+    ctx, resources = _Ctx(template), _resources(targets)
+    return [pid for pid, stmts in _policy_principals(template) if _allows(stmts, action, resources, ctx)]
+
+
+def _state_targets(bucket_lid: str, props: dict, key: str | None) -> list[str]:
+    """The forms of the state bucket (or an object in it): its GetAtt and Ref placeholders and
+    its house name with the account and region left open, so neither a GetAtt/Ref-built nor a
+    hand-written ARN in any partition, account or region escapes the match."""
+    prefix = props.get("BucketNamePrefix", "state")
+    bases = [
+        f"<{bucket_lid}.Arn>",
+        f"arn:{_SEG}:s3:::<{bucket_lid}>",
+        f"arn:{_SEG}:s3:::{prefix}-{_DIGIT * 12}-{_SEG}-an",
+    ]
+    return [b if key is None else f"{b}/{key}" for b in bases]
+
+
+def _state_bucket(template: Template, name: str | None) -> tuple[str, dict]:
+    """The state bucket: the construct's ``{repo}-tfstate`` prefix (lowercase, dots as hyphens),
+    or with no name the one ``*-tfstate`` bucket."""
+    want = artifact_bucket_purpose(name).removesuffix("-pipeline") + "-tfstate" if name else None
+    found = [
+        (lid, r)
+        for lid, r in template.find_resources("AWS::S3::Bucket").items()
+        if (
+            (r.get("Properties") or {}).get("BucketNamePrefix") == want
+            if name
+            else str((r.get("Properties") or {}).get("BucketNamePrefix", "")).endswith("-tfstate")
+        )
+    ]
+    assert len(found) == 1, f"expected one Terraform state bucket ({want or '*-tfstate'}), found {len(found)}"
+    return found[0]
+
+
+def assert_state_bucket(template: Template, name: str) -> None:
+    """The state bucket: house name in the account-regional namespace, versioned, encrypted,
+    retained, private, state never expired, and a bucket policy that only denies."""
+    lid, res = _state_bucket(template, name)
+    props = res.get("Properties", {})
+    assert res.get("DeletionPolicy") == "Retain", "state bucket is not retained"
+    assert res.get("UpdateReplacePolicy") == "Retain", "state bucket is not retained on replacement"
+    assert props.get("BucketNamespace") == "account-regional", "state bucket is not account-regional"
+    assert props.get("VersioningConfiguration", {}).get("Status") == "Enabled", "state bucket is not versioned"
+    assert props.get("BucketEncryption"), "state bucket is not encrypted"
+    block = props.get("PublicAccessBlockConfiguration", {})
+    for flag in ("BlockPublicAcls", "BlockPublicPolicy", "IgnorePublicAcls", "RestrictPublicBuckets"):
+        assert block.get(flag) in (True, "true"), f"state bucket does not set {flag}"
+    for rule in props.get("LifecycleConfiguration", {}).get("Rules", []):
+        assert "ExpirationInDays" not in rule and "ExpirationDate" not in rule, (
+            "a lifecycle rule expires current state"
+        )
+        for days in (
+            rule.get("NoncurrentVersionExpiration", {}).get("NoncurrentDays"),
+            rule.get("NoncurrentVersionExpirationInDays"),  # the legacy spelling
+        ):
+            assert days is None or int(days) >= 30, (
+                f"old state versions expire after {days} days; keep at least 30 for recovery"
+            )
+    others = {k for k in template.find_resources("AWS::S3::Bucket") if k != lid}
+    ctx = _Ctx(template)
+    tls_deny = False
+    for pol in template.find_resources("AWS::S3::BucketPolicy").values():
+        pp = pol.get("Properties", {})
+        bucket = pp.get("Bucket")
+        if isinstance(bucket, dict) and bucket.get("Ref") in others:
+            continue  # another bucket's policy
+        # The state bucket's, or one we cannot tie to a bucket: it may only deny.
+        ours = bucket == {"Ref": lid}
+        for st in _as_list(pp.get("PolicyDocument", {}).get("Statement", [])):
+            assert st.get("Effect") == "Deny", f"a policy that may apply to the state bucket allows: {st}"
+            # only an exact deny of every action without TLS, on the state bucket's own policy
+            covered = {_resource_text(r, ctx) for r in _as_list(st.get("Resource", []))}
+            tls_deny |= ours and (
+                st.get("Condition") in ({"Bool": {"aws:SecureTransport": "false"}},
+                                        {"Bool": {"aws:SecureTransport": False}})
+                and _as_list(st.get("Action")) in (["s3:*"], ["*"])
+                and st.get("Principal") in ({"AWS": "*"}, "*")
+                # the bucket and every object in it
+                and ("*" in covered or {f"<{lid}.Arn>", f"<{lid}.Arn>/*"} <= covered)
+            )
+    assert tls_deny, "state bucket has no TLS-only deny policy"
+    # An access point is a second door with its own policy: none may allow anything.
+    for ap_lid, ap in template.find_resources("AWS::S3::AccessPoint").items():
+        app = ap.get("Properties") or {}
+        target = app.get("Bucket")
+        if isinstance(target, dict) and target.get("Ref") in others:
+            continue
+        if isinstance(target, str) and not target.startswith(str(props.get("BucketNamePrefix"))):
+            continue
+        for st in _doc_statements(app.get("Policy", {"Statement": []})):
+            assert isinstance(st, dict) and st.get("Effect") == "Deny", (
+                f"access point {ap_lid} may open the state bucket: {st}"
+            )
+
+
+def _env_of(template: Template, step: str) -> dict:
+    env = _project_of(template, step)["Environment"].get("EnvironmentVariables", [])
+    return {v["Name"]: (v.get("Type", "PLAINTEXT"), v.get("Value")) for v in env}
+
+
+def _step_of_role(template: Template, role: str) -> str:
+    for res in projects(template).values():
+        if res["Properties"].get("ServiceRole", {}).get("Fn::GetAtt", [None])[0] == role:
+            return _project_step_name(res["Properties"]) or role
+    return role
+
+
+def assert_applies_plan(template: Template, root: TerraformRoot, repo_name: str | None = None) -> None:
+    """Plan once, check that plan, apply exactly that plan.
+
+    ``Plan-<name>`` (EC2) produces the plan artifact. ``Gate-tf-plan-check-<name>`` and the
+    construct-only ``Deploy-<name>`` read that artifact and nothing else, after the plan. Plan,
+    plan check and deploy run exactly the construct's command lists; Plan and Deploy see only the
+    root's env plus the state bucket. Only the deploy role may write or delete the state; the plan
+    role may read it and hold its lock; the plan-check role cannot reach the state bucket at all.
+
+    Other principals are read leniently (see ``_policy_principals``); managed policies attached
+    by a literal ARN (e.g. AWS-managed ``AdministratorAccess``) cannot be read and are not counted.
+
+    Note the plan artifact itself (``tfplan``, ``tfplan.json``) carries the prior state and any
+    sensitive values in clear text, and the pipeline's artifact bucket is readable by every step.
+    """
+    gates = {a["Name"]: a for a in _stage(template, "Gates")["Actions"]}
+    plan_name, check_name, deploy_name = (
+        f"Plan-{root.name}", f"Gate-tf-plan-check-{root.name}", f"Deploy-{root.name}"
+    )
+    assert plan_name in gates, f"no {plan_name} action in Gates"
+    outs = gates[plan_name].get("OutputArtifacts") or []
+    assert len(outs) == 1, f"{plan_name} produces no artifact"
+    artifact = outs[0]["Name"]
+    assert check_name in gates, f"no {check_name} action in Gates"
+    check = gates[check_name]
+    assert [i["Name"] for i in check.get("InputArtifacts", [])] == [artifact], (
+        f"{check_name} does not read exactly the plan artifact"
+    )
+    assert check["RunOrder"] > gates[plan_name]["RunOrder"], f"{check_name} does not wait for the plan"
+
+    source_artifact = _stage(template, "Source")["Actions"][0]["OutputArtifacts"][0]["Name"]
+    plan_reads = [i["Name"] for i in gates[plan_name].get("InputArtifacts", [])]
+    assert plan_reads == [source_artifact], f"{plan_name} reads {plan_reads}, not the source checkout"
+
+    deploys = {a["Name"]: a for a in _stage(template, "Deploy")["Actions"]}
+    assert deploy_name in deploys, f"no {deploy_name} action in Deploy"
+    for name_, action_ in ((plan_name, gates[plan_name]), (check_name, check), (deploy_name, deploys[deploy_name])):
+        assert not action_.get("Configuration", {}).get("EnvironmentVariables"), (
+            f"{name_} sets action-level environment variables"
+        )
+    reads = [i["Name"] for i in deploys[deploy_name].get("InputArtifacts", [])]
+    assert reads == [artifact], f"{deploy_name} reads {reads}: it must read the plan artifact only"
+
+    for step in (plan_name, deploy_name):
+        env = _project_of(template, step)["Environment"]
+        assert env["Type"] == "LINUX_CONTAINER" and env["Image"] == EC2_IMAGE.image_id, (
+            f"{step} is not on EC2: Terraform must not be killed by Lambda's 15-minute limit"
+        )
+
+    # Exact command lists: nothing added, removed or reordered.
+    def exact(step: str, bodies: list[list[str]], artifacts: dict | None = None) -> None:
+        spec = _step_buildspec(template, step)
+        rest = {k: v for k, v in spec.items() if k not in ("version", "phases")}
+        assert rest == ({"artifacts": artifacts} if artifacts else {}), (
+            f"{step} buildspec has more than the build commands: {sorted(rest)}"
+        )
+        assert set(spec["phases"]) == {"build"}, f"{step} buildspec has phases besides build"
+        assert set(spec["phases"]["build"]) == {"commands"}, f"{step} build phase has extra settings"
+        assert spec["phases"]["build"]["commands"] in bodies, (
+            f"{step} runs more or other than the construct's commands"
+        )
+
+    tf_preludes = [
+        [*python_prelude(ec2=True), *terraform_prelude(v)] for v in TERRAFORM_LINUX_SHA256
+    ]
+    # The plan's output is the whole checkout (relative module paths) plus the saved plan.
+    exact(plan_name, [[*p, *plan_commands(root)] for p in tf_preludes],
+          artifacts={"base-directory": ".", "files": "**/*"})
+    exact(deploy_name, [[*p, *apply_commands(root)] for p in tf_preludes])
+    exact(check_name, [[*python_prelude(), f"pip install {TF_CHECKOV}",
+                        *plan_check_commands(root, root.path)]])
+
+    # Environment: the root's env plus the state bucket, nothing else.
+    bucket_lid, _ = _state_bucket(template, repo_name)
+    for step in (plan_name, deploy_name):
+        env = _env_of(template, step)
+        expected = {k: ("PLAINTEXT", v) for k, v in root.environment.items()}
+        bucket = env.pop("TF_STATE_BUCKET", None)
+        assert bucket is not None, f"{step} has no TF_STATE_BUCKET"
+        assert bucket[1] == {"Ref": bucket_lid}, f"{step} points TF_STATE_BUCKET elsewhere"
+        assert env == expected, f"{step} environment differs from the root's: {env}"
+    assert _env_of(template, check_name) == {"CI": ("PLAINTEXT", "true")}, (
+        f"{check_name} has environment variables besides CI=true"
+    )
+
+    # IAM, as IAM evaluates it (case-insensitive actions, wildcards, literal or GetAtt ARNs).
+    bucket_lid, bucket = _state_bucket(template, repo_name)
+    props = bucket.get("Properties") or {}
+    the_bucket = _state_targets(bucket_lid, props, None)
+    state = [_state_targets(bucket_lid, props, root.state_key)]
+    # The bucket, the state object and its lock: a pattern like bucket/main/* must count as
+    # reaching state, so concrete objects are the targets, never a "bucket/*" pattern.
+    whole = [the_bucket, *state, _state_targets(bucket_lid, props, root.state_key + ".tflock")]
+    roles = {step: _role_of(template, step) for step in (plan_name, check_name, deploy_name)}
+    assert _grants(template, roles[deploy_name], "s3:PutObject", state), (
+        f"{deploy_name} cannot write the state"
+    )
+    # Only the deploy role may write state or change the bucket. Its own role is read strictly
+    # above; every other principal the template's IAM reaches is read leniently.
+    for action in ("s3:PutObject", "s3:DeleteObject", "s3:DeleteObjectVersion"):
+        for pid in _principals_granting(template, action, state):
+            assert pid == roles[deploy_name], (
+                f"{_step_of_role(template, pid)} can write the Terraform state ({action})"
+            )
+    for action in _BUCKET_ADMIN:
+        for pid in _principals_granting(template, action, [the_bucket]):
+            assert pid == roles[deploy_name], (
+                f"{_step_of_role(template, pid)} can change the Terraform state bucket ({action})"
+            )
+    for role in (roles[plan_name], roles[check_name]):
+        _role_policy_statements(template, {role})  # strict: no managed policies, no Not*
+    for action in ("s3:GetObject", "s3:ListBucket"):
+        assert not _grants(template, roles[check_name], action, whole), (
+            f"{check_name} can reach the state bucket"
+        )
+
+
+#: Bucket-level actions that could weaken the state bucket (open it, stop versioning, expire
+#: state, delete it); no role but the deploy role may hold them.
+_BUCKET_ADMIN = (
+    "s3:PutBucketPolicy", "s3:DeleteBucketPolicy", "s3:PutBucketVersioning",
+    "s3:PutLifecycleConfiguration", "s3:PutBucketPublicAccessBlock", "s3:PutBucketAcl",
+    "s3:PutEncryptionConfiguration", "s3:DeleteBucket",
+)
+
+
 def assert_no_pipeline_triggers(template: Template) -> None:
     """A pull-request trigger would run self-mutation from a PR branch before any approval.
     CloudFormation spells the key 'PullRequest', so check for no triggers at all."""
@@ -573,17 +1114,28 @@ def assert_source(
 def assert_artifact_bucket(template: Template, name: str) -> None:
     """A '...-{account}-{region}-an' name needs the account-regional namespace; a literal
     BucketName fails to create (found on a real deploy attempt)."""
-    buckets = [
+    prefixed = [
         r["Properties"]
         for r in template.find_resources("AWS::S3::Bucket").values()
-        if "BucketNamePrefix" in r["Properties"]
+        if "BucketNamePrefix" in (r.get("Properties") or {})
     ]
+    # Every house-named bucket (the artifact bucket, a Terraform state bucket) must be in the
+    # account-regional namespace and private.
+    for b in prefixed:
+        assert "BucketName" not in b, f"{b['BucketNamePrefix']} uses a literal BucketName"
+        assert b.get("BucketNamespace") == "account-regional", (
+            f"{b['BucketNamePrefix']} is not in the account-regional namespace"
+        )
+        assert b.get("PublicAccessBlockConfiguration", {}).get("BlockPublicAcls") in (True, "true"), (
+            f"{b['BucketNamePrefix']} allows public access"
+        )
+    expected = artifact_bucket_purpose(name)
+    buckets = [b for b in prefixed if b["BucketNamePrefix"] == expected]
     assert len(buckets) == 1, (
-        f"expected one prefixed artifact bucket, found {len(buckets)}"
+        f"expected one artifact bucket with prefix {expected!r}, found {len(buckets)}"
     )
     props = buckets[0]
     assert "BucketName" not in props, "artifact bucket uses a literal BucketName"
-    expected = artifact_bucket_purpose(name)
     assert props["BucketNamePrefix"] == expected, (
         f"unexpected bucket prefix {props['BucketNamePrefix']!r}, expected {expected!r}"
     )
@@ -729,6 +1281,7 @@ def assert_standard_contract(
     assembly: Assembly | None = None,
     deploy_step: DeployStep | None = None,
     post_deploy: Sequence[PostDeployStep] = (),
+    terraform: TerraformRoot | None = None,
 ) -> None:
     """Every invariant a StandardPipeline must satisfy. Repo-specific checks go alongside.
 
@@ -759,10 +1312,19 @@ def assert_standard_contract(
         if pr_on_ec2 and pull_request_checks and g.runs_on_pull_requests:
             expected_ec2.add(f"{name}-pr-{g.name}")
     declared = {f"Post-{step.name}" for step in post_deploy}
+    # Pipeline steps only (a PR check of a repo named "Post-..." is not one), found both by the
+    # project's description and by the pipeline's own action names, which a description edit
+    # cannot hide.
     present = {
         n
         for r in projects(template).values()
-        if (n := _project_step_name(r["Properties"])) and n.startswith("Post-")
+        if str(r["Properties"].get("Description", "")).startswith("Pipeline step ")
+        and (n := _project_step_name(r["Properties"])).startswith("Post-")
+    } | {
+        a["Name"]
+        for st in pipeline(template).get("Stages", [])
+        for a in st.get("Actions", [])
+        if a["Name"].startswith("Post-")
     }
     # an undeclared post-deploy step would skip its runtime and compute checks
     assert present <= declared, (
@@ -780,6 +1342,10 @@ def assert_standard_contract(
             Runtime.NODE if builds_from_assembly else deploy_step.runtime
         )
         runtimes[f"PreDeploy-{deploy_step.name}"] = deploy_step.runtime
+    if terraform is not None:
+        expected_ec2 |= {f"Plan-{terraform.name}", f"Deploy-{terraform.name}"}
+        runtimes[f"Plan-{terraform.name}"] = Runtime.TERRAFORM
+        runtimes[f"Deploy-{terraform.name}"] = Runtime.TERRAFORM
     if deploy_step is not None and deploy_step.ec2 is not None:
         expected_ec2.add(f"Deploy-{deploy_step.name}")
         pre = f"PreDeploy-{deploy_step.name}"
@@ -788,7 +1354,13 @@ def assert_standard_contract(
     assert_lambda_compute(template, expected_ec2, runtimes, pr_prefix=name)
     assert_ci_env_on_repo_command_projects(template)
     assert_stage_order(template, deploy_stage)
-    assert_gates_present(template, gates)
+    checked_gates = list(gates)
+    if terraform is not None:
+        # The construct's plan check reads the plan artifact, like an assembly gate.
+        checked_gates.append(
+            Gate(f"tf-plan-check-{terraform.name}", ["true"], uses_assembly=True)
+        )
+    assert_gates_present(template, checked_gates)
     assert_deploy_ordering(template, deploy_stage, require_approval=require_approval)
     if deploy_enabled:
         assert_deploy_open(template)
@@ -806,6 +1378,10 @@ def assert_standard_contract(
             "PR-check projects exist but pull_request_checks is off"
         )
     assert_gates_have_node(gates, node_gates)
+    if terraform is not None:
+        assert_applies_plan(template, terraform, name)
+        assert_state_bucket(template, name)
+        builds_once = False if builds_once is None else builds_once
     if builds_once is None:
         builds_once = bool(_assembly_actions(template)) or any(g.uses_assembly for g in gates)
     if builds_once:
@@ -814,6 +1390,7 @@ def assert_standard_contract(
 
 __all__ = [
     "CDK_INTERNAL_WILDCARDS",
+    "assert_applies_plan",
     "assert_artifact_bucket",
     "assert_builds_once",
     "assert_ci_env_on_repo_command_projects",
@@ -831,6 +1408,7 @@ __all__ = [
     "assert_source",
     "assert_stage_order",
     "assert_standard_contract",
+    "assert_state_bucket",
     "pipeline",
     "pr_projects",
     "projects",

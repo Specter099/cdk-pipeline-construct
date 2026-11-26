@@ -417,3 +417,21 @@ def test_gates_and_pr_checks_get_a_non_default_terraform_version(monkeypatch):
         spec = json.loads(prs[name]["Properties"]["Source"]["BuildSpec"])
         cmds = spec["phases"]["build"]["commands"]
         assert want in cmds and not any(DEFAULT_TERRAFORM_VERSION in x for x in cmds), name
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+def test_the_tf_json_check_fails_closed_without_find(tmp_path):
+    (ckv,) = [g for g in terraform_gates(roots=["infra"]) if g.name == "tf-checkov"]
+    (tmp_path / "w" / "infra").mkdir(parents=True)
+    (tmp_path / "home").mkdir()
+    bin_ = _fake_checkov(tmp_path, "Passed checks: 1", 0)
+    # a PATH holding only the fake checkov and the few tools the gate needs, but no find
+    nofind = tmp_path / "nofind"
+    nofind.mkdir()
+    for tool in ("cat", "grep", "head", "test"):
+        if shutil.which(tool):
+            (nofind / tool).symlink_to(shutil.which(tool))
+    env = {"PATH": f"{bin_}:{nofind}", "HOME": str(tmp_path / "home")}
+    r = subprocess.run([shutil.which("bash"), "-ec", "\n".join(ckv.commands)], check=False,
+                       cwd=tmp_path / "w", capture_output=True, text=True, env=env)
+    assert r.returncode != 0 and "find is not installed" in r.stdout

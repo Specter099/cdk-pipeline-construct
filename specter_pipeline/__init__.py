@@ -4,6 +4,7 @@ from .gate import Assembly, DeployStep, Gate, PostDeployStep
 from .pipeline import StandardPipeline, artifact_bucket_purpose
 from .pull_request import PullRequestChecks
 from .runtimes import Runtime
+from .terraform import TerraformRoot
 
 __all__ = [
     "Assembly",
@@ -15,5 +16,6 @@ __all__ = [
     "PullRequestChecks",
     "Runtime",
     "StandardPipeline",
+    "TerraformRoot",
     "artifact_bucket_purpose",
 ]

@@ -242,3 +242,50 @@ def test_failures_say_which_root_and_where_to_look(tpl):
                if "EventPattern" in r["Properties"] and "'github'" in r["Properties"]["Description"]]
     template = rule["Targets"][0]["InputTransformer"]["InputTemplate"]
     assert "'github'" in template and "<detail-build-status>" in template and "<detail-build-id>" in template
+
+
+# --- PR #8 verification follow-ups (A, B): rules that never fire, extra project settings ------
+
+
+def _failure_rules(res):
+    return _rules(res, lambda p: "EventPattern" in p)
+
+
+def _schedule_rules(res):
+    return _rules(res, lambda p: "ScheduleExpression" in p)
+
+
+def _drop_topic_policy(res):
+    for k in [k for k, r in res.items() if r["Type"] == "AWS::SNS::TopicPolicy"]:
+        res.pop(k)
+
+
+@pytest.mark.parametrize(
+    "change,message",
+    [
+        (lambda r: [p["EventPattern"].__setitem__("source", ["aws.codepipeline"]) for p in _failure_rules(r)],
+         "failures are not published"),
+        (lambda r: [p["EventPattern"].__setitem__("detail-type", ["x"]) for p in _failure_rules(r)],
+         "failures are not published"),
+        (lambda r: [p["EventPattern"]["detail"].__setitem__("never", ["x"]) for p in _failure_rules(r)],
+         "failures are not published"),
+        (lambda r: [p["EventPattern"].__setitem__("account", ["111122223333"]) for p in _failure_rules(r)],
+         "failures are not published"),
+        (lambda r: [p.__setitem__("EventBusName", "custom") for p in _failure_rules(r)],
+         "failures are not published"),
+        (_drop_topic_policy, "failures are not published"),
+        (lambda r: [p.__setitem__("EventBusName", "custom") for p in _schedule_rules(r)],
+         "not started by a schedule"),
+        (lambda r: [t.pop("RoleArn") for p in _schedule_rules(r) for t in p["Targets"]],
+         "not started by a schedule"),
+        (lambda r: _drift(r).__setitem__("SecondarySources", [{"Type": "GITHUB", "Location": "x"}]),
+         "project settings the construct does not set"),
+        (lambda r: _drift(r).__setitem__("BuildBatchConfig", {}), "project settings the construct does not set"),
+        (lambda r: _drift(r)["Source"].__setitem__("GitSubmodulesConfig", {"FetchSubmodules": True}),
+         "source settings the construct does not set"),
+    ],
+)
+def test_rules_that_never_fire_and_extra_settings_are_caught(change, message):
+    with pytest.raises(AssertionError, match=message):
+        c.assert_standard_contract(mutated(change), post_deploy=[POST], repo=REPO, gates=GATES,
+                                   terraform=ROOTS, drift=True)

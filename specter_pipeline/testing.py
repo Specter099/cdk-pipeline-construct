@@ -1207,6 +1207,14 @@ def _drift_project(template: Template, root: TerraformRoot, repo_name: str | Non
     return found[0]
 
 
+#: The settings of a drift project, as the construct writes them (no secondary sources, no
+#: batch builds, no VPC).
+_DRIFT_PROJECT_KEYS = frozenset({
+    "Artifacts", "Cache", "Description", "EncryptionKey", "Environment", "Name", "ServiceRole",
+    "Source", "SourceVersion", "TimeoutInMinutes", "Triggers",
+})
+
+
 def assert_drift_checks(
     template: Template,
     roots: Sequence[TerraformRoot],
@@ -1224,15 +1232,29 @@ def assert_drift_checks(
     enabled = {k: p for k, p in rules.items() if p.get("State", "ENABLED") == "ENABLED"}
     scheduled = {
         json.dumps(tg["Arn"])
-        for p in enabled.values() if p.get("ScheduleExpression")
+        for p in enabled.values() if p.get("ScheduleExpression") and "EventBusName" not in p
         for tg in p.get("Targets", [])
+        if tg.get("RoleArn")  # EventBridge needs a role to start a CodeBuild build
     }
-    topics = set(template.find_resources("AWS::SNS::Topic"))
+    # Rules on the default bus only, so they see CodeBuild's events and fire on a schedule.
+    enabled = {k: p for k, p in enabled.items() if "EventBusName" not in p}
+    # A topic EventBridge may publish to: its policy lets events.amazonaws.com sns:Publish.
+    topics = {
+        pp.get("Topics", [{}])[0].get("Ref")
+        for pol in template.find_resources("AWS::SNS::TopicPolicy").values()
+        if (pp := pol.get("Properties") or {})
+        for st in _as_list(pp.get("PolicyDocument", {}).get("Statement", []))
+        if st.get("Effect") == "Allow"
+        and st.get("Principal") == {"Service": "events.amazonaws.com"}
+        and "sns:Publish" in _as_list(st.get("Action"))
+    }
     failure_rules = [
         p for p in enabled.values()
-        if {"FAILED", "STOPPED"} <= set(
-            p.get("EventPattern", {}).get("detail", {}).get("build-status", [])
-        )
+        if set(p.get("EventPattern", {})) == {"source", "detail-type", "detail"}
+        and p["EventPattern"]["source"] == ["aws.codebuild"]
+        and p["EventPattern"]["detail-type"] == ["CodeBuild Build State Change"]
+        and set(p["EventPattern"]["detail"]) == {"build-status", "project-name"}
+        and {"FAILED", "STOPPED"} <= set(p["EventPattern"]["detail"]["build-status"])
         and any(tg.get("Arn", {}).get("Ref") in topics for tg in p.get("Targets", []))
     ]
     connection = _stage(template, "Source")["Actions"][0]["Configuration"].get("ConnectionArn")
@@ -1276,7 +1298,11 @@ def assert_drift_checks(
         assert variables == want, (
             f"drift check {root.name} environment differs from the root's: {variables}"
         )
+        extra = set(props) - _DRIFT_PROJECT_KEYS
+        assert not extra, f"drift check {root.name} has project settings the construct does not set: {sorted(extra)}"
         source = props.get("Source", {})
+        extra = set(source) - {"Auth", "BuildSpec", "Location", "ReportBuildStatus", "Type"}
+        assert not extra, f"drift check {root.name} has source settings the construct does not set: {sorted(extra)}"
         assert source.get("Type") == "GITHUB" and source.get("Auth") == {
             "Type": "CODECONNECTIONS", "Resource": connection
         }, f"drift check {root.name} does not check out through the pipeline's connection"

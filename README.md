@@ -356,7 +356,8 @@ CodeBuild project per root, started by an EventBridge schedule:
     approval that changes a root output or adds a `moved` block also exits 2.
   * A check that runs while `Deploy-<root>` applies compares half-applied infrastructure with the
     state from before the apply. Schedule the check away from release times.
-* One schedule rule per root, so there is no limit on the number of roots.
+* Each root gets its own schedule rule (an EventBridge rule takes at most 5 targets) and its own
+  failure rule, so the drift checks use two of the account's EventBridge rules per root.
 * It runs on EC2 with the root's plan permissions, read-only access to its state object (no lock),
   and the root's provider secrets. It has no state write and no deploy rights.
 * Like `Plan-<root>`, it runs the branch's code with those credentials before anyone approves a

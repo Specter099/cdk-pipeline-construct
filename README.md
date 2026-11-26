@@ -159,6 +159,31 @@ GATES = python_cdk_gates(env={"JSII_SILENCE_WARNING_UNTESTED_NODE_VERSION": "1"}
   GitHub write token; PR checks report a commit status per gate instead), CI log shipping
   (CodeBuild already writes every build to CloudWatch Logs).
 
+## Terraform: static checks on every pull request
+
+Step 2 of the Terraform pipeline. A Terraform repo's pipeline is still defined in CDK; these gates
+check its root modules without AWS access, so they run on pull requests too.
+
+```python
+from specter_pipeline.presets import terraform_gates
+GATES = terraform_gates(roots=["infra"])   # tf-fmt, tf-validate, tf-checkov
+```
+
+* `Runtime.TERRAFORM` is the Python image plus Terraform 1.17.2. The binary is downloaded from
+  releases.hashicorp.com and checked against a committed SHA-256. That hash was copied from the
+  release's `SHA256SUMS` after verifying the file's signature with HashiCorp's release key
+  (C874 011F 0AB4 0511 0D02 1055 3436 5D94 72D7 468F). An unknown version is refused.
+  `StandardPipeline(terraform_version=...)` picks among committed versions.
+* `tf-fmt` runs `fmt -check -recursive`. `tf-validate` runs `init -backend=false -lockfile=readonly`
+  and then `validate`, so it never reads state. The root must commit `.terraform.lock.hcl`, and
+  providers must match its hashes; `init` still downloads them from the public registry.
+* `tf-checkov` runs pinned Checkov with its built-in policies, offline.
+* TFLint is opt-in (`tflint=(version, sha256)`), because its releases are on GitHub and no hash has
+  been verified for this package yet. Trivy, in the original plan, is not included for the same
+  reason.
+* None of these gates has AWS permissions, and the contract's PR-role check proves it on the
+  synthesized pipeline. Plan and apply, with state and credentials, come in step 3, on EC2 compute.
+
 ## Contract tests: `specter_pipeline.testing`
 
 Every consumer must prove the same things about its pipeline. Instead of copying a test file:

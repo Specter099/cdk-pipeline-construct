@@ -826,3 +826,113 @@ def test_the_full_contract_survives_a_bare_bucket():
     def change(res):
         res["Bare"] = {"Type": "AWS::S3::Bucket"}
     c.assert_standard_contract(mutated(change), post_deploy=[POST], repo=REPO, gates=GATES, terraform=ROOT)
+
+
+# --- step 3, round 6: CDK-written managed ARNs, unknowns never excuse, digit account slot -----
+
+
+def _stack_with(extra):
+    """The Terraform pipeline plus whatever ``extra(stack)`` adds, through the public API."""
+    import aws_cdk as cdk
+    from test_pipeline import CONN, ENV
+
+    from specter_pipeline import StandardPipeline
+
+    app = cdk.App()
+    stack = cdk.Stack(app, "PipelineStack", env=ENV)
+    StandardPipeline(stack, "P", repo=REPO, connection_arn=CONN, gates=GATES, terraform=ROOT,
+                     synth_commands=["cdk -a 'python3 pipeline_app.py' synth"],
+                     synth_install=["pip install -r requirements.txt"], post_deploy=[POST])
+    extra(stack)
+    return Template.from_stack(stack)
+
+
+def _lambda(stack):
+    from aws_cdk import aws_lambda as lambda_
+
+    lambda_.Function(stack, "F", runtime=lambda_.Runtime.PYTHON_3_12, handler="i.h",
+                     code=lambda_.Code.from_inline("def h(e, c): pass"))
+
+
+def _managed_role(stack):
+    iam.Role(stack, "R", assumed_by=iam.ServicePrincipal("lambda.amazonaws.com"), managed_policies=[
+        iam.ManagedPolicy.from_aws_managed_policy_name("ReadOnlyAccess"),
+        iam.ManagedPolicy.from_managed_policy_name(stack, "Mine", "team-policy")])
+
+
+def _auto_delete(stack):
+    import aws_cdk as cdk
+    from aws_cdk import aws_s3 as s3
+
+    s3.Bucket(stack, "Site", removal_policy=cdk.RemovalPolicy.DESTROY, auto_delete_objects=True)
+
+
+def _custom_resource(stack):
+    from aws_cdk import custom_resources as cr
+
+    cr.AwsCustomResource(stack, "CR", on_create=cr.AwsSdkCall(
+        service="STS", action="getCallerIdentity", physical_resource_id=cr.PhysicalResourceId.of("x")),
+        policy=cr.AwsCustomResourcePolicy.from_sdk_calls(resources=cr.AwsCustomResourcePolicy.ANY_RESOURCE))
+
+
+@pytest.mark.parametrize("extra", [_lambda, _managed_role, _auto_delete, _custom_resource],
+                         ids=["lambda", "managed-role", "auto-delete-bucket", "custom-resource"])
+def test_ordinary_cdk_constructs_beside_the_pipeline_pass(extra):
+    t = _stack_with(extra)
+    c.assert_standard_contract(t, post_deploy=[POST], repo=REPO, gates=GATES, terraform=ROOT)
+
+
+def _queue(res):
+    _add(res, "Q", "AWS::SQS::Queue", {})
+
+
+@pytest.mark.parametrize(
+    "stmts",
+    [
+        lambda res: [{"Effect": "Allow", "Action": "s3:*", "Resource": "*"},
+                     {"Effect": "Deny", "Action": "s3:*", "Resource": {"Fn::GetAtt": ["Q", "Arn"]}}],
+        lambda res: [{"Effect": "Allow", "Action": "s3:*", "Resource": "*"},
+                     {"Effect": "Deny", "Action": "s3:*", "Resource": {"Fn::Sub": "${Q.Arn}"}}],
+        lambda res: [{"Effect": "Allow", "Action": "s3:*", "Resource": "*"},
+                     {"Effect": "Deny", "Action": "s3:*", "Resource": {"Fn::If": ["C", "*", "x"]}}],
+        lambda res: [{"Effect": "Allow", "Action": "s3:*", "Resource": "*"},
+                     {"Effect": "Deny", "Action": "s3:*", "Resource": {"Ref": "NoDefault"}}],
+        lambda res: [{"Effect": "Allow", "Action": "*", "NotResource": {"Fn::GetAtt": ["Q", "Arn"]}}],
+        lambda res: [{"Effect": "Allow", "Action": "*", "NotResource": {"Fn::If": ["C", "*", "x"]}}],
+    ],
+    ids=["deny-other-resource", "deny-sub", "deny-if", "deny-param", "not-resource-other", "not-resource-if"],
+)
+def test_an_unreadable_deny_or_not_resource_never_excuses_a_state_write(stmts):
+    doc = copy.deepcopy(tf_build().to_json())
+    res = doc["Resources"]
+    _queue(res)
+    _other_role(res, Policies=[{"PolicyName": "p", "PolicyDocument": _doc(*stmts(res))}])
+    doc.setdefault("Parameters", {})["NoDefault"] = {"Type": "String"}
+    with pytest.raises(AssertionError, match="OtherRole can"):
+        c.assert_applies_plan(Template.from_json(doc), ROOT)
+
+
+def test_a_deny_in_an_unrelated_managed_policy_is_not_borrowed():
+    def change(res):
+        _add(res, "DenyAll", "AWS::IAM::ManagedPolicy", {"PolicyDocument": _doc(
+            {"Effect": "Deny", "Action": "s3:*", "Resource": "*"})})
+        _other_role(res, ManagedPolicyArns=[{"Fn::ImportValue": "SomePolicyArn"}],
+                    Policies=[{"PolicyName": "p", "PolicyDocument": _doc(_put(_state_object(res)))}])
+    with pytest.raises(AssertionError, match="OtherRole can write the Terraform state"):
+        c.assert_applies_plan(mutated(change), ROOT)
+
+
+def test_an_account_prefixed_bucket_is_not_the_state_bucket():
+    def change(res):
+        _other_role(res, Policies=[{"PolicyName": "p", "PolicyDocument": _doc(_put(
+            {"Fn::Join": ["", ["arn:aws:s3:::", {"Ref": "AWS::AccountId"}, "-site/*"]]}))}])
+    c.assert_applies_plan(mutated(change), ROOT)
+
+
+def test_an_ssm_parameter_is_read_as_unknown():
+    doc = copy.deepcopy(tf_build().to_json())
+    _other_role(doc["Resources"], Policies=[{"PolicyName": "p", "PolicyDocument": _doc(_put({"Ref": "X"}))}])
+    doc.setdefault("Parameters", {})["X"] = {"Type": "AWS::SSM::Parameter::Value<String>",
+                                             "Default": "/config/bucket-arn"}
+    with pytest.raises(AssertionError, match="OtherRole can write the Terraform state"):
+        c.assert_applies_plan(Template.from_json(doc), ROOT)

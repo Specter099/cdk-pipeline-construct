@@ -261,7 +261,10 @@ Deploy: Approve -> Deploy-main (EC2: terraform apply tfplan) -> post-deploy step
     template, is read leniently. That covers inline and managed policies of the template,
     `RolePolicy`/`UserPolicy`/`GroupPolicy`, `NotAction`/`NotResource`, explicit denies, and
     `Fn::Sub`/`Fn::Join`/parameter defaults. A construction it cannot read (an `Fn::If`, an unknown
-    intrinsic) counts as reaching the state.
+    intrinsic, a parameter without a default or read from SSM) counts as reaching the state, and
+    never as a Deny or `NotResource` that excludes it. So a grant on
+    `Bucket.from_bucket_arn(CfnParameter)` with no default fails the contract: give the parameter
+    a default, or keep such grants out of the pipeline stack.
   * Only the Deploy role may write the state or change the bucket (policy, versioning,
     lifecycle, public access, encryption, deletion).
   * **Not covered:** managed policies attached by a literal ARN (AWS-managed ones such as

@@ -555,35 +555,48 @@ class _Ctx:
     def __init__(self, template: Template) -> None:
         doc = template.to_json()
         self.distinct = frozenset(template.find_resources("AWS::S3::Bucket"))
+        # a parameter is its default; without one, or when it names an SSM path (the value is
+        # read at deploy time), it is unknown
         self.params = {
-            k: (v.get("Default") if isinstance(v, dict) and isinstance(v.get("Default"), str) else "*")
+            k: (v.get("Default")
+                if isinstance(v, dict) and isinstance(v.get("Default"), str)
+                and not str(v.get("Type", "")).startswith("AWS::SSM::")
+                else None)
             for k, v in doc.get("Parameters", {}).items()
         }
 
 
-def _sub_text(body: str, variables: dict, ctx: _Ctx) -> str:
+#: What an unreadable value renders as when the question is "does this surely cover the
+#: resource?" (a Deny, a NotResource): it matches nothing, so the unknown never excuses.
+_NOTHING = "\x00"
+
+
+def _sub_text(body: str, variables: dict, ctx: _Ctx, unknown: str = "*") -> str:
     def one(m: re.Match) -> str:
         name = m.group(1)
         if name.startswith("!"):
             return "${" + name[1:] + "}"
         if name in variables:
-            return _resource_text(variables[name], ctx)
+            return _resource_text(variables[name], ctx, unknown)
         lid, _, attr = name.partition(".")
         if lid in ctx.distinct:
             return f"<{lid}.{attr}>" if attr else f"<{lid}>"
         if not attr and lid in ctx.params:
-            return ctx.params[lid]
-        return "*"
+            return ctx.params[lid] if ctx.params[lid] is not None else unknown
+        if lid.startswith("AWS::") and unknown == "*":
+            return "*"
+        return unknown
 
     return re.sub(r"\$\{([^}]*)\}", one, body)
 
 
-def _resource_text(resource, ctx: _Ctx | None = None) -> str:
+def _resource_text(resource, ctx: _Ctx | None = None, unknown: str = "*") -> str:
     """An IAM resource as a pattern. A Ref/GetAtt of a known bucket and an ``Fn::ImportValue``
     (another stack's export, never this stack's state bucket) stay ``<...>`` placeholders that
     match only themselves; a template parameter becomes its default (``*`` without one);
     ``Fn::Join`` and ``Fn::Sub`` are rendered; pseudo parameters and any other intrinsic become
-    ``*``, so an unrecognised construction fails closed (counts as a match)."""
+    ``unknown`` (``*`` by default), so an unrecognised construction fails closed: it counts as a
+    match for an Allow, and with ``unknown=_NOTHING`` as no match for a Deny or NotResource."""
     ctx = ctx or _EMPTY_CTX
     if isinstance(resource, str):
         return resource
@@ -591,22 +604,25 @@ def _resource_text(resource, ctx: _Ctx | None = None) -> str:
         if "Fn::Join" in resource:
             sep, parts = resource["Fn::Join"]
             if isinstance(sep, str) and isinstance(parts, list):
-                return sep.join(_resource_text(p, ctx) for p in parts)
+                return sep.join(_resource_text(p, ctx, unknown) for p in parts)
         if "Fn::Sub" in resource:
             sub = resource["Fn::Sub"]
             if isinstance(sub, str):
-                return _sub_text(sub, {}, ctx)
+                return _sub_text(sub, {}, ctx, unknown)
             if isinstance(sub, list) and len(sub) == 2 and isinstance(sub[0], str) and isinstance(sub[1], dict):
-                return _sub_text(sub[0], sub[1], ctx)
+                return _sub_text(sub[0], sub[1], ctx, unknown)
         if "Fn::GetAtt" in resource and resource["Fn::GetAtt"][0] in ctx.distinct:
             return "<" + ".".join(resource["Fn::GetAtt"]) + ">"
         if "Ref" in resource and resource["Ref"] in ctx.distinct:
             return "<" + resource["Ref"] + ">"
         if "Ref" in resource and resource["Ref"] in ctx.params:
-            return ctx.params[resource["Ref"]]
+            value = ctx.params[resource["Ref"]]
+            return value if value is not None else unknown
+        if "Ref" in resource and str(resource["Ref"]).startswith("AWS::") and unknown == "*":
+            return "*"
         if "Fn::ImportValue" in resource:
             return "<import:" + json.dumps(resource["Fn::ImportValue"], sort_keys=True) + ">"
-    return "*"
+    return unknown
 
 
 class _EmptyCtx(_Ctx):
@@ -617,8 +633,10 @@ class _EmptyCtx(_Ctx):
 _EMPTY_CTX = _EmptyCtx()
 
 
-#: In a target form: any run of characters within one ARN segment (no ":" or "/").
+#: In a target form: any run of characters within one ARN segment (no ":" or "/"), and one
+#: digit (a slot of the 12-digit account number).
 _SEG = "\x01"
+_DIGIT = "\x02"
 
 
 def _globs_meet(a: str, b: str) -> bool:
@@ -626,7 +644,7 @@ def _globs_meet(a: str, b: str) -> bool:
     ``_SEG`` any run without ":" or "/" (IAM patterns use the first two; target forms all three)."""
 
     def can(tok: str, c: str) -> bool:  # whether a non-star token can produce character c
-        return tok in ("?", c)
+        return tok in ("?", c) or (tok == _DIGIT and c.isdigit())
 
     seen: set[tuple[int, int]] = set()
     stack = [(0, 0)]
@@ -646,8 +664,8 @@ def _globs_meet(a: str, b: str) -> bool:
         if i == len(a) or j == len(b):
             continue
         # produce one character both sides accept
-        lits = [t for t in (a[i], b[j]) if t not in ("*", _SEG, "?")]
-        c = lits[0] if lits else "x"
+        lits = [t for t in (a[i], b[j]) if t not in ("*", _SEG, "?", _DIGIT)]
+        c = lits[0] if lits else ("0" if _DIGIT in (a[i], b[j]) else "x")
         ok_a = (a[i] == "*") or (a[i] == _SEG and c not in ":/") or can(a[i], c)
         ok_b = (b[j] == "*") or (b[j] == _SEG and c not in ":/") or can(b[j], c)
         if ok_a and ok_b:
@@ -684,7 +702,7 @@ def _statement_allows(stmt, action: str, forms: list[str], ctx: _Ctx) -> bool:
         return False
     if "NotResource" in stmt:
         # excluded only if an exclusion surely covers the resource
-        return not any(_covers(_resource_text(r, ctx), forms) for r in _as_list(stmt["NotResource"])
+        return not any(_covers(_resource_text(r, ctx, _NOTHING), forms) for r in _as_list(stmt["NotResource"])
                        if isinstance(r, str | dict))
     return any(_globs_meet(f, _resource_text(r, ctx)) for r in _as_list(stmt.get("Resource", [])) for f in forms)
 
@@ -698,7 +716,7 @@ def _statement_denies(stmt, action: str, forms: list[str], ctx: _Ctx) -> bool:
     actions = _as_list(stmt.get("Action", []))
     if not all(isinstance(v, str) for v in actions) or not _matches_action(action.lower(), actions):
         return False
-    return any(isinstance(r, str | dict) and _covers(_resource_text(r, ctx), forms)
+    return any(isinstance(r, str | dict) and _covers(_resource_text(r, ctx, _NOTHING), forms)
                for r in _as_list(stmt.get("Resource", [])))
 
 
@@ -725,6 +743,9 @@ def _grants(template: Template, role: str, action: str, targets) -> bool:
     stmts = [st for _, st in _role_policy_statements(template, {role})]
     return _allows(stmts, action, _resources(targets), _Ctx(template))
 
+
+#: A managed policy ARN from outside the template (any partition and account, any path).
+_MANAGED_ARN = re.compile(r"arn:[^:/]+:iam::[^:/]*:policy/[^*]+")
 
 _PRINCIPALS = {"Roles": ("AWS::IAM::Role", "RoleName"), "Users": ("AWS::IAM::User", "UserName"),
                "Groups": ("AWS::IAM::Group", "GroupName")}
@@ -795,8 +816,6 @@ def _policy_principals(template: Template) -> list[tuple[str, list]]:
     for kind, (cfn, _) in _PRINCIPALS.items():
         for pid, res in template.find_resources(cfn).items():
             for arn in _as_list((res.get("Properties", {}) or {}).get("ManagedPolicyArns", [])):
-                if isinstance(arn, str):
-                    continue
                 mid = None
                 if isinstance(arn, dict) and set(arn) == {"Ref"}:
                     mid = arn["Ref"]
@@ -807,11 +826,17 @@ def _policy_principals(template: Template) -> list[tuple[str, list]]:
                     mid = m.group(1) if m else None
                 if mid in managed:
                     found[pid].extend(managed[mid])
-                else:
-                    for stmts in managed.values():
-                        found[pid].extend(stmts)
-                    if not managed:
-                        found[pid].append(None)
+                    continue
+                # A policy ARN, literal or built the way CDK writes AWS-managed ones
+                # (Join/Sub with the partition), is from outside the template: unreadable.
+                if _MANAGED_ARN.fullmatch(_resource_text(arn)):
+                    continue
+                # Anything else may be any template managed policy: take their Allows (never
+                # their Denies, which may not apply), or an unknown statement if there are none.
+                for stmts in managed.values():
+                    found[pid].extend(st for st in stmts if not (isinstance(st, dict) and st.get("Effect") == "Deny"))
+                if not managed:
+                    found[pid].append(None)
     return sorted(found.items())
 
 
@@ -831,7 +856,7 @@ def _state_targets(bucket_lid: str, props: dict, key: str | None) -> list[str]:
     bases = [
         f"<{bucket_lid}.Arn>",
         f"arn:{_SEG}:s3:::<{bucket_lid}>",
-        f"arn:{_SEG}:s3:::{prefix}-????????????-{_SEG}-an",
+        f"arn:{_SEG}:s3:::{prefix}-{_DIGIT * 12}-{_SEG}-an",
     ]
     return [b if key is None else f"{b}/{key}" for b in bases]
 

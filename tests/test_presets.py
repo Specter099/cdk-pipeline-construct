@@ -5,7 +5,7 @@ import subprocess
 
 import pytest
 from aws_cdk import aws_iam as iam
-from test_pipeline import _step_build
+from test_pipeline import POST, _step_build
 
 from specter_pipeline import Gate, Runtime
 from specter_pipeline import presets as p
@@ -119,8 +119,7 @@ def _preset_pipeline():
 
 def test_pipeline_with_the_preset_satisfies_the_standard_contract():
     t = _preset_pipeline()
-    c.assert_standard_contract(
-        t,
+    c.assert_standard_contract(t, post_deploy=[POST],
         repo="Specter099/demo",
         gates=python_cdk_gates(env={"X": "1"}),
         node_gates=["tests", "cdk-synth", "access-analyzer"],

@@ -36,6 +36,14 @@ GATES = [
 ]
 
 
+# the default post-deploy step; contract calls on build() templates declare it as post_deploy=[POST]
+POST = PostDeployStep(
+    "frontend",
+    ["npm run build"],
+    policy_statements=[iam.PolicyStatement(actions=["s3:PutObject"], resources=["arn:aws:s3:::b/*"])],
+)
+
+
 def build(**overrides) -> Template:
     app = cdk.App()
     stack = cdk.Stack(app, "PipelineStack", env=ENV)
@@ -46,17 +54,7 @@ def build(**overrides) -> Template:
         "gates": GATES,
         "synth_commands": ["cdk -a 'python3 pipeline_app.py' synth"],
         "synth_install": ["pip install -r requirements.txt"],
-        "post_deploy": [
-            PostDeployStep(
-                "frontend",
-                ["npm run build"],
-                policy_statements=[
-                    iam.PolicyStatement(
-                        actions=["s3:PutObject"], resources=["arn:aws:s3:::b/*"]
-                    )
-                ],
-            )
-        ],
+        "post_deploy": [POST],
     }
     kwargs.update(overrides)
     StandardPipeline(stack, "P", **kwargs)

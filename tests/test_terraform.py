@@ -6,7 +6,7 @@ import subprocess
 import zipfile
 
 import pytest
-from test_pipeline import build
+from test_pipeline import POST, build
 
 from specter_pipeline import DeployStep, Ec2, Gate, Runtime
 from specter_pipeline import testing as c
@@ -158,7 +158,7 @@ def tpl():
 
 
 def test_the_pipeline_satisfies_the_standard_contract(tpl):
-    c.assert_standard_contract(tpl, repo=REPO, gates=terraform_gates())
+    c.assert_standard_contract(tpl, post_deploy=[POST], repo=REPO, gates=terraform_gates())
 
 
 def test_every_terraform_gate_has_a_pr_check_with_no_aws_access(tpl):
@@ -183,7 +183,7 @@ def test_a_terraform_gate_can_move_to_ec2():
     slow = Gate("tf-big", ["terraform -chdir=. validate"], Runtime.TERRAFORM, ec2=Ec2("medium", 45))
     gates = [*terraform_gates(), slow]
     t = tf_build(gates)
-    c.assert_standard_contract(t, repo=REPO, gates=gates)
+    c.assert_standard_contract(t, post_deploy=[POST], repo=REPO, gates=gates)
     assert "terraform version" in c.step_commands(t, "Gate-tf-big")
 
 
@@ -316,7 +316,7 @@ def test_a_lambda_terraform_gate_with_its_download_swapped_fails_the_contract():
             ]
             r["Properties"]["Source"]["BuildSpec"] = json.dumps(spec)
     with pytest.raises(AssertionError, match="pinned TERRAFORM toolchain"):
-        c.assert_standard_contract(Template.from_json(doc), repo=REPO, gates=terraform_gates())
+        c.assert_standard_contract(Template.from_json(doc), post_deploy=[POST], repo=REPO, gates=terraform_gates())
 
 
 
@@ -373,3 +373,47 @@ def test_unquoted_shell_syntax_in_the_deploy_command_is_refused(tail):
     from specter_pipeline.gate import deploy_command, split_deploy_command
 
     assert split_deploy_command(deploy_command(["A"], []) + tail) is None
+
+
+# --- third round: repo-wide .tf.json, registry ports, non-default versions everywhere ----------
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+@pytest.mark.parametrize("where", ["modules/net/main.tf.json", "infra/.terraform/m/x.tf.json",
+                                   "infra/sub/.terraform/x.tf.json", "linked"])
+def test_tf_json_anywhere_in_the_repo_is_refused(tmp_path, where):
+    (ckv,) = [g for g in terraform_gates(roots=["infra"]) if g.name == "tf-checkov"]
+    w = tmp_path / "w"
+    (w / "infra").mkdir(parents=True)
+    if where == "linked":
+        (tmp_path / "outside").mkdir()
+        (tmp_path / "outside" / "main.tf.json").write_text("{}")
+        (w / "infra" / "mod").symlink_to(tmp_path / "outside")
+    else:
+        (w / where).parent.mkdir(parents=True, exist_ok=True)
+        (w / where).write_text("{}")
+    (tmp_path / "home").mkdir()
+    r = _run(ckv.commands, w, _fake_checkov(tmp_path, "Passed checks: 1", 0), home=tmp_path / "home")
+    assert r.returncode != 0 and ".tf.json" in r.stdout
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+def test_a_lock_entry_for_a_registry_with_a_port_is_accepted(tmp_path):
+    (validate,) = [g for g in terraform_gates() if g.name == "tf-validate"]
+    lock = 'provider "tf.example.com:8443/a/b" {\n  version = "1"\n  hashes = [\n    "h1:x",\n  ]\n}\n'
+    (tmp_path / ".terraform.lock.hcl").write_text(lock)
+    r = _run(validate.commands[:2], tmp_path, "")
+    assert r.returncode == 0, r.stdout + r.stderr
+
+
+def test_gates_and_pr_checks_get_a_non_default_terraform_version(monkeypatch):
+    monkeypatch.setitem(TERRAFORM_LINUX_SHA256, "9.9.9", {"amd64": "9" * 64, "arm64": "8" * 64})
+    t = tf_build(terraform_gates(), terraform_version="9.9.9")
+    want = f'echo "{"9" * 64}  /tmp/terraform.zip" | sha256sum -c -'
+    for gate in ("tf-fmt", "tf-validate"):  # tf-checkov is Python only: it installs no Terraform
+        assert want in c.step_commands(t, f"Gate-{gate}"), gate
+    prs = {r["Properties"]["Name"]: r for r in c.pr_projects(t, "demo").values()}
+    for name in ("demo-pr-tf-fmt", "demo-pr-tf-validate"):
+        spec = json.loads(prs[name]["Properties"]["Source"]["BuildSpec"])
+        cmds = spec["phases"]["build"]["commands"]
+        assert want in cmds and not any(DEFAULT_TERRAFORM_VERSION in x for x in cmds), name

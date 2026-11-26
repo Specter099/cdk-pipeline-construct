@@ -1,7 +1,7 @@
 """The reusable contract helpers pass on good pipelines and FAIL on each violation they claim to catch."""
 
 import pytest
-from test_pipeline import CONN, GATES, _step_build, build
+from test_pipeline import CONN, GATES, POST, _step_build, build
 
 from specter_pipeline import testing as c
 
@@ -13,7 +13,7 @@ def _contract(template, **kw):
     kw.setdefault("repo", REPO)
     kw.setdefault("gates", GATES)
     kw.setdefault("node_gates", NODE_GATES)
-    c.assert_standard_contract(template, **kw)
+    c.assert_standard_contract(template, post_deploy=[POST], **kw)
 
 
 # --- passes ------------------------------------------------------------------------
@@ -124,3 +124,10 @@ def test_step_commands_returns_the_commands_of_the_project_behind_a_step():
     assert c.step_commands(t, "Gate-synth-check")[-1] == "cdk synth"
     with pytest.raises(AssertionError, match="no CodeBuild project"):
         c.step_commands(t, "Nope")
+
+
+def test_catches_a_post_deploy_step_the_caller_did_not_declare():
+    tpl = build()
+    # an undeclared step would skip its runtime and compute checks
+    with pytest.raises(AssertionError, match=r"Post-frontend.*not passed as post_deploy="):
+        c.assert_standard_contract(tpl, repo=REPO, gates=GATES, node_gates=NODE_GATES)

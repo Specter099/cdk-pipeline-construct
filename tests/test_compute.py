@@ -9,7 +9,7 @@ import subprocess
 import pytest
 from aws_cdk.assertions import Template
 from test_assembly import ASM_GATES, asm_build
-from test_pipeline import GATES, build
+from test_pipeline import GATES, POST, build
 
 from specter_pipeline import Assembly, DeployStep, Ec2, Gate, PostDeployStep, Runtime
 from specter_pipeline import testing as c
@@ -133,7 +133,7 @@ def test_ec2_uses_the_amazon_linux_2023_6_image():
 
 def test_contract_infers_ec2_gates():
     t = build(gates=[*GATES, TF])
-    c.assert_standard_contract(t, repo=REPO, gates=[*GATES, TF], deploy_stage="Prod", node_gates=NODE_GATES)
+    c.assert_standard_contract(t, post_deploy=[POST], repo=REPO, gates=[*GATES, TF], deploy_stage="Prod", node_gates=NODE_GATES)
 
 
 def test_an_undeclared_ec2_step_fails_the_contract():
@@ -176,7 +176,7 @@ def test_a_legacy_deploy_step_on_ec2():
         deploy_step=DeployStep("app", ["cdk deploy AppStack --require-approval never"], ec2=Ec2("small", 120)),
     )
     assert project(t, "Deploy-app")["TimeoutInMinutes"] == 120
-    c.assert_standard_contract(t, repo=REPO, gates=GATES, node_gates=NODE_GATES, ec2_steps=["Deploy-app"])
+    c.assert_standard_contract(t, post_deploy=[POST], repo=REPO, gates=GATES, node_gates=NODE_GATES, ec2_steps=["Deploy-app"])
 
 
 def test_the_construct_only_deploy_and_the_assembly_on_ec2():
@@ -191,7 +191,7 @@ def test_the_construct_only_deploy_and_the_assembly_on_ec2():
     # the assembly gate's PR check synthesizes, so it follows the assembly onto EC2
     assert project(t, "demo-pr-scan")["Environment"]["Type"] == "LINUX_CONTAINER"
     # inferred from the steps: no ec2_steps needed
-    c.assert_standard_contract(t, repo=REPO, gates=ASM_GATES, node_gates=NODE_GATES,
+    c.assert_standard_contract(t, post_deploy=[POST], repo=REPO, gates=ASM_GATES, node_gates=NODE_GATES,
                                assembly=asm, deploy_step=deploy)
 
 
@@ -290,7 +290,7 @@ def test_ec2_steps_with_cdk_tokens_in_their_commands_pass_the_contract():
     post = PostDeployStep("frontend", [f"aws s3 sync dist s3://{tok}"], ec2=Ec2("small", 30))
     t = build(gates=[*GATES, gate], post_deploy=[post])
     assert isinstance(project(t, "Gate-tokgate")["Source"]["BuildSpec"], dict)
-    c.assert_standard_contract(t, repo=REPO, gates=[*GATES, gate], deploy_stage="Prod",
+    c.assert_standard_contract(t, post_deploy=[POST], repo=REPO, gates=[*GATES, gate], deploy_stage="Prod",
                                node_gates=NODE_GATES, ec2_steps=["Post-frontend"])
 
 
@@ -310,7 +310,7 @@ def test_pre_deploy_on_ec2_is_inferred_from_the_template():
     deploy = DeployStep("app", ["./migrate.sh"], stacks=["AppStack"], ec2=Ec2("small", 60))
     t = asm_build(deploy_step=deploy)
     # assembly= not passed: the PreDeploy action is still found
-    c.assert_standard_contract(t, repo=REPO, gates=ASM_GATES, node_gates=NODE_GATES, deploy_step=deploy)
+    c.assert_standard_contract(t, post_deploy=[POST], repo=REPO, gates=ASM_GATES, node_gates=NODE_GATES, deploy_step=deploy)
 
 
 def test_a_deploy_step_on_ec2_moves_its_pre_deploy_action_too_and_the_contract_knows():
@@ -318,7 +318,7 @@ def test_a_deploy_step_on_ec2_moves_its_pre_deploy_action_too_and_the_contract_k
     deploy = DeployStep("app", ["./migrate.sh"], stacks=["AppStack"], ec2=Ec2("small", 240))
     t = asm_build(assembly=asm, deploy_step=deploy)
     assert project(t, "PreDeploy-app")["Environment"]["Type"] == "LINUX_CONTAINER"
-    c.assert_standard_contract(t, repo=REPO, gates=ASM_GATES, node_gates=NODE_GATES,
+    c.assert_standard_contract(t, post_deploy=[POST], repo=REPO, gates=ASM_GATES, node_gates=NODE_GATES,
                                assembly=asm, deploy_step=deploy)
 
 
@@ -381,7 +381,7 @@ def _drop(pred):
 def test_a_two_runtime_step_missing_half_its_toolchain_fails_the_contract(edit, step):
     t = _edit_cmds(build(gates=PN_GATES), step, edit)
     with pytest.raises(AssertionError, match="toolchain"):
-        c.assert_standard_contract(t, repo=REPO, gates=PN_GATES, deploy_stage="Prod", node_gates=[*NODE_GATES, "pn"])
+        c.assert_standard_contract(t, post_deploy=[POST], repo=REPO, gates=PN_GATES, deploy_stage="Prod", node_gates=[*NODE_GATES, "pn"])
 
 
 def test_without_known_runtimes_stray_toolchain_after_the_prelude_fails():
@@ -420,7 +420,7 @@ def test_assert_builds_once_reads_token_buildspecs():
     deploy = DeployStep("app", [f"echo {tok}"], stacks=["AppStack"])
     scan = Gate("scan", [f"ls cdk.out && echo {tok}"], uses_assembly=True)
     t = asm_build(deploy_step=deploy, gates=[*GATES, scan])
-    c.assert_standard_contract(t, repo=REPO, gates=[*GATES, scan], node_gates=NODE_GATES,
+    c.assert_standard_contract(t, post_deploy=[POST], repo=REPO, gates=[*GATES, scan], node_gates=NODE_GATES,
                                deploy_step=deploy)
 
 
@@ -445,7 +445,7 @@ def test_a_token_in_the_construct_deploy_buildspec_is_read():
                         deploy_args=["--context", f"k={cdk.Fn.import_value('X')}"])
     t = asm_build(deploy_step=deploy)
     assert isinstance(project(t, "Deploy-app")["Source"]["BuildSpec"], dict)
-    c.assert_standard_contract(t, repo=REPO, gates=ASM_GATES, node_gates=NODE_GATES, deploy_step=deploy)
+    c.assert_standard_contract(t, post_deploy=[POST], repo=REPO, gates=ASM_GATES, node_gates=NODE_GATES, deploy_step=deploy)
 
 
 @pytest.mark.parametrize("props", [{"Source": {"BuildSpec": {"Fn::Join": [1, ["a"]]}}},

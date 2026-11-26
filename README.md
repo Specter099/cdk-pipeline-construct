@@ -178,13 +178,16 @@ GATES = terraform_gates(roots=["infra"])   # tf-fmt, tf-validate, tf-checkov
 * `tf-validate` runs `init -backend=false -lockfile=readonly` and then `validate`, so it never reads
   state. The root must commit `.terraform.lock.hcl` (an empty file if it has no providers), and
   every provider in it must list hashes: `init` would otherwise install an unhashed provider as
-  "unauthenticated". A committed `terraform.d/` or `.terraform/` is refused, because it could supply
+  "unauthenticated". The lock file must keep the layout `terraform init` writes: unindented
+  `provider "host[:port]/namespace/name" {` blocks, a `hashes = [` list with at least one entry,
+  no comments and no other syntax. Regenerate it with `terraform providers lock` rather than
+  editing it by hand; anything else is refused, so a comment cannot hide a missing hash. A committed `terraform.d/` or `.terraform/` is refused, because it could supply
   provider binaries.
 * `tf-checkov` runs pinned Checkov with its built-in policies, `--skip-download` (no platform calls)
   and `--hard-fail-on 'CKV*'`. A `.checkov.yaml` or `.checkov.yml` in the root, the working
   directory or `$HOME` is refused, because such a file can switch the gate off. A missing root, a
-  file Checkov cannot parse, or any `*.tf.json` file (Checkov 3.4.4 skips JSON configuration)
-  fails the gate. Inline `#checkov:skip=` comments still work and show
+  file Checkov cannot parse, or a `*.tf.json` file anywhere in the repository, symlinked
+  directories included (Checkov 3.4.4 skips JSON configuration), fails the gate. Inline `#checkov:skip=` comments still work and show
   in the diff.
 * TFLint is opt-in (`tflint=(version, sha256)`), because its releases are on GitHub and no hash has
   been verified for this package yet. It runs without `--init`, so only its bundled Terraform rules
@@ -210,7 +213,9 @@ def test_pipeline(template):
 ```
 
 Pass `assembly=`, `deploy_step=` and `post_deploy=` too, so that each step's expected runtime and
-compute are known and its pinned toolchain is checked exactly.
+compute are known and its pinned toolchain is checked exactly. `post_deploy=` is required whenever
+the pipeline has post-deploy steps: an undeclared `Post-*` step fails the contract instead of
+skipping its checks.
 
 It checks Lambda compute everywhere, the stage order, the gates, build-once (whenever the pipeline has an
 assembly step or a gate reads the assembly), the deploy closed (or open),

@@ -758,6 +758,17 @@ def assert_standard_contract(
         pr_on_ec2 = g.ec2 is not None or (g.uses_assembly and assembly_on_ec2)
         if pr_on_ec2 and pull_request_checks and g.runs_on_pull_requests:
             expected_ec2.add(f"{name}-pr-{g.name}")
+    declared = {f"Post-{step.name}" for step in post_deploy}
+    present = {
+        n
+        for r in projects(template).values()
+        if (n := _project_step_name(r["Properties"])) and n.startswith("Post-")
+    }
+    # an undeclared post-deploy step would skip its runtime and compute checks
+    assert present <= declared, (
+        f"post-deploy steps {sorted(present - declared)} are in the pipeline but not passed as "
+        "post_deploy=; pass them so their runtime and compute are checked"
+    )
     for step in post_deploy:
         runtimes[f"Post-{step.name}"] = step.runtime
         if step.ec2 is not None:

@@ -282,7 +282,7 @@ for n, line in enumerate(text.replace("\r\n", "\n").split("\n"), 1):
     if block is None:
         if line == "" or line.startswith("#"):
             continue
-        m = re.fullmatch(r'provider "([a-z0-9.-]+/[a-z0-9_-]+/[a-z0-9_-]+)" \{', line)
+        m = re.fullmatch(r'provider "([a-z0-9.-]+(?::[0-9]+)?/[a-z0-9_-]+/[a-z0-9_-]+)" \{', line)
         if not m:
             print(f"lock file line {n} is not what terraform init writes: {line!r}"); sys.exit(1)
         block, hashes = m.group(1), 0
@@ -346,13 +346,15 @@ def checkov_commands(raw: str, d: str, extra_args: str = "") -> list[str]:
     unparsed = shlex.quote(f"{raw}: Checkov could not parse some files")
     missing = shlex.quote(f"{raw}: no such directory")
     json_tf = shlex.quote(
-        f"{raw}: *.tf.json files are not scanned by Checkov 3.4.4; write the configuration as .tf"
+        "*.tf.json files in the repository are not scanned by Checkov 3.4.4; write them as .tf"
     )
     return [
         f"test -d {d} || {{ echo {missing}; exit 1; }}",
         # Checkov silently skips JSON configuration, so a .tf.json resource would pass unscanned.
+        # The search is repo-wide and follows symlinks: a module outside the root, a nested
+        # .terraform/ directory or a linked directory can all hold configuration Checkov loads.
         (
-            f'if [ -n "$(find {d} -name \'*.tf.json\' -not -path \'*/.terraform/*\' | head -n 1)" ]; '
+            f'if [ -n "$(find -L . -name \'*.tf.json\' -print -quit 2>/dev/null)" ]; '
             f"then echo {json_tf}; exit 1; fi"
         ),
         f'for f in {configs}; do if [ -e "$f" ]; then echo "$f:" {refuse}; exit 1; fi; done',

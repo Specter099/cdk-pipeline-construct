@@ -38,11 +38,10 @@ from .gate import (
 from .pipeline import artifact_bucket_purpose
 from .runtimes import (
     NODE_LINUX_X64_SHA256,
-    PYTHON_VERSION,
     Runtime,
     cdk_cli_install,
-    ec2_python_select,
     node_tarball_prelude,
+    prelude,
 )
 
 #: The exact actions a PR-check role may hold (measured on a synthesized pipeline): its own
@@ -166,6 +165,31 @@ def _project_step_name(props: dict) -> str:
     return str(props.get("Name", ""))
 
 
+def _construct_generated(props: dict) -> bool:
+    desc = str(props.get("Description", ""))
+    return desc.startswith(("Pipeline step ", "PR check "))
+
+
+def _buildspec_commands(props: dict) -> list[str] | None:
+    """The build-phase commands of a project's inline buildspec, or None if it has none we can
+    read. A buildspec holding CDK tokens is an Fn::Join; its non-literal parts read as TOKEN."""
+    spec = props.get("Source", {}).get("BuildSpec")
+    if isinstance(spec, dict) and "Fn::Join" in spec:
+        sep, parts = spec["Fn::Join"]
+        spec = sep.join(p if isinstance(p, str) else "TOKEN" for p in parts)
+    if not isinstance(spec, str):
+        return None
+    try:
+        cmds = json.loads(spec)["phases"]["build"]["commands"]
+    except (ValueError, KeyError, TypeError):
+        return None
+    return cmds if isinstance(cmds, list) else None
+
+
+def _ec2_preludes() -> list[list[str]]:
+    return [prelude(rt, v, ec2=True) for rt in Runtime for v in NODE_LINUX_X64_SHA256]
+
+
 def assert_lambda_compute(template: Template, ec2_steps: Iterable[str] = ()) -> None:
     """Every CodeBuild project, including CDK Pipelines' own, runs on Lambda compute, except the
     steps named in ``ec2_steps`` (pipeline step names such as ``Gate-tf-plan`` or PR-check
@@ -197,14 +221,14 @@ def assert_lambda_compute(template: Template, ec2_steps: Iterable[str] = ()) -> 
                 f"{step} on EC2 has no explicit timeout"
             )
             assert env["ComputeType"].startswith("BUILD_GENERAL1_"), f"{step} on EC2 has a Lambda size"
-            # The image's own Python is not 3.12: a venv must come from the pinned selection.
-            cmds = json.loads(props["Source"]["BuildSpec"])["phases"]["build"]["commands"]
-            venvs = [i for i, x in enumerate(cmds) if " -m venv " in x]
-            select = ec2_python_select()
-            for i in venvs:
-                assert cmds[i].startswith(f"python{PYTHON_VERSION} -m venv") and any(
-                    cmds[j : j + len(select)] == select for j in range(i)
-                ), f"{step} on EC2 builds a venv from the image's Python: {cmds[i]!r}"
+            # A project the construct generated must start with one of its own EC2 toolchain
+            # set-ups (pinned Node; Python 3.12 selected through pyenv): never the image's own.
+            if _construct_generated(props):
+                cmds = _buildspec_commands(props)
+                assert cmds is not None, f"{step}: cannot read its buildspec commands"
+                assert any(cmds[: len(p)] == p for p in _ec2_preludes()), (
+                    f"{step} on EC2 does not start with the pinned toolchain set-up: {cmds[:3]}"
+                )
             continue
         assert env["Type"] == "LINUX_LAMBDA_CONTAINER", (
             f"{logical_id} ({step}) is not on Lambda compute and is not declared in ec2_steps"
@@ -549,6 +573,10 @@ def assert_pr_checks(
             f"PR filter {pattern!r} is not anchored"
         )
         assert "PUSH" not in by_type["EVENT"], "PR checks must not fire on push"
+        assert "ConcurrentBuildLimit" not in props, (
+            "a PR check has a concurrency limit: CodeBuild drops builds over it, leaving a PR "
+            "without its status"
+        )
         policy = props["Triggers"]["PullRequestBuildPolicy"]
         assert policy["RequiresCommentApproval"] == "FORK_PULL_REQUESTS", (
             "fork PRs must need an approval comment"

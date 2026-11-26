@@ -238,8 +238,72 @@ def test_an_ec2_step_whose_venv_uses_the_image_python_fails_the_contract():
             cmds = spec["phases"]["build"]["commands"]
             spec["phases"]["build"]["commands"] = [x for x in cmds if x not in ec2_python_select()]
             r["Properties"]["Source"]["BuildSpec"] = json.dumps(spec)
-    with pytest.raises(AssertionError, match="builds a venv from the image's Python"):
+    with pytest.raises(AssertionError, match="does not start with the pinned toolchain"):
         c.assert_lambda_compute(Template.from_json(doc), ["Gate-tf-plan", "demo-pr-tf-plan"])
+
+
+def _edit_cmds(t, step, edit):
+    doc = copy.deepcopy(t.to_json())
+    for r in doc["Resources"].values():
+        if r["Type"] == "AWS::CodeBuild::Project" and c._project_step_name(r["Properties"]) == step:
+            spec = json.loads(r["Properties"]["Source"]["BuildSpec"])
+            edit(spec["phases"]["build"]["commands"])
+            r["Properties"]["Source"]["BuildSpec"] = json.dumps(spec)
+    return Template.from_json(doc)
+
+
+NODE_GATE = Gate("lint-ec2", ["npm run lint"], Runtime.NODE, ec2=Ec2())
+
+
+@pytest.mark.parametrize(
+    "gate,step,edit",
+    [
+        # (i) the image's Node instead of the pinned tarball
+        (NODE_GATE, "Gate-lint-ec2", lambda cmds: [cmds.remove(x) for x in list(cmds) if "node" in x and x != "npm run lint"]),
+        # (ii) no venv at all
+        (TF, "Gate-tf-plan", lambda cmds: [cmds.remove(x) for x in list(cmds) if "venv" in x]),
+        # (iii) another Python selected between the pin and the venv
+        (TF, "Gate-tf-plan", lambda cmds: cmds.insert(3, 'export PYENV_VERSION="$PYTHON_314_VERSION"')),
+    ],
+)
+def test_ec2_toolchain_tampering_fails_the_contract(gate, step, edit):
+    t = _edit_cmds(build(gates=[*GATES, gate]), step, edit)
+    with pytest.raises(AssertionError, match="does not start with the pinned toolchain"):
+        c.assert_lambda_compute(t, [step, f"demo-pr-{gate.name}"])
+
+
+def test_a_pr_check_with_a_concurrency_limit_fails_the_contract():
+    doc = copy.deepcopy(build(gates=[*GATES, TF]).to_json())
+    for r in doc["Resources"].values():
+        if r["Type"] == "AWS::CodeBuild::Project" and r["Properties"].get("Name") == "demo-pr-tf-plan":
+            r["Properties"]["ConcurrentBuildLimit"] = 1
+    with pytest.raises(AssertionError, match="concurrency limit"):
+        c.assert_pr_checks(Template.from_json(doc), [*GATES, TF], "demo")
+
+
+def test_ec2_steps_with_cdk_tokens_in_their_commands_pass_the_contract():
+    """Regression: a token makes the BuildSpec an Fn::Join; the contract must read it, not crash."""
+    import aws_cdk as cdk
+
+    tok = cdk.Fn.import_value("SiteBucket")
+    gate = Gate("tokgate", [f"echo {tok}"], ec2=Ec2("small", 30))
+    post = PostDeployStep("frontend", [f"aws s3 sync dist s3://{tok}"], ec2=Ec2("small", 30))
+    t = build(gates=[*GATES, gate], post_deploy=[post])
+    assert isinstance(project(t, "Gate-tokgate")["Source"]["BuildSpec"], dict)
+    c.assert_standard_contract(t, repo=REPO, gates=[*GATES, gate], deploy_stage="Prod",
+                               node_gates=NODE_GATES, ec2_steps=["Post-frontend"])
+
+
+def test_a_consumer_owned_ec2_project_is_not_held_to_the_construct_toolchain():
+
+    t0 = build()
+    doc = copy.deepcopy(t0.to_json())
+    doc["Resources"]["Mine"] = {"Type": "AWS::CodeBuild::Project", "Properties": {
+        "Name": "my-own-ec2", "Source": {"Type": "CODEPIPELINE", "BuildSpec": "buildspec.yml"},
+        "Environment": {"Type": "LINUX_CONTAINER", "Image": EC2_IMAGE.image_id,
+                        "ComputeType": "BUILD_GENERAL1_SMALL", "EnvironmentVariables": []},
+        "TimeoutInMinutes": 30, "ServiceRole": "x", "Artifacts": {"Type": "CODEPIPELINE"}}}
+    c.assert_lambda_compute(Template.from_json(doc), ["my-own-ec2"])
 
 
 def test_pre_deploy_on_ec2_is_inferred_from_the_template():

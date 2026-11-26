@@ -35,9 +35,11 @@ def test_one_drift_check_per_root_on_a_schedule(tpl):
     names = sorted(r["Properties"]["Name"] for r in c.projects(tpl).values()
                    if "-drift-" in r["Properties"].get("Name", ""))
     assert names == sorted(f"demo-drift-{r.name}" for r in ROOTS)
-    (rule,) = [r for r in tpl.find_resources("AWS::Events::Rule").values()
-               if r["Properties"].get("ScheduleExpression")]
-    assert rule["Properties"]["ScheduleExpression"] == CRON and len(rule["Properties"]["Targets"]) == 3
+    # one rule per root: an EventBridge rule takes at most 5 targets
+    rules = [r["Properties"] for r in tpl.find_resources("AWS::Events::Rule").values()
+             if r["Properties"].get("ScheduleExpression")]
+    assert len(rules) == len(ROOTS)
+    assert all(p["ScheduleExpression"] == CRON and len(p["Targets"]) == 1 for p in rules)
 
 
 def test_drift_checks_read_the_branch_with_no_webhook(tpl):

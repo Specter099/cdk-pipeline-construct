@@ -33,8 +33,9 @@ def test_pr_checks_are_least_privilege(tpl):
     c.assert_no_wildcard_resources(tpl)
 
 
-def test_only_the_smoke_check_is_on_ec2(tpl):
-    c.assert_lambda_compute(tpl, [f"{NAME_PREFIX}-pr-ec2-smoke"])
+def test_the_smoke_check_and_the_tests_are_on_ec2(tpl):
+    # the suite runs for minutes; Lambda compute would kill it at 15
+    c.assert_lambda_compute(tpl, [f"{NAME_PREFIX}-pr-ec2-smoke", f"{NAME_PREFIX}-pr-tests"])
     (smoke,) = [r["Properties"] for r in c.projects(tpl).values()
                 if r["Properties"]["Name"].endswith("-pr-ec2-smoke")]
     assert smoke["Environment"]["Image"] == EC2_IMAGE.image_id
@@ -66,3 +67,25 @@ def test_the_smoke_check_rejects_the_wrong_interpreters(tmp_path):
     assert run("3.12.15", "22.22.0") == 0
     assert run("3.14.9", "22.22.0") != 0
     assert run("3.12.15", "24.1.0") != 0
+
+
+def _install(gate_name):
+    (gate,) = [g for g in CI_GATES if g.name == gate_name]
+    return gate.install
+
+
+def test_the_audit_upgrades_the_venvs_own_pip_first():
+    install = _install("dependency-audit")
+    assert install[0] == "python -m pip install --upgrade pip"
+
+
+def test_every_gate_installs_with_the_exact_versions():
+    for gate in CI_GATES:
+        for cmd in gate.install:
+            if "requirements-dev.txt" in cmd:
+                assert "-c constraints-dev.txt" in cmd, gate.name
+
+
+def test_lint_covers_the_whole_repo():
+    (lint,) = [g for g in CI_GATES if g.name == "lint"]
+    assert lint.commands == ["ruff check ."]

@@ -289,3 +289,49 @@ def test_rules_that_never_fire_and_extra_settings_are_caught(change, message):
     with pytest.raises(AssertionError, match=message):
         c.assert_standard_contract(mutated(change), post_deploy=[POST], repo=REPO, gates=GATES,
                                    terraform=ROOTS, drift=True)
+
+
+# --- PR #9 review: no false positives on tagged stacks or minimized topic policies ------------
+
+
+def test_a_tagged_stack_passes_the_drift_contract():
+    import aws_cdk as cdk
+    from test_pipeline import CONN, ENV
+
+    from specter_pipeline import StandardPipeline
+
+    app = cdk.App()
+    cdk.Tags.of(app).add("owner", "me")
+    stack = cdk.Stack(app, "PipelineStack", env=ENV)
+    StandardPipeline(stack, "P", repo=REPO, connection_arn=CONN, gates=GATES, terraform=ROOTS,
+                     drift_schedule=CRON, synth_commands=["cdk -a 'python3 pipeline_app.py' synth"],
+                     synth_install=["pip install -r requirements.txt"], post_deploy=[POST])
+    c.assert_standard_contract(Template.from_stack(stack), post_deploy=[POST], repo=REPO, gates=GATES,
+                               terraform=ROOTS, drift=True)
+
+
+def test_a_minimized_topic_policy_passes_the_drift_contract():
+    import aws_cdk as cdk
+    from test_pipeline import CONN, ENV
+
+    from specter_pipeline import StandardPipeline
+
+    app = cdk.App(context={"@aws-cdk/aws-iam:minimizePolicies": True})
+    stack = cdk.Stack(app, "PipelineStack", env=ENV)
+    StandardPipeline(stack, "P", repo=REPO, connection_arn=CONN, gates=GATES, terraform=ROOTS,
+                     drift_schedule=CRON, synth_commands=["cdk -a 'python3 pipeline_app.py' synth"],
+                     synth_install=["pip install -r requirements.txt"], post_deploy=[POST])
+    t = Template.from_stack(stack)
+    services = [st["Principal"].get("Service") for pol in t.find_resources("AWS::SNS::TopicPolicy").values()
+                for st in pol["Properties"]["PolicyDocument"]["Statement"] if isinstance(st.get("Principal"), dict)]
+    assert any(isinstance(s, list) for s in services), services  # the shape that used to fail
+    c.assert_standard_contract(t, post_deploy=[POST], repo=REPO, gates=GATES, terraform=ROOTS, drift=True)
+
+
+def test_a_build_status_filter_that_is_not_a_plain_list_is_an_assertion():
+    def change(res):
+        for p in _failure_rules(res):
+            p["EventPattern"]["detail"]["build-status"] = [{"anything-but": ["SUCCEEDED"]}]
+    with pytest.raises(AssertionError, match="failures are not published"):
+        c.assert_standard_contract(mutated(change), post_deploy=[POST], repo=REPO, gates=GATES,
+                                   terraform=ROOTS, drift=True)

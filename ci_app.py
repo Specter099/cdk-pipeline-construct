@@ -25,7 +25,8 @@ LibraryCiStack(
         account=app.node.try_get_context("account") or os.environ.get("CDK_DEFAULT_ACCOUNT"),
         region=app.node.try_get_context("region") or os.environ.get("CDK_DEFAULT_REGION"),
     ),
-    # No assets, so no dependency on CDK bootstrap resources.
+    # No assets, so no bootstrap bucket or ECR repository; CloudFormation still deploys through
+    # the account's CDK bootstrap roles, so the account must be bootstrapped.
     synthesizer=cdk.BootstraplessSynthesizer(),
 )
 app.synth()

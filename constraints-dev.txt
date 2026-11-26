@@ -1,0 +1,15 @@
+# Exact versions for CI (pip install -r requirements-dev.txt -c constraints-dev.txt), so a new
+# release cannot turn unrelated PRs red: the tests compare synthesized templates exactly.
+# Raise them in a PR of their own.
+aws-cdk-lib==2.278.0
+aws-cdk.asset-awscli-v1==2.2.297
+aws-cdk.asset-node-proxy-agent-v6==2.1.3
+aws-cdk.cloud-assembly-schema==55.7.0
+constructs==10.8.1
+jsii==1.143.0
+publication==0.0.3
+typeguard==2.13.3
+attrs==26.1.0
+cattrs==26.2.1
+pytest==9.2.0
+ruff==0.17.6

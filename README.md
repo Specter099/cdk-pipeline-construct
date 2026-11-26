@@ -452,14 +452,27 @@ Gate("tf-plan", ["terraform plan -out=tfplan"], ec2=Ec2(size="medium", timeout_m
 
 `ci_app.py` deploys the library's own `PullRequestChecks` for this repo. Every PR gets four commit
 statuses:
-* `lint`: ruff;
-* `tests`: pytest, on Python+Node because the tests import `aws_cdk`;
-* `dependency-audit`: pinned pip-audit;
+* `lint`: ruff over the whole repo;
+* `tests`: pytest, on Python+Node because the tests import `aws_cdk`, on EC2 (30 minutes): the
+  suite synthesizes hundreds of pipelines and would come close to Lambda's 15-minute limit;
+* `dependency-audit`: pinned pip-audit, after upgrading the venv's own pip;
 * `ec2-smoke`: on EC2, the live check that the Amazon Linux 2023 standard 6.0 image gives Python
   3.12 (selected through pyenv) and the pinned Node 22.
 
+The checks install from `requirements-dev.txt` with the exact versions in `constraints-dev.txt`,
+so a new CDK release cannot turn unrelated PRs red; raise them in a PR of their own.
+
 Nothing is deployed by the checks, and their roles hold only logs and the connection token.
-Deploy it once:
+* `lint`, `tests` and `dependency-audit` run the PR's code (its requirements, its package build,
+  its tests) with that token, which reaches every repository the GitHub connection's app is
+  installed on. PRs from forks wait for a maintainer's approval comment: before approving, read
+  the PR's changes to `requirements-dev.txt`, `constraints-dev.txt`, `pyproject.toml` and the
+  tests. A connection whose app is installed on this repository only would narrow the token.
+* The checks are deployed from `main`. A PR that changes `ci/ci_stack.py` is still checked by the
+  deployed projects until someone redeploys after the merge.
+
+Deploy it once, into a CDK-bootstrapped account (the stack has no assets, but CloudFormation
+deploys it through the bootstrap roles):
 
 ```bash
 cdk -a "python3 ci_app.py" deploy -c connection_arn=<the SpecterGitHubConnection ARN>
@@ -469,8 +482,8 @@ cdk -a "python3 ci_app.py" deploy -c connection_arn=<the SpecterGitHubConnection
 
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements-dev.txt
-ruff check specter_pipeline tests
+pip install -r requirements-dev.txt -c constraints-dev.txt
+ruff check .
 JSII_RUNTIME_PACKAGE_CACHE_ROOT=$TMPDIR/jsii-cache pytest -q   # env var only needed in a sandbox
 ```
 

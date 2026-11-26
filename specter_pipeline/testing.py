@@ -1211,7 +1211,7 @@ def _drift_project(template: Template, root: TerraformRoot, repo_name: str | Non
 #: batch builds, no VPC).
 _DRIFT_PROJECT_KEYS = frozenset({
     "Artifacts", "Cache", "Description", "EncryptionKey", "Environment", "Name", "ServiceRole",
-    "Source", "SourceVersion", "TimeoutInMinutes", "Triggers",
+    "Source", "SourceVersion", "TimeoutInMinutes", "Triggers", "Tags",
 })
 
 
@@ -1245,7 +1245,9 @@ def assert_drift_checks(
         if (pp := pol.get("Properties") or {})
         for st in _as_list(pp.get("PolicyDocument", {}).get("Statement", []))
         if st.get("Effect") == "Allow"
-        and st.get("Principal") == {"Service": "events.amazonaws.com"}
+        and isinstance(st.get("Principal"), dict)
+        # one service, or a list of them (as CDK writes it under minimizePolicies)
+        and "events.amazonaws.com" in _as_list(st["Principal"].get("Service"))
         and "sns:Publish" in _as_list(st.get("Action"))
     }
     failure_rules = [
@@ -1254,7 +1256,9 @@ def assert_drift_checks(
         and p["EventPattern"]["source"] == ["aws.codebuild"]
         and p["EventPattern"]["detail-type"] == ["CodeBuild Build State Change"]
         and set(p["EventPattern"]["detail"]) == {"build-status", "project-name"}
-        and {"FAILED", "STOPPED"} <= set(p["EventPattern"]["detail"]["build-status"])
+        and {"FAILED", "STOPPED"} <= {
+            v for v in _as_list(p["EventPattern"]["detail"]["build-status"]) if isinstance(v, str)
+        }
         and any(tg.get("Arn", {}).get("Ref") in topics for tg in p.get("Targets", []))
     ]
     connection = _stage(template, "Source")["Actions"][0]["Configuration"].get("ConnectionArn")

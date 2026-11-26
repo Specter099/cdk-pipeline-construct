@@ -18,17 +18,20 @@ from specter_pipeline.presets import PIP_AUDIT
 
 REPO = "Specter099/cdk-pipeline-construct"
 NAME_PREFIX = "cdk-pipeline-construct"
-DEV_INSTALL = ["pip install -r requirements-dev.txt"]
+DEV_INSTALL = ["pip install -r requirements-dev.txt -c constraints-dev.txt"]
 
 CI_GATES = [
-    Gate("lint", ["ruff check specter_pipeline tests ci"], Runtime.PYTHON, install=DEV_INSTALL),
-    # The tests import aws_cdk, whose jsii runtime needs Node.
-    Gate("tests", ["pytest -q"], Runtime.PYTHON_NODE, install=DEV_INSTALL, memory_gb=4),
+    Gate("lint", ["ruff check ."], Runtime.PYTHON, install=DEV_INSTALL),
+    # The tests import aws_cdk, whose jsii runtime needs Node. On EC2: the suite synthesizes
+    # hundreds of pipelines and takes minutes; Lambda compute would kill it at 15.
+    Gate("tests", ["pytest -q"], Runtime.PYTHON_NODE, install=DEV_INSTALL, ec2=Ec2("medium", 30)),
     Gate(
         "dependency-audit",
         ["pip-audit --skip-editable"],
         Runtime.PYTHON,
-        install=[*DEV_INSTALL, f"pip install {PIP_AUDIT}"],
+        # pip-audit audits the whole venv, pip included: the pip that venv bundles has known
+        # advisories, so bring it up to date first.
+        install=["python -m pip install --upgrade pip", *DEV_INSTALL, f"pip install {PIP_AUDIT}"],
     ),
     Gate(
         "ec2-smoke",

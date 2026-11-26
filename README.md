@@ -327,6 +327,21 @@ StandardPipeline(..., gates=terraform_gates(roots=["network", "github"]), terraf
   root's own Plan and Deploy can read its state or touch its lock, and that only the roots
   declaring a secret can read it, with no wider secret grant on those roles.
 
+## Terraform: drift detection
+
+Step 5. `StandardPipeline(..., terraform=ROOTS, drift_schedule="cron(17 6 * * ? *)")` adds one
+CodeBuild project per root, started by an EventBridge schedule:
+
+* It checks out the pipeline's branch through the shared GitHub connection, with no webhook, and
+  initialises against the state bucket, with the same backend guard as Plan.
+* It then runs `terraform plan -refresh-only -detailed-exitcode -lock=false`. Exit 2 means the real
+  infrastructure differs from the state: the build fails and says so. `-lock=false` means a drift
+  check never blocks a release.
+* Failed drift builds are published to the pipeline's notification topic.
+* It runs on EC2 with the root's plan permissions, read-only access to its state object (no lock),
+  and the root's provider secrets. It has no state write and no deploy rights.
+* Pass `drift=True` to `assert_standard_contract` to check all of this, via `assert_drift_checks`.
+
 ## Contract tests: `specter_pipeline.testing`
 
 Every consumer must prove the same things about its pipeline. Instead of copying a test file:

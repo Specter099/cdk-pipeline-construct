@@ -26,6 +26,7 @@ from aws_cdk import aws_codebuild as codebuild
 from aws_cdk.assertions import Template
 
 from .compute import EC2_IMAGE
+from .drift import drift_commands
 from .gate import (
     Assembly,
     DeployStep,
@@ -204,8 +205,8 @@ def _construct_generated(props: dict, pr_prefix: str | None = None) -> bool:
     if str(props.get("Description", "")).startswith("Pipeline step "):
         return True
     if pr_prefix is not None:
-        return str(props.get("Name", "")).startswith(f"{pr_prefix}-pr-")
-    return str(props.get("Description", "")).startswith("PR check ")
+        return str(props.get("Name", "")).startswith((f"{pr_prefix}-pr-", f"{pr_prefix}-drift-"))
+    return str(props.get("Description", "")).startswith(("PR check ", "Terraform drift check "))
 
 
 def _buildspec_commands(props: dict) -> list[str] | None:
@@ -997,6 +998,7 @@ def assert_applies_plan(
     root: TerraformRoot,
     repo_name: str | None = None,
     roots: Sequence[TerraformRoot] | None = None,
+    drift: bool = False,
 ) -> None:
     """Plan once, check that plan, apply exactly that plan.
 
@@ -1119,22 +1121,33 @@ def assert_applies_plan(
     # This root's state and lock: only its own Plan and Deploy may read the state or touch the
     # lock (another root's roles, a gate or an unrelated role may not).
     own = {roles[plan_name], roles[deploy_name]}
+
+    def readers(r: TerraformRoot) -> set[str]:
+        """The roles that may read a root's state and secrets: its Plan and Deploy, and its
+        drift check when there is one (which never takes the lock)."""
+        found = {_role_of(template, f"Plan-{r.name}"), _role_of(template, f"Deploy-{r.name}")}
+        if drift:
+            found.add(_drift_project(template, r)["ServiceRole"]["Fn::GetAtt"][0])
+        return found
+
     lock = [_state_targets(bucket_lid, props, root.state_key + ".tflock")]
-    for action, targets, what in (
-        ("s3:GetObject", state, "read"),
-        ("s3:GetObject", lock, "read the lock of"),
-        ("s3:PutObject", lock, "take the lock of"),
-        ("s3:DeleteObject", lock, "release the lock of"),
+    for action, targets, what, allowed_ in (
+        ("s3:GetObject", state, "read", readers(root)),
+        ("s3:GetObject", lock, "read the lock of", own),
+        ("s3:PutObject", lock, "take the lock of", own),
+        ("s3:DeleteObject", lock, "release the lock of", own),
     ):
         for pid in _principals_granting(template, action, targets):
-            assert pid in own, f"{_step_of_role(template, pid)} can {what} {root.name}'s Terraform state"
+            assert pid in allowed_, (
+                f"{_step_of_role(template, pid)} can {what} {root.name}'s Terraform state"
+            )
 
     # The root's provider secrets: readable by the Plan and Deploy of every root that declares
     # the secret (roots may share one), by no other principal. Like the state sweep: those
     # roles strictly, every other principal leniently.
     ctx = _Ctx(template)
     bases = sorted({secret_base_arn(a) for a in root.secrets.values()})
-    for role in own:
+    for role in sorted(readers(root)):
         # exactly these secrets: no wider grant (such as "<arn>*") that also reaches them
         for _, st in _role_policy_statements(template, {role}):
             if not isinstance(st, dict) or st.get("Effect", "Allow") != "Allow":
@@ -1148,12 +1161,11 @@ def assert_applies_plan(
                     f"{root.name}'s own: {text}"
                 )
     for secret in bases:
-        allowed = set(own)
+        allowed = set(readers(root))
         for other in roots or [root]:
             if secret in {secret_base_arn(a) for a in other.secrets.values()}:
-                allowed |= {_role_of(template, f"Plan-{other.name}"),
-                            _role_of(template, f"Deploy-{other.name}")}
-        for role in sorted(own):
+                allowed |= readers(other)
+        for role in sorted(readers(root)):
             assert _grants(template, role, "secretsmanager:GetSecretValue", secret), (
                 f"{role} cannot read the secret {secret}"
             )
@@ -1167,6 +1179,72 @@ def _roots(terraform) -> list[TerraformRoot]:
     if terraform is None:
         return []
     return [terraform] if isinstance(terraform, TerraformRoot) else list(terraform)
+
+
+def _drift_project(template: Template, root: TerraformRoot) -> dict:
+    found = [
+        r["Properties"] for r in projects(template).values()
+        if str(r["Properties"].get("Name", "")).endswith(f"-drift-{root.name}")
+    ]
+    assert len(found) == 1, f"expected one drift project for {root.name}, found {len(found)}"
+    return found[0]
+
+
+def assert_drift_checks(template: Template, roots: Sequence[TerraformRoot], repo_name: str) -> None:
+    """Each root has a scheduled, read-only drift check: EC2 with the pinned Terraform set-up and
+    exactly the construct's drift commands, no webhook, started by a schedule rule, failures
+    published to SNS, and a role that can read the state but not write it or take the lock."""
+    rules = template.find_resources("AWS::Events::Rule")
+    scheduled = {
+        json.dumps(tg["Arn"])
+        for r in rules.values() if r["Properties"].get("ScheduleExpression")
+        for tg in r["Properties"].get("Targets", [])
+    }
+    failure_rules = [
+        r for r in rules.values()
+        if "FAILED" in json.dumps(r["Properties"].get("EventPattern", {}))
+    ]
+    bucket_lid, bucket = _state_bucket(template, repo_name)
+    for root in roots:
+        props = _drift_project(template, root)
+        lid = next(
+            k for k, r in projects(template).items()
+            if r["Properties"].get("Name") == props.get("Name")
+        )
+        env = props["Environment"]
+        assert env["Type"] == "LINUX_CONTAINER" and env["Image"] == EC2_IMAGE.image_id, (
+            f"drift check {root.name} is not on EC2"
+        )
+        assert props.get("Triggers", {}).get("Webhook") in (None, False) and not props.get(
+            "Triggers", {}
+        ).get("FilterGroups"), f"drift check {root.name} has a webhook"
+        cmds = _buildspec_commands(props)
+        expected = [
+            [*python_prelude(ec2=True), *terraform_prelude(v), *drift_commands(root)]
+            for v in TERRAFORM_LINUX_SHA256
+        ]
+        assert cmds in expected, f"drift check {root.name} runs more or other than the drift commands"
+        spec = _read_buildspec(props) or {}
+        rest = {k: v for k, v in spec.items() if k not in ("version", "phases")}
+        assert rest == secrets_buildspec(root), (
+            f"drift check {root.name} buildspec has more than its commands and secrets: {sorted(rest)}"
+        )
+        assert not any(
+            v.get("Type") == "SECRETS_MANAGER" for v in env.get("EnvironmentVariables", [])
+        ), f"drift check {root.name} passes secrets as project variables (CDK grants <arn>*)"
+        assert json.dumps({"Fn::GetAtt": [lid, "Arn"]}) in scheduled, (
+            f"drift check {root.name} is not started by a schedule"
+        )
+        assert any(lid in json.dumps(r["Properties"].get("EventPattern", {})) for r in failure_rules), (
+            f"drift check {root.name} failures are not published"
+        )
+        role = props["ServiceRole"]["Fn::GetAtt"][0]
+        state = _state_targets(bucket_lid, bucket["Properties"], root.state_key)
+        lock = _state_targets(bucket_lid, bucket["Properties"], root.state_key + ".tflock")
+        for action in ("s3:PutObject", "s3:DeleteObject"):
+            assert not _grants(template, role, action, state + lock), (
+                f"drift check {root.name} can write the state or its lock"
+            )
 
 
 def assert_terraform_order(
@@ -1398,6 +1476,7 @@ def assert_standard_contract(
     deploy_step: DeployStep | None = None,
     post_deploy: Sequence[PostDeployStep] = (),
     terraform: TerraformRoot | Sequence[TerraformRoot] | None = None,
+    drift: bool = False,
 ) -> None:
     """Every invariant a StandardPipeline must satisfy. Repo-specific checks go alongside.
 
@@ -1459,6 +1538,9 @@ def assert_standard_contract(
         )
         runtimes[f"PreDeploy-{deploy_step.name}"] = deploy_step.runtime
     for root in _roots(terraform):
+        if drift:
+            expected_ec2.add(f"{name}-drift-{root.name}")
+            runtimes[f"{name}-drift-{root.name}"] = Runtime.TERRAFORM
         expected_ec2 |= {f"Plan-{root.name}", f"Deploy-{root.name}"}
         runtimes[f"Plan-{root.name}"] = Runtime.TERRAFORM
         runtimes[f"Deploy-{root.name}"] = Runtime.TERRAFORM
@@ -1494,7 +1576,9 @@ def assert_standard_contract(
         )
     assert_gates_have_node(gates, node_gates)
     for root in roots:
-        assert_applies_plan(template, root, name, roots)
+        assert_applies_plan(template, root, name, roots, drift=drift)
+    if drift:
+        assert_drift_checks(template, roots, name)
     if roots:
         assert_state_bucket(template, name)
         assert_terraform_order(template, roots, deploy_stage)
@@ -1514,6 +1598,7 @@ __all__ = [
     "assert_deploy_closed",
     "assert_deploy_open",
     "assert_deploy_ordering",
+    "assert_drift_checks",
     "assert_gates_have_node",
     "assert_gates_present",
     "assert_lambda_compute",

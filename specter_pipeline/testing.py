@@ -29,6 +29,7 @@ from .gate import (
     Assembly,
     DeployStep,
     Gate,
+    PostDeployStep,
     mentions_cdk_cli,
     names_path,
     owns_deploy_flag,
@@ -120,7 +121,8 @@ def projects(template: Template) -> dict:
 def _read_buildspec(props: dict) -> dict | None:
     """A project's inline buildspec as a dict, or None if it has none we can read. A buildspec
     holding CDK tokens is an Fn::Join; its non-literal parts read as TOKEN."""
-    spec = props.get("Source", {}).get("BuildSpec")
+    source = props.get("Source")
+    spec = source.get("BuildSpec") if isinstance(source, dict) else None
     try:
         if isinstance(spec, dict) and "Fn::Join" in spec:
             sep, parts = spec["Fn::Join"]
@@ -128,7 +130,7 @@ def _read_buildspec(props: dict) -> dict | None:
         if not isinstance(spec, str):
             return None
         parsed = json.loads(spec)
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, AttributeError):
         return None
     return parsed if isinstance(parsed, dict) else None
 
@@ -204,17 +206,20 @@ def _buildspec_commands(props: dict) -> list[str] | None:
     return cmds if isinstance(cmds, list) else None
 
 
-def _ec2_preludes(runtimes: Iterable[Runtime] = tuple(Runtime)) -> list[list[str]]:
+def _ec2_preludes(
+    runtimes: Iterable[Runtime] = tuple(Runtime), *, ec2: bool = True
+) -> list[list[str]]:
     return [
-        prelude(rt, v, tf, ec2=True)
+        prelude(rt, v, tf, ec2=ec2)
         for rt in runtimes
         for v in NODE_LINUX_X64_SHA256
         for tf in TERRAFORM_LINUX_SHA256
     ]
 
 
-#: Toolchain set-up that must only appear in a prelude, never after it.
-_TOOLCHAIN_MARKERS = (" -m venv ", "PYENV_VERSION", "/tmp/node.tgz", "/tmp/terraform.zip")
+#: Toolchain set-up that must only appear in a prelude, never after it. (A step's own venv for
+#: its tools is fine; selecting another interpreter or fetching another runtime is not.)
+_TOOLCHAIN_MARKERS = ("PYENV_VERSION", "/tmp/node.tgz", "/tmp/terraform.zip")
 
 
 def _assert_ec2_toolchain(step: str, cmds: list[str], runtime: Runtime | None) -> None:
@@ -282,6 +287,15 @@ def assert_lambda_compute(
         for key in ("TimeoutInMinutes", "QueuedTimeoutInMinutes"):
             assert key not in props, (
                 f"{logical_id} sets {key}, which Lambda compute does not support"
+            )
+        # A step whose runtime is known gets exactly that runtime's pinned set-up on Lambda too
+        # (the Lambda images carry no Terraform, and only Python or Node).
+        runtime = (runtimes or {}).get(step)
+        if runtime is not None and _construct_generated(props, pr_prefix):
+            cmds = _buildspec_commands(props)
+            assert cmds is not None, f"{step}: cannot read its buildspec commands"
+            assert any(cmds[: len(p)] == p for p in _ec2_preludes([runtime], ec2=False)), (
+                f"{step} on Lambda does not start with the pinned {runtime.name} toolchain set-up: {cmds[:3]}"
             )
     missing = declared - set(seen)
     assert not missing, f"no CodeBuild project for EC2 steps {sorted(missing)}"
@@ -431,7 +445,8 @@ def _assert_construct_deploy(template: Template, action: dict) -> None:
     assert variables == {("CI", "PLAINTEXT", "true")}, (
         f"{step} has environment variables besides a plaintext CI=true: {variables}"
     )
-    spec = json.loads(props["Source"]["BuildSpec"])
+    spec = _read_buildspec(props)
+    assert spec is not None, f"{step}: cannot read its buildspec"
     assert set(spec) <= {"version", "phases"}, f"{step} buildspec has extra keys: {sorted(spec)}"
     assert set(spec.get("phases", {})) == {"build"}, (
         f"{step} has phases besides build: {sorted(spec.get('phases', {}))}"
@@ -713,6 +728,7 @@ def assert_standard_contract(
     ec2_steps: Iterable[str] = (),
     assembly: Assembly | None = None,
     deploy_step: DeployStep | None = None,
+    post_deploy: Sequence[PostDeployStep] = (),
 ) -> None:
     """Every invariant a StandardPipeline must satisfy. Repo-specific checks go alongside.
 
@@ -742,6 +758,10 @@ def assert_standard_contract(
         pr_on_ec2 = g.ec2 is not None or (g.uses_assembly and assembly_on_ec2)
         if pr_on_ec2 and pull_request_checks and g.runs_on_pull_requests:
             expected_ec2.add(f"{name}-pr-{g.name}")
+    for step in post_deploy:
+        runtimes[f"Post-{step.name}"] = step.runtime
+        if step.ec2 is not None:
+            expected_ec2.add(f"Post-{step.name}")
     if deploy_step is not None:
         builds_from_assembly = assembly is not None or bool(_assembly_actions(template))
         # the construct-only deploy runs only the pinned Node; a legacy deploy its own runtime

@@ -103,6 +103,11 @@ class Gate(_Step):
         super().__post_init__()
         if self.pull_request is not None and not isinstance(self.pull_request, bool):
             raise TypeError(f"gate {self.name!r}: pull_request must be True, False or None")
+        if self.uses_assembly and self.runtime is Runtime.TERRAFORM:
+            raise ValueError(
+                f"gate {self.name!r}: a Terraform gate cannot read the CDK assembly (its PR check "
+                "synthesizes on Python+Node); read Terraform plans with TerraformRoot instead"
+            )
         if self.pull_request and self.policy_statements:
             raise ValueError(
                 f"gate {self.name!r} has its own IAM permissions and cannot run on pull requests: "
@@ -323,9 +328,15 @@ def split_deploy_command(command: str) -> list[str] | None:
     cli = command[len(prefix):]
     try:
         tokens = shlex.split(cli)
+        # Any unquoted shell operator (&& ; | & ( ) < > or a newline) means more than one command.
+        lexer = shlex.shlex(cli, posix=True, punctuation_chars=True)
+        lexer.whitespace_split = True
+        operators = [t for t in lexer if t and all(ch in "();<>|&" for ch in t)]
     except ValueError:
         return None
-    if shlex.join(tokens) != cli or tokens[:4] != [CDK_BIN, "deploy", "--app", SNAPSHOT_DIR]:
+    if operators or "\n" in cli or "`" in cli or "$(" in cli:
+        return None
+    if tokens[:4] != [CDK_BIN, "deploy", "--app", SNAPSHOT_DIR]:
         return None
     return tokens
 

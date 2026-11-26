@@ -174,15 +174,27 @@ GATES = terraform_gates(roots=["infra"])   # tf-fmt, tf-validate, tf-checkov
   release's `SHA256SUMS` after verifying the file's signature with HashiCorp's release key
   (C874 011F 0AB4 0511 0D02 1055 3436 5D94 72D7 468F). An unknown version is refused.
   `StandardPipeline(terraform_version=...)` picks among committed versions.
-* `tf-fmt` runs `fmt -check -recursive`. `tf-validate` runs `init -backend=false -lockfile=readonly`
-  and then `validate`, so it never reads state. The root must commit `.terraform.lock.hcl`, and
-  providers must match its hashes; `init` still downloads them from the public registry.
-* `tf-checkov` runs pinned Checkov with its built-in policies, offline.
+* `tf-fmt` runs `fmt -check -recursive`.
+* `tf-validate` runs `init -backend=false -lockfile=readonly` and then `validate`, so it never reads
+  state. The root must commit `.terraform.lock.hcl` (an empty file if it has no providers), and
+  every provider in it must list hashes: `init` would otherwise install an unhashed provider as
+  "unauthenticated". A committed `terraform.d/` or `.terraform/` is refused, because it could supply
+  provider binaries.
+* `tf-checkov` runs pinned Checkov with its built-in policies, `--skip-download` (no platform calls)
+  and `--hard-fail-on 'CKV*'`. A `.checkov.yaml` or `.checkov.yml` in the root, the working
+  directory or `$HOME` is refused, because such a file can switch the gate off. A missing root or
+  any file Checkov cannot parse fails the gate. Inline `#checkov:skip=` comments still work and show
+  in the diff.
 * TFLint is opt-in (`tflint=(version, sha256)`), because its releases are on GitHub and no hash has
-  been verified for this package yet. Trivy, in the original plan, is not included for the same
-  reason.
-* None of these gates has AWS permissions, and the contract's PR-role check proves it on the
-  synthesized pipeline. Plan and apply, with state and credentials, come in step 3, on EC2 compute.
+  been verified for this package yet. It runs without `--init`, so only its bundled Terraform rules
+  run; plugins named by the repo's `.tflint.hcl` would otherwise be downloaded unpinned. Trivy is
+  not included: for Terraform it overlaps Checkov.
+* What these gates can and cannot do. Their roles hold only what every PR check holds: its own logs,
+  and the GitHub connection token used for the checkout. They never read Terraform state. But
+  `tf-validate` and `tf-lint` execute provider plugins, and those come from the PR. A PR that
+  changes providers has to change the lock file, so the change shows in its diff, but its plugins
+  still run in the check. Keep the repo private, or require approval for PRs from forks (the
+  default). Plan and apply, with state and credentials, come in step 3, on EC2 compute.
 
 ## Contract tests: `specter_pipeline.testing`
 

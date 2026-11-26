@@ -43,7 +43,8 @@ class Runtime(enum.Enum):
     PYTHON = "python"
     NODE = "node"
     PYTHON_NODE = "python+node"
-    #: The Python image plus a pinned, signature-checked Terraform binary on PATH.
+    #: The Python image plus a pinned Terraform binary on PATH, checked against a committed hash
+    #: (taken from the release's SHA256SUMS after its signature was verified once, by hand).
     TERRAFORM = "terraform"
 
     @property
@@ -160,7 +161,7 @@ def terraform_prelude(version: str = DEFAULT_TERRAFORM_VERSION, arch: str = "amd
         ) from None
     zip_name = f"terraform_{version}_linux_{arch}.zip"
     return [
-        f"curl -fsSL -o /tmp/terraform.zip https://releases.hashicorp.com/terraform/{version}/{zip_name}",
+        f"curl -fsSL --proto '=https' --retry 3 -o /tmp/terraform.zip https://releases.hashicorp.com/terraform/{version}/{zip_name}",
         f'echo "{sha256}  /tmp/terraform.zip" | sha256sum -c -',
         f"mkdir -p {_TERRAFORM_HOME}/bin",
         f"python3 -I -c \"import zipfile; zipfile.ZipFile('/tmp/terraform.zip').extract('terraform', '{_TERRAFORM_HOME}/bin')\"",

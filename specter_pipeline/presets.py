@@ -244,7 +244,8 @@ def python_cdk_assembly(
 
 # --- Terraform: static checks that need no AWS access ----------------------------------------
 
-#: Checkov runs offline with its built-in policies; pinned like the other pip-installed tools.
+#: Checkov with its built-in policies, run with --skip-download (no platform calls); pinned like
+#: the other pip-installed tools (top level only, as with bandit and pip-audit).
 CHECKOV = "checkov==3.4.4"
 
 #: TFLint has no committed hash yet (its releases are on GitHub, which this package's maintainers
@@ -264,6 +265,65 @@ def _terraform_root(root: str) -> str:
     return norm
 
 
+#: Fails unless every provider in a .terraform.lock.hcl lists hashes: `init -lockfile=readonly`
+#: installs a provider whose lock entry has none ("unauthenticated") and exits 0.
+_LOCK_HASHES_CHECK = (
+    "import re, sys; t = open(sys.argv[1]).read(); "
+    "bad = [b.split('\"', 1)[0] for b in re.split(r'(?m)^provider\\s+\"', t)[1:] "
+    "if not re.search(r'hashes\\s*=\\s*\\[\\s*\"(h1|zh):', b)]; "
+    "bad and print('lock file entries without hashes: ' + ', '.join(bad) + "
+    "' (run terraform providers lock)'); sys.exit(1 if bad else 0)"
+)
+
+#: Checkov reads .checkov.yaml/.yml from the scanned directory, the working directory and $HOME,
+#: and such a file can switch the gate off (soft-fail, skip-path, skip-check, external checks).
+_CHECKOV_CONFIGS = (".checkov.yaml", ".checkov.yml")
+
+
+def _validate_commands(raw: str, d: str) -> list[str]:
+    lock = shlex.quote(raw + "/.terraform.lock.hcl")
+    no_lock = shlex.quote(
+        f"{raw}: commit .terraform.lock.hcl (terraform providers lock; an empty file if the root "
+        "has no providers)"
+    )
+    plugins = shlex.quote(
+        f"{raw}: committed terraform.d/ or .terraform/ would supply provider binaries; remove it"
+    )
+    return [
+        f"test -f {lock} || {{ echo {no_lock}; exit 1; }}",
+        f"python3 -I -c {shlex.quote(_LOCK_HASHES_CHECK)} {lock}",
+        (
+            f"test ! -e {shlex.quote(raw + '/terraform.d')} && test ! -e {shlex.quote(raw + '/.terraform')} "
+            f"|| {{ echo {plugins}; exit 1; }}"
+        ),
+        f"terraform -chdir={d} init -backend=false -input=false -lockfile=readonly -no-color",
+        f"terraform -chdir={d} validate -no-color",
+    ]
+
+
+def checkov_commands(raw: str, d: str, extra_args: str = "") -> list[str]:
+    """Checkov that cannot be switched off from the repo, never reaches the network, and does not
+    pass on input it could not read."""
+    configs = " ".join(
+        [*_CHECKOV_CONFIGS, *(shlex.quote(f"{raw}/{c}") for c in _CHECKOV_CONFIGS),
+         *(f'"$HOME/{c}"' for c in _CHECKOV_CONFIGS)]
+    )
+    refuse = shlex.quote("a Checkov config file can switch the gate off; remove it")
+    unparsed = shlex.quote(f"{raw}: Checkov could not parse some files")
+    missing = shlex.quote(f"{raw}: no such directory")
+    return [
+        f"test -d {d} || {{ echo {missing}; exit 1; }}",
+        f'for f in {configs}; do if [ -e "$f" ]; then echo "$f:" {refuse}; exit 1; fi; done',
+        (
+            f"rc=0; checkov {extra_args or f'-d {d} --framework terraform'} --quiet --compact "
+            "--skip-download --hard-fail-on 'CKV*' > /tmp/checkov.out 2>&1 || rc=$?; "
+            "cat /tmp/checkov.out; "
+            f'if grep -Eq "Parsing errors: [1-9]" /tmp/checkov.out; then echo {unparsed}; exit 1; fi; '
+            '[ "$rc" -eq 0 ]'
+        ),
+    ]
+
+
 def terraform_gates(
     *,
     roots: Sequence[str] = (".",),
@@ -273,39 +333,33 @@ def terraform_gates(
 ) -> list[Gate]:
     """Static checks for Terraform root modules: format, validate, Checkov, optional TFLint.
 
-    None of them has AWS permissions or reads state, so all of them run on pull requests (the
-    PR-check role holds only logs and the connection token). ``validate`` initialises with
-    ``-backend=false`` and ``-lockfile=readonly``: the root must commit ``.terraform.lock.hcl``
-    and providers must match its hashes, so a PR cannot swap a provider in silently. It does
-    download providers from the public Terraform registry.
+    They hold no AWS permissions beyond what every PR check has (its own logs, and the GitHub
+    connection token for the checkout) and never read state, so all of them run on pull requests.
+
+    What they do run: ``validate`` and ``tf-lint`` execute provider plugins, and those come from
+    the PR. ``init -lockfile=readonly`` refuses any provider change not in the committed
+    ``.terraform.lock.hcl``, each lock entry must carry hashes, and committed ``terraform.d/`` or
+    ``.terraform/`` directories are refused; a PR that changes providers therefore shows it in its
+    diff, but its plugins still run here. Providers come from the public Terraform registry.
     """
+    if isinstance(roots, str):
+        raise TypeError("roots is a list of paths, e.g. roots=['infra']")
     dirs = [_terraform_root(r) for r in roots]
     if not dirs or len(set(dirs)) != len(dirs):
         raise ValueError(f"terraform roots must be non-empty and distinct, got {list(roots)}")
     extra = dict(env or {})
-    q = [shlex.quote(d) for d in dirs]
+    pairs = [(raw, shlex.quote(raw)) for raw in dirs]
 
     gates = [
         Gate(
             "tf-fmt",
-            [f"terraform -chdir={d} fmt -check -recursive -diff" for d in q],
+            [f"terraform -chdir={d} fmt -check -recursive -diff" for _, d in pairs],
             Runtime.TERRAFORM,
             env=extra,
         ),
         Gate(
             "tf-validate",
-            [
-                cmd
-                for d, raw in zip(q, dirs)
-                for cmd in (
-                    (
-                        f"test -f {shlex.quote(raw + '/.terraform.lock.hcl')} || "
-                        f"{{ echo {shlex.quote(f'{raw}: commit .terraform.lock.hcl')}; exit 1; }}"
-                    ),
-                    f"terraform -chdir={d} init -backend=false -input=false -lockfile=readonly -no-color",
-                    f"terraform -chdir={d} validate -no-color",
-                )
-            ],
+            [cmd for raw, d in pairs for cmd in _validate_commands(raw, d)],
             Runtime.TERRAFORM,
             env=extra,
         ),
@@ -314,7 +368,7 @@ def terraform_gates(
         gates.append(
             Gate(
                 "tf-checkov",
-                [f"checkov -d {d} --framework terraform --quiet --compact" for d in q],
+                [cmd for raw, d in pairs for cmd in checkov_commands(raw, d)],
                 Runtime.PYTHON,
                 install=[f"pip install {CHECKOV}"],
                 env=extra,
@@ -327,10 +381,12 @@ def terraform_gates(
         gates.append(
             Gate(
                 "tf-lint",
-                [f"tflint --chdir={d} --init && tflint --chdir={d}" for d in q],
+                # No `--init`: plugins named by the repo's .tflint.hcl would be downloaded from
+                # GitHub unpinned. TFLint's bundled Terraform rules run without it.
+                [f"tflint --chdir={d}" for _, d in pairs],
                 Runtime.TERRAFORM,
                 install=[
-                    f"curl -fsSL -o /tmp/tflint.zip {TFLINT_URL.format(version=version)}",
+                    f"curl -fsSL --proto '=https' --retry 3 -o /tmp/tflint.zip {TFLINT_URL.format(version=version)}",
                     f'echo "{sha256}  /tmp/tflint.zip" | sha256sum -c -',
                     "mkdir -p /tmp/tflint/bin",
                     "python3 -I -c \"import zipfile; zipfile.ZipFile('/tmp/tflint.zip').extract('tflint', '/tmp/tflint/bin')\"",

@@ -328,7 +328,11 @@ class StandardPipeline(Construct):
 
         post: list[pipelines.Step] = [
             _codebuild_step(
-                f"Post-{step.name}", step, source=source, node_version=node_version
+                f"Post-{step.name}",
+                step,
+                source=source,
+                node_version=node_version,
+                terraform_version=terraform_version,
             )
             for step in post_deploy
         ]
@@ -362,7 +366,7 @@ class StandardPipeline(Construct):
                             deploy_step,
                             source=source,
                             node_version=node_version,
-                terraform_version=terraform_version,
+                            terraform_version=terraform_version,
                         )
                     )
                 steps.append(
@@ -392,7 +396,7 @@ class StandardPipeline(Construct):
                         deploy_step,
                         source=source,
                         node_version=node_version,
-                terraform_version=terraform_version,
+                        terraform_version=terraform_version,
                         cdk_cli_version=cdk_cli_version,
                         extra_policies=[assume_bootstrap],
                     )

@@ -427,3 +427,29 @@ def test_assert_builds_once_reads_token_buildspecs():
 @pytest.mark.parametrize("spec", [{"Fn::Join": ["", "notalist", "extra"]}, {"Fn::Join": "x"}, 42, "not json", "[1]"])
 def test_unreadable_buildspecs_read_as_none(spec):
     assert c._read_buildspec({"Source": {"BuildSpec": spec}}) is None
+
+
+
+def test_a_post_deploy_step_may_make_its_own_venv_when_its_runtime_is_known():
+    post = PostDeployStep("fe", ["python -m venv /tmp/tools && /tmp/tools/bin/pip install x"],
+                          Runtime.PYTHON, ec2=Ec2("small", 30))
+    t = build(post_deploy=[post])
+    c.assert_standard_contract(t, repo=REPO, gates=GATES, deploy_stage="Prod",
+                               node_gates=NODE_GATES, post_deploy=[post])
+
+
+def test_a_token_in_the_construct_deploy_buildspec_is_read():
+    import aws_cdk as cdk
+
+    deploy = DeployStep("app", stacks=["AppStack"],
+                        deploy_args=["--context", f"k={cdk.Fn.import_value('X')}"])
+    t = asm_build(deploy_step=deploy)
+    assert isinstance(project(t, "Deploy-app")["Source"]["BuildSpec"], dict)
+    c.assert_standard_contract(t, repo=REPO, gates=ASM_GATES, node_gates=NODE_GATES, deploy_step=deploy)
+
+
+@pytest.mark.parametrize("props", [{"Source": {"BuildSpec": {"Fn::Join": [1, ["a"]]}}},
+                                   {"Source": {"BuildSpec": {"Fn::Join": [None, ["{}"]]}}},
+                                   {"Source": None}, {}])
+def test_more_malformed_buildspecs_read_as_none(props):
+    assert c._read_buildspec(props) is None

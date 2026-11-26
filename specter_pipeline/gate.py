@@ -103,6 +103,11 @@ class Gate(_Step):
         super().__post_init__()
         if self.pull_request is not None and not isinstance(self.pull_request, bool):
             raise TypeError(f"gate {self.name!r}: pull_request must be True, False or None")
+        if self.uses_assembly and self.runtime is Runtime.TERRAFORM:
+            raise ValueError(
+                f"gate {self.name!r}: a Terraform gate cannot read the CDK assembly (its PR check "
+                "synthesizes on Python+Node and would have no Terraform)"
+            )
         if self.pull_request and self.policy_statements:
             raise ValueError(
                 f"gate {self.name!r} has its own IAM permissions and cannot run on pull requests: "
@@ -315,17 +320,47 @@ def deploy_command(stacks: Sequence[str], deploy_args: Sequence[str]) -> str:
     return f"rm -rf {DEPLOY_WORKDIR} && mkdir -p {DEPLOY_WORKDIR} && cd {DEPLOY_WORKDIR} && {cli}"
 
 
+#: What may appear outside quotes in a deploy command: shlex.quote's output never needs more.
+_SAFE_UNQUOTED = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_./:=@%+,- ")
+
+
+def _only_safe_unquoted(cli: str) -> bool:
+    """True when everything outside single quotes is a plain word character or a space, and
+    double quotes appear only in shlex.quote's '"'"' idiom. So no operator, expansion ($, `,
+    globs, ~), comment or newline can act, while quoted arguments may hold anything."""
+    i, n = 0, len(cli)
+    while i < n:
+        ch = cli[i]
+        if ch == "'":
+            end = cli.find("'", i + 1)
+            if end < 0:
+                return False
+            i = end + 1
+        elif ch == '"':
+            end = cli.find('"', i + 1)
+            if end < 0 or cli[i + 1 : end] != "'":
+                return False
+            i = end + 1
+        elif ch in _SAFE_UNQUOTED:
+            i += 1
+        else:
+            return False
+    return True
+
+
 def split_deploy_command(command: str) -> list[str] | None:
     """The CLI tokens of a ``deploy_command`` string, or None if it is not one."""
     prefix = f"rm -rf {DEPLOY_WORKDIR} && mkdir -p {DEPLOY_WORKDIR} && cd {DEPLOY_WORKDIR} && "
     if not command.startswith(prefix):
         return None
     cli = command[len(prefix):]
+    if not _only_safe_unquoted(cli):
+        return None
     try:
         tokens = shlex.split(cli)
     except ValueError:
         return None
-    if shlex.join(tokens) != cli or tokens[:4] != [CDK_BIN, "deploy", "--app", SNAPSHOT_DIR]:
+    if tokens[:4] != [CDK_BIN, "deploy", "--app", SNAPSHOT_DIR]:
         return None
     return tokens
 

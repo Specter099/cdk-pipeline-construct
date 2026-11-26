@@ -34,7 +34,13 @@ from constructs import Construct
 
 from .compute import Ec2, build_environment, build_timeout
 from .gate import BASE_ENV, Gate
-from .runtimes import DEFAULT_NODE_VERSION, Runtime, join, prelude
+from .runtimes import (
+    DEFAULT_NODE_VERSION,
+    DEFAULT_TERRAFORM_VERSION,
+    Runtime,
+    join,
+    prelude,
+)
 
 
 class PullRequestChecks(Construct):
@@ -49,6 +55,7 @@ class PullRequestChecks(Construct):
         gates: Sequence[Gate],
         name_prefix: str,
         node_version: str = DEFAULT_NODE_VERSION,
+        terraform_version: str = DEFAULT_TERRAFORM_VERSION,
         assembly_commands: Sequence[str] = (),
         assembly_env: Mapping[str, str] | None = None,
         assembly_memory_gb: int = 4,
@@ -122,7 +129,7 @@ class PullRequestChecks(Construct):
                         "phases": {
                             "build": {
                                 "commands": join(
-                                    prelude(runtime, node_version, ec2=ec2 is not None),
+                                    prelude(runtime, node_version, terraform_version, ec2=ec2 is not None),
                                     pre,
                                     gate.install,
                                     gate.commands,

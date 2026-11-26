@@ -159,6 +159,47 @@ GATES = python_cdk_gates(env={"JSII_SILENCE_WARNING_UNTESTED_NODE_VERSION": "1"}
   GitHub write token; PR checks report a commit status per gate instead), CI log shipping
   (CodeBuild already writes every build to CloudWatch Logs).
 
+## Terraform: static checks on every pull request
+
+Step 2 of the Terraform pipeline. A Terraform repo's pipeline is still defined in CDK; these gates
+check its root modules without AWS access, so they run on pull requests too.
+
+```python
+from specter_pipeline.presets import terraform_gates
+GATES = terraform_gates(roots=["infra"])   # tf-fmt, tf-validate, tf-checkov
+```
+
+* `Runtime.TERRAFORM` is the Python image plus Terraform 1.17.2. The binary is downloaded from
+  releases.hashicorp.com and checked against a committed SHA-256. That hash was copied from the
+  release's `SHA256SUMS` after verifying the file's signature with HashiCorp's release key
+  (C874 011F 0AB4 0511 0D02 1055 3436 5D94 72D7 468F). An unknown version is refused.
+  `StandardPipeline(terraform_version=...)` picks among committed versions.
+* `tf-fmt` runs `fmt -check -recursive`.
+* `tf-validate` runs `init -backend=false -lockfile=readonly` and then `validate`, so it never reads
+  state. The root must commit `.terraform.lock.hcl` (an empty file if it has no providers), and
+  every provider in it must list hashes: `init` would otherwise install an unhashed provider as
+  "unauthenticated". The lock file must keep the layout `terraform init` writes: unindented
+  `provider "host[:port]/namespace/name" {` blocks, a `hashes = [` list with at least one entry,
+  no comments and no other syntax. Regenerate it with `terraform providers lock` rather than
+  editing it by hand; anything else is refused, so a comment cannot hide a missing hash. A committed `terraform.d/` or `.terraform/` is refused, because it could supply
+  provider binaries.
+* `tf-checkov` runs pinned Checkov with its built-in policies, `--skip-download` (no platform calls)
+  and `--hard-fail-on 'CKV*'`. A `.checkov.yaml` or `.checkov.yml` in the root, the working
+  directory or `$HOME` is refused, because such a file can switch the gate off. A missing root, a
+  file Checkov cannot parse, or a `*.tf.json` file anywhere in the repository, symlinked
+  directories included (Checkov 3.4.4 skips JSON configuration), fails the gate. Inline `#checkov:skip=` comments still work and show
+  in the diff.
+* TFLint is opt-in (`tflint=(version, sha256)`), because its releases are on GitHub and no hash has
+  been verified for this package yet. It runs without `--init`, so only its bundled Terraform rules
+  run; plugins named by the repo's `.tflint.hcl` would otherwise be downloaded unpinned. Trivy is
+  not included: for Terraform it overlaps Checkov.
+* What these gates can and cannot do. Their roles hold only what every PR check holds: its own logs,
+  and the GitHub connection token used for the checkout. They never read Terraform state. But
+  `tf-validate` and `tf-lint` execute provider plugins, and those come from the PR. A PR that
+  changes providers has to change the lock file, so the change shows in its diff, but its plugins
+  still run in the check. Keep the repo private, or require approval for PRs from forks (the
+  default). Plan and apply, with state and credentials, come in step 3, on EC2 compute.
+
 ## Contract tests: `specter_pipeline.testing`
 
 Every consumer must prove the same things about its pipeline. Instead of copying a test file:
@@ -170,6 +211,11 @@ def test_pipeline(template):
     contract.assert_standard_contract(template, repo="Specter099/my-repo", gates=GATES,
                                       node_gates=["tests", "cdk-synth"])
 ```
+
+Pass `assembly=`, `deploy_step=` and `post_deploy=` too, so that each step's expected runtime and
+compute are known and its pinned toolchain is checked exactly. `post_deploy=` is required whenever
+the pipeline has post-deploy steps: an undeclared `Post-*` step fails the contract instead of
+skipping its checks.
 
 It checks Lambda compute everywhere, the stage order, the gates, build-once (whenever the pipeline has an
 assembly step or a gate reads the assembly), the deploy closed (or open),

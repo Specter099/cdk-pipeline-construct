@@ -57,6 +57,7 @@ from .pull_request import PullRequestChecks
 from .runtimes import (
     DEFAULT_CDK_CLI_VERSION,
     DEFAULT_NODE_VERSION,
+    DEFAULT_TERRAFORM_VERSION,
     Runtime,
     cdk_cli_install,
     join,
@@ -97,6 +98,7 @@ def _codebuild_step(
     *,
     source: pipelines.IFileSetProducer,
     node_version: str,
+    terraform_version: str = DEFAULT_TERRAFORM_VERSION,
     cdk_cli_version: str | None = None,
     extra_policies: Sequence[iam.PolicyStatement] = (),
     additional_inputs: dict[str, pipelines.IFileSetProducer] | None = None,
@@ -110,7 +112,7 @@ def _codebuild_step(
         additional_inputs=additional_inputs or None,
         primary_output_directory=primary_output_directory,
         commands=join(
-            prelude(spec.runtime, node_version, ec2=spec.ec2 is not None),
+            prelude(spec.runtime, node_version, terraform_version, ec2=spec.ec2 is not None),
             cdk_cli_install(cdk_cli_version) if cdk_cli_version else (),
             spec.install,
             spec.commands,
@@ -148,6 +150,7 @@ class StandardPipeline(Construct):
         synth_memory_gb: int = 4,
         cdk_cli_version: str = DEFAULT_CDK_CLI_VERSION,
         node_version: str = DEFAULT_NODE_VERSION,
+        terraform_version: str = DEFAULT_TERRAFORM_VERSION,
     ) -> None:
         super().__init__(scope, construct_id)
 
@@ -293,6 +296,7 @@ class StandardPipeline(Construct):
                 assembly,
                 source=source,
                 node_version=node_version,
+                terraform_version=terraform_version,
                 cdk_cli_version=cdk_cli_version,
                 primary_output_directory=assembly.output_dir,
             )
@@ -308,6 +312,7 @@ class StandardPipeline(Construct):
                 gate,
                 source=source,
                 node_version=node_version,
+                terraform_version=terraform_version,
                 additional_inputs=assembly_inputs if gate.uses_assembly else None,
             )
             for gate in gates
@@ -323,7 +328,11 @@ class StandardPipeline(Construct):
 
         post: list[pipelines.Step] = [
             _codebuild_step(
-                f"Post-{step.name}", step, source=source, node_version=node_version
+                f"Post-{step.name}",
+                step,
+                source=source,
+                node_version=node_version,
+                terraform_version=terraform_version,
             )
             for step in post_deploy
         ]
@@ -357,6 +366,7 @@ class StandardPipeline(Construct):
                             deploy_step,
                             source=source,
                             node_version=node_version,
+                            terraform_version=terraform_version,
                         )
                     )
                 steps.append(
@@ -386,6 +396,7 @@ class StandardPipeline(Construct):
                         deploy_step,
                         source=source,
                         node_version=node_version,
+                        terraform_version=terraform_version,
                         cdk_cli_version=cdk_cli_version,
                         extra_policies=[assume_bootstrap],
                     )
@@ -444,6 +455,7 @@ class StandardPipeline(Construct):
                 gates=[g for g in gates if g.runs_on_pull_requests],
                 name_prefix=name,
                 node_version=node_version,
+                terraform_version=terraform_version,
                 assembly_commands=join(
                     cdk_cli_install(cdk_cli_version),
                     assembly.install if assembly else synth_install,

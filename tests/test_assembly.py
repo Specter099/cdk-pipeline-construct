@@ -8,7 +8,7 @@ import subprocess
 import pytest
 from aws_cdk import aws_iam as iam
 from aws_cdk.assertions import Template
-from test_pipeline import GATES, build
+from test_pipeline import GATES, POST, build
 
 from specter_pipeline import Assembly, DeployStep, Gate, PostDeployStep, Runtime
 from specter_pipeline import testing as c
@@ -246,7 +246,7 @@ def test_deploy_environments_add_only_bootstrap_roles_to_the_deploy_action():
     holders = [v for v in docs.values() if "role/cdk-hnb659fds-" in v]
     assert len(holders) == 1, "only the deploy action may assume the CDK bootstrap roles"
     assert '"arn:", {"Ref": "AWS::Partition"}, ":iam::111122223333:role/cdk-hnb659fds-*-role-111122223333-eu-west-1"' in holders[0]
-    c.assert_standard_contract(t, repo=REPO, gates=ASM_GATES, node_gates=["synth-check", "lint"])
+    c.assert_standard_contract(t, post_deploy=[POST], repo=REPO, gates=ASM_GATES, node_gates=["synth-check", "lint"])
 
 
 @pytest.mark.parametrize("stack", ["", "-rf", "A B", "A;rm", "$(x)"])
@@ -283,7 +283,7 @@ def test_repo_work_runs_in_its_own_action_before_the_deploy():
     assert "role/cdk-hnb659fds-" not in pre_role
     deploy_roles = [v for v in policies.values() if "role/cdk-hnb659fds-" in v]
     assert len(deploy_roles) == 1 and "ssm:GetParameter" not in deploy_roles[0]
-    c.assert_standard_contract(t, repo=REPO, gates=ASM_GATES, node_gates=["synth-check", "lint"])
+    c.assert_standard_contract(t, post_deploy=[POST], repo=REPO, gates=ASM_GATES, node_gates=["synth-check", "lint"])
 
 
 def test_the_deploy_action_gets_only_ci_true_while_pre_deploy_gets_the_step_env():
@@ -425,7 +425,7 @@ def test_approval_still_strictly_precedes_the_deploy(tpl):
 
 
 def test_contract_passes_and_includes_build_once(tpl):
-    c.assert_standard_contract(tpl, repo=REPO, gates=ASM_GATES, node_gates=["synth-check", "lint"])
+    c.assert_standard_contract(tpl, post_deploy=[POST], repo=REPO, gates=ASM_GATES, node_gates=["synth-check", "lint"])
 
 
 def test_contract_checks_build_once_whenever_there_is_an_assembly_step():
@@ -433,8 +433,7 @@ def test_contract_checks_build_once_whenever_there_is_an_assembly_step():
     doc = copy.deepcopy(asm_build(gates=GATES).to_json())
     _set_last(lambda _: "cdk deploy AppStack")(doc["Resources"])
     with pytest.raises(AssertionError, match="does not deploy the assembly snapshot"):
-        c.assert_standard_contract(
-            Template.from_json(doc), repo=REPO, gates=GATES, node_gates=["synth-check", "lint"]
+        c.assert_standard_contract(Template.from_json(doc), post_deploy=[POST], repo=REPO, gates=GATES, node_gates=["synth-check", "lint"]
         )
 
 
@@ -443,8 +442,7 @@ def test_stage_mode_gates_read_the_synth_output_that_is_deployed():
     gates = actions(t, "Gates")
     assert "Assemble" not in gates
     assert "Synth_Output" in inputs(gates["Gate-scan"])
-    c.assert_standard_contract(
-        t, repo=REPO, gates=ASM_GATES, deploy_stage="Prod", node_gates=["synth-check", "lint"]
+    c.assert_standard_contract(t, post_deploy=[POST], repo=REPO, gates=ASM_GATES, deploy_stage="Prod", node_gates=["synth-check", "lint"]
     )
 
 
@@ -622,7 +620,7 @@ def test_the_scan_never_expands_the_directory_name(tmp_path):
 def test_preset_pipeline_in_assembly_mode_satisfies_the_contract():
     gates = python_cdk_gates(assembly=True, env={"X": "1"})
     t = asm_build(assembly=python_cdk_assembly(env={"X": "1"}), gates=gates)
-    c.assert_standard_contract(t, repo=REPO, gates=gates, node_gates=["tests"])
+    c.assert_standard_contract(t, post_deploy=[POST], repo=REPO, gates=gates, node_gates=["tests"])
     allowed = c.CDK_INTERNAL_WILDCARDS | {"access-analyzer:CheckNoPublicAccess"}
     c.assert_no_wildcard_resources(t, allowed_actions=allowed)
 

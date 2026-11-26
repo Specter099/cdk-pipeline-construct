@@ -43,6 +43,8 @@ together. Not reproduced (and why):
 
 from __future__ import annotations
 
+import posixpath
+import re
 import shlex
 from collections.abc import Mapping, Sequence
 
@@ -238,3 +240,204 @@ def python_cdk_assembly(
         memory_gb=memory_gb,
         output_dir=output_dir,
     )
+
+
+# --- Terraform: static checks that need no AWS access ----------------------------------------
+
+#: Checkov with its built-in policies, run with --skip-download (no platform calls); pinned like
+#: the other pip-installed tools (top level only, as with bandit and pip-audit).
+CHECKOV = "checkov==3.4.4"
+
+#: TFLint has no committed hash yet (its releases are on GitHub, which this package's maintainers
+#: verify separately): pass ``tflint=(version, sha256)`` from tflint's ``checksums.txt`` to add it.
+TFLINT_URL = "https://github.com/terraform-linters/tflint/releases/download/v{version}/tflint_linux_amd64.zip"
+
+
+def _terraform_root(root: str) -> str:
+    norm = posixpath.normpath(root)
+    if (
+        not re.fullmatch(r"[A-Za-z0-9_.][A-Za-z0-9_./-]*", root)
+        or root.startswith("/")
+        or ".." in root.split("/")
+        or norm.startswith("-")
+    ):
+        raise ValueError(f"terraform root must be a relative path below the source, got {root!r}")
+    return norm
+
+
+#: Fails unless .terraform.lock.hcl is exactly the shape `terraform init` writes and every
+#: provider in it lists at least one hash. `init -lockfile=readonly` installs a provider whose
+#: entry has no hashes ("unauthenticated") and exits 0, and a loose pattern match can be fooled
+#: (a comment holding "hashes", indentation, a byte-order mark), so the whole file is checked line
+#: by line against Terraform's own layout: anything else is refused.
+_LOCK_GRAMMAR = r"""
+import re, sys
+raw = open(sys.argv[1], "rb").read()
+try:
+    text = raw.decode("ascii")
+except UnicodeDecodeError:
+    print("lock file has non-ASCII bytes"); sys.exit(1)
+ok, block, hashes, in_hashes, bad = True, None, 0, False, []
+for n, line in enumerate(text.replace("\r\n", "\n").split("\n"), 1):
+    if block is None:
+        if line == "" or line.startswith("#"):
+            continue
+        m = re.fullmatch(r'provider "([a-z0-9.-]+(?::[0-9]+)?/[a-z0-9_-]+/[a-z0-9_-]+)" \{', line)
+        if not m:
+            print(f"lock file line {n} is not what terraform init writes: {line!r}"); sys.exit(1)
+        block, hashes = m.group(1), 0
+    elif in_hashes:
+        if re.fullmatch(r'    "(h1|zh):[A-Za-z0-9+/=]+",', line):
+            hashes += 1
+        elif line == "  ]":
+            in_hashes = False
+        else:
+            print(f"lock file line {n} is not what terraform init writes: {line!r}"); sys.exit(1)
+    elif line == "}":
+        if not hashes:
+            bad.append(block)
+        block = None
+    elif line == "  hashes = [":
+        in_hashes = True
+    elif not re.fullmatch(r'  (version|constraints) +=  ?"[^"\\]*"', line):
+        print(f"lock file line {n} is not what terraform init writes: {line!r}"); sys.exit(1)
+if block is not None or in_hashes:
+    print("lock file ends inside a block"); sys.exit(1)
+if bad:
+    print("lock file entries without hashes: " + ", ".join(bad) + " (run terraform providers lock)")
+    sys.exit(1)
+""".strip()
+_LOCK_HASHES_CHECK = "exec(" + repr(_LOCK_GRAMMAR) + ")"
+
+#: Checkov reads .checkov.yaml/.yml from the scanned directory, the working directory and $HOME,
+#: and such a file can switch the gate off (soft-fail, skip-path, skip-check, external checks).
+_CHECKOV_CONFIGS = (".checkov.yaml", ".checkov.yml")
+
+
+def _validate_commands(raw: str, d: str) -> list[str]:
+    lock = shlex.quote(raw + "/.terraform.lock.hcl")
+    no_lock = shlex.quote(
+        f"{raw}: commit .terraform.lock.hcl (terraform providers lock; an empty file if the root "
+        "has no providers)"
+    )
+    plugins = shlex.quote(
+        f"{raw}: committed terraform.d/ or .terraform/ would supply provider binaries; remove it"
+    )
+    return [
+        f"test -f {lock} || {{ echo {no_lock}; exit 1; }}",
+        f"python3 -I -c {shlex.quote(_LOCK_HASHES_CHECK)} {lock}",
+        (
+            f"test ! -e {shlex.quote(raw + '/terraform.d')} && test ! -e {shlex.quote(raw + '/.terraform')} "
+            f"|| {{ echo {plugins}; exit 1; }}"
+        ),
+        f"terraform -chdir={d} init -backend=false -input=false -lockfile=readonly -no-color",
+        f"terraform -chdir={d} validate -no-color",
+    ]
+
+
+def checkov_commands(raw: str, d: str, extra_args: str = "") -> list[str]:
+    """Checkov that cannot be switched off from the repo, never reaches the network, and does not
+    pass on input it could not read."""
+    configs = " ".join(
+        [*_CHECKOV_CONFIGS, *(shlex.quote(f"{raw}/{c}") for c in _CHECKOV_CONFIGS),
+         *(f'"$HOME/{c}"' for c in _CHECKOV_CONFIGS)]
+    )
+    refuse = shlex.quote("a Checkov config file can switch the gate off; remove it")
+    unparsed = shlex.quote(f"{raw}: Checkov could not parse some files")
+    missing = shlex.quote(f"{raw}: no such directory")
+    json_tf = shlex.quote(
+        "*.tf.json files in the repository are not scanned by Checkov 3.4.4; write them as .tf"
+    )
+    return [
+        f"test -d {d} || {{ echo {missing}; exit 1; }}",
+        # Checkov silently skips JSON configuration, so a .tf.json resource would pass unscanned.
+        # The search is repo-wide and follows symlinks: a module outside the root, a nested
+        # .terraform/ directory or a linked directory can all hold configuration Checkov loads.
+        (
+            f'if [ -n "$(find -L . -name \'*.tf.json\' -print -quit 2>/dev/null)" ]; '
+            f"then echo {json_tf}; exit 1; fi"
+        ),
+        f'for f in {configs}; do if [ -e "$f" ]; then echo "$f:" {refuse}; exit 1; fi; done',
+        (
+            f"rc=0; checkov {extra_args or f'-d {d} --framework terraform'} --quiet --compact "
+            "--skip-download --hard-fail-on 'CKV*' > /tmp/checkov.out 2>&1 || rc=$?; "
+            "cat /tmp/checkov.out; "
+            f'if grep -Eq "Parsing errors: [1-9]" /tmp/checkov.out; then echo {unparsed}; exit 1; fi; '
+            '[ "$rc" -eq 0 ]'
+        ),
+    ]
+
+
+def terraform_gates(
+    *,
+    roots: Sequence[str] = (".",),
+    checkov: bool = True,
+    tflint: tuple[str, str] | None = None,
+    env: Mapping[str, str] | None = None,
+) -> list[Gate]:
+    """Static checks for Terraform root modules: format, validate, Checkov, optional TFLint.
+
+    They hold no AWS permissions beyond what every PR check has (its own logs, and the GitHub
+    connection token for the checkout) and never read state, so all of them run on pull requests.
+
+    What they do run: ``validate`` and ``tf-lint`` execute provider plugins, and those come from
+    the PR. ``init -lockfile=readonly`` refuses any provider change not in the committed
+    ``.terraform.lock.hcl``, each lock entry must carry hashes, and committed ``terraform.d/`` or
+    ``.terraform/`` directories are refused; a PR that changes providers therefore shows it in its
+    diff, but its plugins still run here. Providers come from the public Terraform registry.
+    """
+    if isinstance(roots, str):
+        raise TypeError("roots is a list of paths, e.g. roots=['infra']")
+    dirs = [_terraform_root(r) for r in roots]
+    if not dirs or len(set(dirs)) != len(dirs):
+        raise ValueError(f"terraform roots must be non-empty and distinct, got {list(roots)}")
+    extra = dict(env or {})
+    pairs = [(raw, shlex.quote(raw)) for raw in dirs]
+
+    gates = [
+        Gate(
+            "tf-fmt",
+            [f"terraform -chdir={d} fmt -check -recursive -diff" for _, d in pairs],
+            Runtime.TERRAFORM,
+            env=extra,
+        ),
+        Gate(
+            "tf-validate",
+            [cmd for raw, d in pairs for cmd in _validate_commands(raw, d)],
+            Runtime.TERRAFORM,
+            env=extra,
+        ),
+    ]
+    if checkov:
+        gates.append(
+            Gate(
+                "tf-checkov",
+                [cmd for raw, d in pairs for cmd in checkov_commands(raw, d)],
+                Runtime.PYTHON,
+                install=[f"pip install {CHECKOV}"],
+                env=extra,
+            )
+        )
+    if tflint is not None:
+        version, sha256 = tflint
+        if not re.fullmatch(r"\d+\.\d+\.\d+", version) or not re.fullmatch(r"[0-9a-f]{64}", sha256):
+            raise ValueError("tflint is (version 'X.Y.Z', 64-hex sha256 of tflint_linux_amd64.zip)")
+        gates.append(
+            Gate(
+                "tf-lint",
+                # No `--init`: plugins named by the repo's .tflint.hcl would be downloaded from
+                # GitHub unpinned. TFLint's bundled Terraform rules run without it.
+                [f"tflint --chdir={d}" for _, d in pairs],
+                Runtime.TERRAFORM,
+                install=[
+                    f"curl -fsSL --proto '=https' --retry 3 -o /tmp/tflint.zip {TFLINT_URL.format(version=version)}",
+                    f'echo "{sha256}  /tmp/tflint.zip" | sha256sum -c -',
+                    "mkdir -p /tmp/tflint/bin",
+                    "python3 -I -c \"import zipfile; zipfile.ZipFile('/tmp/tflint.zip').extract('tflint', '/tmp/tflint/bin')\"",
+                    "chmod 0755 /tmp/tflint/bin/tflint",
+                    "export PATH=/tmp/tflint/bin:$PATH",
+                ],
+                env=extra,
+            )
+        )
+    return gates

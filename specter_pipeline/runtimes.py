@@ -43,6 +43,9 @@ class Runtime(enum.Enum):
     PYTHON = "python"
     NODE = "node"
     PYTHON_NODE = "python+node"
+    #: The Python image plus a pinned Terraform binary on PATH, checked against a committed hash
+    #: (taken from the release's SHA256SUMS after its signature was verified once, by hand).
+    TERRAFORM = "terraform"
 
     @property
     def image(self) -> codebuild.IBuildImage:
@@ -125,6 +128,50 @@ def node_tarball_prelude(node_version: str = DEFAULT_NODE_VERSION) -> list[str]:
     ]
 
 
+#: Terraform used for ``Runtime.TERRAFORM``.
+DEFAULT_TERRAFORM_VERSION = "1.17.2"
+
+#: SHA-256 of ``terraform_<version>_linux_<arch>.zip``, copied from the release's
+#: ``terraform_<version>_SHA256SUMS`` after verifying that file's signature
+#: (``terraform_<version>_SHA256SUMS.sig``) with HashiCorp's release key, fingerprint
+#: C874 011F 0AB4 0511 0D02 1055 3436 5D94 72D7 468F (signed by its subkey 374E...AB87).
+#: Committed, not downloaded beside the zip: a hash from the same origin only detects
+#: corruption. To add a version, repeat that verification in a reviewed change.
+TERRAFORM_LINUX_SHA256 = {
+    "1.17.2": {
+        "amd64": "e6f16b2f0b137ee5729caa8c4e79a3bae4ee261acd198a1fcfa8584a6296605b",
+        "arm64": "858e08c181a76b6b223e8c767a8e983922eebe2d062db949a2de66ce040c368c",
+    },
+}
+
+_TERRAFORM_HOME = "/tmp/terraform"
+
+
+def terraform_prelude(version: str = DEFAULT_TERRAFORM_VERSION, arch: str = "amd64") -> list[str]:
+    """Fetch a pinned Terraform, verify it against a committed hash, put it on PATH.
+
+    Unzipped with Python's zipfile (``unzip`` is not on every image). Also sets the variables
+    Terraform reads in automation: no prompts, no update check, plain output."""
+    try:
+        sha256 = TERRAFORM_LINUX_SHA256[version][arch]
+    except KeyError:
+        raise ValueError(
+            f"no committed SHA-256 for Terraform {version!r} ({arch}); add it to "
+            f"TERRAFORM_LINUX_SHA256 (known: {sorted(TERRAFORM_LINUX_SHA256)})"
+        ) from None
+    zip_name = f"terraform_{version}_linux_{arch}.zip"
+    return [
+        f"curl -fsSL --proto '=https' --retry 3 -o /tmp/terraform.zip https://releases.hashicorp.com/terraform/{version}/{zip_name}",
+        f'echo "{sha256}  /tmp/terraform.zip" | sha256sum -c -',
+        f"mkdir -p {_TERRAFORM_HOME}/bin",
+        f"python3 -I -c \"import zipfile; zipfile.ZipFile('/tmp/terraform.zip').extract('terraform', '{_TERRAFORM_HOME}/bin')\"",
+        f"chmod 0755 {_TERRAFORM_HOME}/bin/terraform",
+        f"export PATH={_TERRAFORM_HOME}/bin:$PATH",
+        "export TF_IN_AUTOMATION=1 TF_INPUT=0 CHECKPOINT_DISABLE=1",
+        "terraform version",
+    ]
+
+
 def cdk_cli_install(version: str = DEFAULT_CDK_CLI_VERSION) -> list[str]:
     """Install the pinned CDK CLI under /tmp so it works without root.
 
@@ -140,7 +187,11 @@ def cdk_cli_install(version: str = DEFAULT_CDK_CLI_VERSION) -> list[str]:
 
 
 def prelude(
-    runtime: Runtime, node_version: str = DEFAULT_NODE_VERSION, *, ec2: bool = False
+    runtime: Runtime,
+    node_version: str = DEFAULT_NODE_VERSION,
+    terraform_version: str = DEFAULT_TERRAFORM_VERSION,
+    *,
+    ec2: bool = False,
 ) -> list[str]:
     """Commands that make ``runtime`` ready, run before a step's own commands.
 
@@ -151,6 +202,8 @@ def prelude(
         return python_prelude(ec2=ec2)
     if runtime is Runtime.NODE:
         return node_tarball_prelude(node_version) if ec2 else []
+    if runtime is Runtime.TERRAFORM:
+        return [*python_prelude(ec2=ec2), *terraform_prelude(terraform_version)]
     return [*node_tarball_prelude(node_version), *python_prelude(ec2=ec2)]
 
 

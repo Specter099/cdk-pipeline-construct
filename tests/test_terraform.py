@@ -188,3 +188,9 @@ def test_terraform_on_ec2_uses_the_pinned_python_too():
     cmds = prelude(Runtime.TERRAFORM, ec2=True)
     assert cmds == [*python_prelude(ec2=True), *terraform_prelude()]
     assert "python3.12 -m venv /tmp/venv" in cmds
+
+
+def test_a_terraform_gate_on_ec2_passes_the_toolchain_contract():
+    slow = Gate("tf-big", ["terraform -chdir=. validate"], Runtime.TERRAFORM, ec2=Ec2("medium", 45))
+    t = tf_build([*terraform_gates(), slow])
+    c.assert_lambda_compute(t, ["Gate-tf-big", "demo-pr-tf-big"])

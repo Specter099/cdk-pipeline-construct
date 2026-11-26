@@ -38,6 +38,7 @@ from .gate import (
 from .pipeline import artifact_bucket_purpose
 from .runtimes import (
     NODE_LINUX_X64_SHA256,
+    TERRAFORM_LINUX_SHA256,
     Runtime,
     cdk_cli_install,
     node_tarball_prelude,
@@ -187,7 +188,12 @@ def _buildspec_commands(props: dict) -> list[str] | None:
 
 
 def _ec2_preludes() -> list[list[str]]:
-    return [prelude(rt, v, ec2=True) for rt in Runtime for v in NODE_LINUX_X64_SHA256]
+    return [
+        prelude(rt, v, tf, ec2=True)
+        for rt in Runtime
+        for v in NODE_LINUX_X64_SHA256
+        for tf in TERRAFORM_LINUX_SHA256
+    ]
 
 
 def assert_lambda_compute(template: Template, ec2_steps: Iterable[str] = ()) -> None:

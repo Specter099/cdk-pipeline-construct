@@ -49,7 +49,14 @@ from .runtimes import (
     terraform_prelude,
 )
 from .terraform import CHECKOV as TF_CHECKOV
-from .terraform import TerraformRoot, apply_commands, plan_check_commands, plan_commands
+from .terraform import (
+    TerraformRoot,
+    apply_commands,
+    plan_check_commands,
+    plan_commands,
+    secret_base_arn,
+    secrets_buildspec,
+)
 
 #: The exact actions a PR-check role may hold (measured on a synthesized pipeline): its own
 #: logs, the report permissions CodeBuild adds for the project's own report group, and the
@@ -337,13 +344,24 @@ def _assembly_actions(template: Template) -> list[dict]:
     return [a for a in _stage(template, "Gates")["Actions"] if a.get("OutputArtifacts")]
 
 
-def assert_gates_present(template: Template, gates: Sequence[Gate]) -> None:
-    """Exactly these gates (plus at most one assembly step), in parallel: every gate that does
-    not read the assembly shares one RunOrder, and so does every gate that does."""
+def assert_gates_present(
+    template: Template, gates: Sequence[Gate], plans: Iterable[str] = ()
+) -> None:
+    """Exactly these gates (plus at most one assembly step, and exactly the Terraform ``plans``
+    named, e.g. ``Plan-main``), in parallel: every gate that does not read the assembly shares
+    one RunOrder, and so does every gate that does."""
     actions = _stage(template, "Gates")["Actions"]
+    expected_plans = set(plans)
     producers = _assembly_actions(template)
+    plan_steps = {a["Name"] for a in producers if a["Name"] in expected_plans}
+    assert plan_steps == expected_plans, (
+        f"Terraform plan steps differ: expected {sorted(expected_plans)}, found {sorted(plan_steps)}"
+    )
+    producers = [a for a in producers if a["Name"] not in expected_plans]
     assert len(producers) <= 1, f"more than one step produces an artifact in Gates: {producers}"
-    by_name = {a["Name"]: a for a in actions if a not in producers}
+    by_name = {
+        a["Name"]: a for a in actions if a not in producers and a["Name"] not in expected_plans
+    }
     expected = {f"Gate-{g.name}": g for g in gates}
     assert set(by_name) == set(expected), (
         f"gates differ: missing={sorted(set(expected) - set(by_name))} "
@@ -554,7 +572,9 @@ class _Ctx:
 
     def __init__(self, template: Template) -> None:
         doc = template.to_json()
-        self.distinct = frozenset(template.find_resources("AWS::S3::Bucket"))
+        self.distinct = frozenset(template.find_resources("AWS::S3::Bucket")) | frozenset(
+            template.find_resources("AWS::SecretsManager::Secret")
+        )
         # a parameter is its default; without one, or when it names an SSM path (the value is
         # read at deploy time), it is unknown
         self.params = {
@@ -582,7 +602,8 @@ def _sub_text(body: str, variables: dict, ctx: _Ctx, unknown: str = "*") -> str:
         if lid in ctx.distinct:
             return f"<{lid}.{attr}>" if attr else f"<{lid}>"
         if not attr and lid in ctx.params:
-            return ctx.params[lid] if ctx.params[lid] is not None else unknown
+            # a default can be overridden at deploy time: never trust it to exclude anything
+            return ctx.params[lid] if ctx.params[lid] is not None and unknown == "*" else unknown
         if lid.startswith("AWS::") and unknown == "*":
             return "*"
         return unknown
@@ -617,7 +638,7 @@ def _resource_text(resource, ctx: _Ctx | None = None, unknown: str = "*") -> str
             return "<" + resource["Ref"] + ">"
         if "Ref" in resource and resource["Ref"] in ctx.params:
             value = ctx.params[resource["Ref"]]
-            return value if value is not None else unknown
+            return value if value is not None and unknown == "*" else unknown
         if "Ref" in resource and str(resource["Ref"]).startswith("AWS::") and unknown == "*":
             return "*"
         if "Fn::ImportValue" in resource:
@@ -761,6 +782,10 @@ def _doc_statements(doc) -> list:
     return [None] if stmts is None or not isinstance(stmts, dict | list) else _as_list(stmts)
 
 
+def _allows_only(stmts: list) -> list:
+    return [st for st in stmts if not (isinstance(st, dict) and st.get("Effect") == "Deny")]
+
+
 def _policy_principals(template: Template) -> list[tuple[str, list]]:
     """(principal, statements) for every principal any policy in the template reaches. A
     principal is a role, user or group of the template, or - when a policy's attachment cannot
@@ -798,12 +823,15 @@ def _policy_principals(template: Template) -> list[tuple[str, list]]:
                     found[pid].extend(stmts)
 
     managed: dict[str, list] = {}
+    managed_names: dict[str, str] = {}  # template managed policy -> its name, as a pattern
     for cfn in ("AWS::IAM::Policy", "AWS::IAM::ManagedPolicy"):
         for lid, res in template.find_resources(cfn).items():
             props = res.get("Properties", {}) or {}
             stmts = _doc_statements(props.get("PolicyDocument"))
             if cfn == "AWS::IAM::ManagedPolicy":
                 managed[lid] = stmts
+                if "ManagedPolicyName" in props:
+                    managed_names[lid] = _resource_text(props["ManagedPolicyName"])
             for kind in _PRINCIPALS:
                 if kind in props:
                     attach(lid, kind, props[kind], stmts)
@@ -829,12 +857,23 @@ def _policy_principals(template: Template) -> list[tuple[str, list]]:
                     continue
                 # A policy ARN, literal or built the way CDK writes AWS-managed ones
                 # (Join/Sub with the partition), is from outside the template: unreadable.
-                if _MANAGED_ARN.fullmatch(_resource_text(arn)):
+                text = _resource_text(arn)
+                if _MANAGED_ARN.fullmatch(text):
+                    # By ARN: AWS-managed (account "aws") or external, and unread - unless it
+                    # may name one of this template's policies, whose Allows then count (never
+                    # its Denies: the ARN may be another account's policy of the same name).
+                    name, account = text.rsplit("/", 1)[-1], text.split(":")[4]
+                    if account != "aws":
+                        for mid, pattern in managed_names.items():
+                            if _globs_meet(pattern, name):
+                                found[pid].extend(_allows_only(managed[mid]))
                     continue
+                if isinstance(arn, dict) and set(arn) == {"Fn::ImportValue"}:
+                    continue  # another stack's policy: external and unread, like an ARN
                 # Anything else may be any template managed policy: take their Allows (never
                 # their Denies, which may not apply), or an unknown statement if there are none.
                 for stmts in managed.values():
-                    found[pid].extend(st for st in stmts if not (isinstance(st, dict) and st.get("Effect") == "Deny"))
+                    found[pid].extend(_allows_only(stmts))
                 if not managed:
                     found[pid].append(None)
     return sorted(found.items())
@@ -910,6 +949,8 @@ def assert_state_bucket(template: Template, name: str) -> None:
         bucket = pp.get("Bucket")
         if isinstance(bucket, dict) and bucket.get("Ref") in others:
             continue  # another bucket's policy
+        if isinstance(bucket, str) and not bucket.startswith(str(props.get("BucketNamePrefix"))):
+            continue  # an existing bucket named outright, which cannot be the state bucket
         # The state bucket's, or one we cannot tie to a bucket: it may only deny.
         ours = bucket == {"Ref": lid}
         for st in _as_list(pp.get("PolicyDocument", {}).get("Statement", [])):
@@ -951,7 +992,12 @@ def _step_of_role(template: Template, role: str) -> str:
     return role
 
 
-def assert_applies_plan(template: Template, root: TerraformRoot, repo_name: str | None = None) -> None:
+def assert_applies_plan(
+    template: Template,
+    root: TerraformRoot,
+    repo_name: str | None = None,
+    roots: Sequence[TerraformRoot] | None = None,
+) -> None:
     """Plan once, check that plan, apply exactly that plan.
 
     ``Plan-<name>`` (EC2) produces the plan artifact. ``Gate-tf-plan-check-<name>`` and the
@@ -1001,10 +1047,14 @@ def assert_applies_plan(template: Template, root: TerraformRoot, repo_name: str 
         )
 
     # Exact command lists: nothing added, removed or reordered.
-    def exact(step: str, bodies: list[list[str]], artifacts: dict | None = None) -> None:
+    def exact(step: str, bodies: list[list[str]], artifacts: dict | None = None,
+              extra: dict | None = None) -> None:
         spec = _step_buildspec(template, step)
         rest = {k: v for k, v in spec.items() if k not in ("version", "phases")}
-        assert rest == ({"artifacts": artifacts} if artifacts else {}), (
+        if isinstance(rest.get("artifacts", {}).get("files"), list) and len(rest["artifacts"]["files"]) == 1:
+            # CDK writes a one-file list when it merges a partial buildspec
+            rest["artifacts"] = {**rest["artifacts"], "files": rest["artifacts"]["files"][0]}
+        assert rest == {**({"artifacts": artifacts} if artifacts else {}), **(extra or {})}, (
             f"{step} buildspec has more than the build commands: {sorted(rest)}"
         )
         assert set(spec["phases"]) == {"build"}, f"{step} buildspec has phases besides build"
@@ -1018,8 +1068,8 @@ def assert_applies_plan(template: Template, root: TerraformRoot, repo_name: str 
     ]
     # The plan's output is the whole checkout (relative module paths) plus the saved plan.
     exact(plan_name, [[*p, *plan_commands(root)] for p in tf_preludes],
-          artifacts={"base-directory": ".", "files": "**/*"})
-    exact(deploy_name, [[*p, *apply_commands(root)] for p in tf_preludes])
+          artifacts={"base-directory": ".", "files": "**/*"}, extra=secrets_buildspec(root))
+    exact(deploy_name, [[*p, *apply_commands(root)] for p in tf_preludes], extra=secrets_buildspec(root))
     exact(check_name, [[*python_prelude(), f"pip install {TF_CHECKOV}",
                         *plan_check_commands(root, root.path)]])
 
@@ -1066,6 +1116,72 @@ def assert_applies_plan(template: Template, root: TerraformRoot, repo_name: str 
         assert not _grants(template, roles[check_name], action, whole), (
             f"{check_name} can reach the state bucket"
         )
+    # This root's state and lock: only its own Plan and Deploy may read the state or touch the
+    # lock (another root's roles, a gate or an unrelated role may not).
+    own = {roles[plan_name], roles[deploy_name]}
+    lock = [_state_targets(bucket_lid, props, root.state_key + ".tflock")]
+    for action, targets, what in (
+        ("s3:GetObject", state, "read"),
+        ("s3:GetObject", lock, "read the lock of"),
+        ("s3:PutObject", lock, "take the lock of"),
+        ("s3:DeleteObject", lock, "release the lock of"),
+    ):
+        for pid in _principals_granting(template, action, targets):
+            assert pid in own, f"{_step_of_role(template, pid)} can {what} {root.name}'s Terraform state"
+
+    # The root's provider secrets: readable by the Plan and Deploy of every root that declares
+    # the secret (roots may share one), by no other principal. Like the state sweep: those
+    # roles strictly, every other principal leniently.
+    ctx = _Ctx(template)
+    bases = sorted({secret_base_arn(a) for a in root.secrets.values()})
+    for role in own:
+        # exactly these secrets: no wider grant (such as "<arn>*") that also reaches them
+        for _, st in _role_policy_statements(template, {role}):
+            if not isinstance(st, dict) or st.get("Effect", "Allow") != "Allow":
+                continue
+            if not _matches_action("secretsmanager:getsecretvalue", st.get("Action", [])):
+                continue
+            for r in _as_list(st.get("Resource", [])):
+                text = _resource_text(r, ctx)
+                assert text in bases or not any(_globs_meet(text, b) for b in bases), (
+                    f"{_step_of_role(template, role)} reads secrets more widely than "
+                    f"{root.name}'s own: {text}"
+                )
+    for secret in bases:
+        allowed = set(own)
+        for other in roots or [root]:
+            if secret in {secret_base_arn(a) for a in other.secrets.values()}:
+                allowed |= {_role_of(template, f"Plan-{other.name}"),
+                            _role_of(template, f"Deploy-{other.name}")}
+        for role in sorted(own):
+            assert _grants(template, role, "secretsmanager:GetSecretValue", secret), (
+                f"{role} cannot read the secret {secret}"
+            )
+        for pid in _principals_granting(template, "secretsmanager:GetSecretValue", [secret]):
+            assert pid in allowed, (
+                f"{_step_of_role(template, pid)} can read {root.name}'s secret {secret}"
+            )
+
+
+def _roots(terraform) -> list[TerraformRoot]:
+    if terraform is None:
+        return []
+    return [terraform] if isinstance(terraform, TerraformRoot) else list(terraform)
+
+
+def assert_terraform_order(
+    template: Template, roots: Sequence[TerraformRoot], deploy_stage: str = "Deploy"
+) -> None:
+    """With several roots: every Deploy-<name> strictly after the one before it, in the order
+    given (one apply at a time, never in parallel). ``assert_deploy_ordering`` checks that all of
+    them wait for the approval."""
+    actions = {a["Name"]: a for a in _stage(template, deploy_stage)["Actions"]}
+    missing = [f"Deploy-{r.name}" for r in roots if f"Deploy-{r.name}" not in actions]
+    assert not missing, f"no {missing} in {deploy_stage!r}"
+    orders = [actions[f"Deploy-{r.name}"]["RunOrder"] for r in roots]
+    assert orders == sorted(orders) and len(set(orders)) == len(orders), (
+        f"Terraform applies are not strictly in the order given: {[r.name for r in roots]} -> {orders}"
+    )
 
 
 #: Bucket-level actions that could weaken the state bucket (open it, stop versioning, expire
@@ -1281,7 +1397,7 @@ def assert_standard_contract(
     assembly: Assembly | None = None,
     deploy_step: DeployStep | None = None,
     post_deploy: Sequence[PostDeployStep] = (),
-    terraform: TerraformRoot | None = None,
+    terraform: TerraformRoot | Sequence[TerraformRoot] | None = None,
 ) -> None:
     """Every invariant a StandardPipeline must satisfy. Repo-specific checks go alongside.
 
@@ -1342,10 +1458,10 @@ def assert_standard_contract(
             Runtime.NODE if builds_from_assembly else deploy_step.runtime
         )
         runtimes[f"PreDeploy-{deploy_step.name}"] = deploy_step.runtime
-    if terraform is not None:
-        expected_ec2 |= {f"Plan-{terraform.name}", f"Deploy-{terraform.name}"}
-        runtimes[f"Plan-{terraform.name}"] = Runtime.TERRAFORM
-        runtimes[f"Deploy-{terraform.name}"] = Runtime.TERRAFORM
+    for root in _roots(terraform):
+        expected_ec2 |= {f"Plan-{root.name}", f"Deploy-{root.name}"}
+        runtimes[f"Plan-{root.name}"] = Runtime.TERRAFORM
+        runtimes[f"Deploy-{root.name}"] = Runtime.TERRAFORM
     if deploy_step is not None and deploy_step.ec2 is not None:
         expected_ec2.add(f"Deploy-{deploy_step.name}")
         pre = f"PreDeploy-{deploy_step.name}"
@@ -1354,13 +1470,12 @@ def assert_standard_contract(
     assert_lambda_compute(template, expected_ec2, runtimes, pr_prefix=name)
     assert_ci_env_on_repo_command_projects(template)
     assert_stage_order(template, deploy_stage)
+    roots = _roots(terraform)
     checked_gates = list(gates)
-    if terraform is not None:
+    for root in roots:
         # The construct's plan check reads the plan artifact, like an assembly gate.
-        checked_gates.append(
-            Gate(f"tf-plan-check-{terraform.name}", ["true"], uses_assembly=True)
-        )
-    assert_gates_present(template, checked_gates)
+        checked_gates.append(Gate(f"tf-plan-check-{root.name}", ["true"], uses_assembly=True))
+    assert_gates_present(template, checked_gates, plans=[f"Plan-{r.name}" for r in roots])
     assert_deploy_ordering(template, deploy_stage, require_approval=require_approval)
     if deploy_enabled:
         assert_deploy_open(template)
@@ -1378,9 +1493,11 @@ def assert_standard_contract(
             "PR-check projects exist but pull_request_checks is off"
         )
     assert_gates_have_node(gates, node_gates)
-    if terraform is not None:
-        assert_applies_plan(template, terraform, name)
+    for root in roots:
+        assert_applies_plan(template, root, name, roots)
+    if roots:
         assert_state_bucket(template, name)
+        assert_terraform_order(template, roots, deploy_stage)
         builds_once = False if builds_once is None else builds_once
     if builds_once is None:
         builds_once = bool(_assembly_actions(template)) or any(g.uses_assembly for g in gates)
@@ -1409,6 +1526,7 @@ __all__ = [
     "assert_stage_order",
     "assert_standard_contract",
     "assert_state_bucket",
+    "assert_terraform_order",
     "pipeline",
     "pr_projects",
     "projects",

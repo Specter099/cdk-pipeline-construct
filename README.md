@@ -251,8 +251,9 @@ Deploy: Approve -> Deploy-main (EC2: terraform apply tfplan) -> post-deploy step
   write state.
 * Plan and apply run on EC2 (`plan_ec2`, `apply_ec2`; defaults are small with 60 and 120 minutes),
   so a long apply is not killed half-way.
-* `TerraformRoot.env` may not set variables that redirect Terraform: `TF_CLI_ARGS*`,
-  `TF_WORKSPACE`, `TF_DATA_DIR`, `TF_CLI_CONFIG_FILE` and similar.
+* `TerraformRoot.env` and `secrets` may not set variables that redirect Terraform, the AWS SDK or
+  CodeBuild: `TF_CLI_ARGS*`, `TF_WORKSPACE`, `TF_DATA_DIR`, `TF_CLI_CONFIG_FILE` and similar,
+  `TF_LOG*` (debug logs can print secrets), `AWS_*`, `CODEBUILD_*`, `PATH`, `HOME` and `CI`.
 * `assert_standard_contract(..., terraform=ROOT)` checks all of this, via `assert_applies_plan` and
   `assert_state_bucket`: exact command lists, environment variables, artifact wiring, and IAM with
   wildcards taken into account.
@@ -288,6 +289,43 @@ Deploy: Approve -> Deploy-main (EC2: terraform apply tfplan) -> post-deploy step
   state object first.
 * Not yet proven on a real account: the state bucket permissions, including the very first run with
   no state, and EC2 compute itself. Test both once with `deploy_enabled=False`.
+
+## Terraform: several roots, and credentials for other providers
+
+Step 4. `terraform=` also takes a list:
+
+```python
+GH = "arn:aws:secretsmanager:us-east-1:111122223333:secret:github-token-AbC123"
+ROOTS = [
+    TerraformRoot("network", name="network", plan_policy_statements=[...], apply_policy_statements=[...]),
+    TerraformRoot("github", name="github", secrets={"GITHUB_TOKEN": GH}),
+]
+StandardPipeline(..., gates=terraform_gates(roots=["network", "github"]), terraform=ROOTS)
+```
+
+* Every root plans and is checked in the Gates stage. Then one approval covers all of them, and the
+  applies run one at a time, in the order given. Each root has its own state key and lock in the
+  repo's one state bucket, and its own Plan and Deploy roles.
+* **Roots must be independent.** All plans are made before any apply. A root that reads another
+  root's outputs (`terraform_remote_state`) would be planned against the outputs from before this
+  release's applies, and Terraform would not flag it. Put dependent roots in separate pipelines,
+  or release them in two steps.
+* `secrets` maps environment variable names to Secrets Manager secret ARNs. Each ARN must be
+  complete, with its random suffix; CodeBuild's `:json-key:version-stage:version-id` selectors are
+  allowed. They go into the buildspec's `env.secrets-manager` of that root's Plan and Deploy only,
+  and those two roles get `secretsmanager:GetSecretValue` on exactly those ARNs. (As CodeBuild
+  project variables, CDK would add its own grant on `<arn>*`.) The static gates, the PR checks
+  and the plan check never see a secret. Use it for providers such as GitHub (`GITHUB_TOKEN`) or
+  Equinix (`METAL_AUTH_TOKEN`).
+  * Check the ARN is copied whole. The construct cannot tell a real six-character suffix from a
+    name that happens to end in a hyphen and six letters (`secret:github-tokens`), and IAM
+    matches a grant on a suffix-less name against nothing.
+  * `TF_VAR_*` names are refused: Terraform writes input variable values into the saved plan,
+    which every pipeline step can read. Use the provider's own environment variable.
+  * Several roots may share a secret; each one's Plan and Deploy may read it.
+* The contract (`terraform=ROOTS`) checks each root as before, plus the apply order, that only a
+  root's own Plan and Deploy can read its state or touch its lock, and that only the roots
+  declaring a secret can read it, with no wider secret grant on those roles.
 
 ## Contract tests: `specter_pipeline.testing`
 

@@ -47,11 +47,33 @@ PLAN_TEXT = "tfplan.txt"
 #: Checkov for the plan checks; the same pin as the static gate.
 CHECKOV = "checkov==3.4.4"
 
+#: A complete secret ARN (name plus Secrets Manager's 6-character suffix), optionally followed by
+#: CodeBuild's :json-key:version-stage:version-id selectors.
+_SECRET_ARN = re.compile(
+    r"(arn:aws[a-z-]*:secretsmanager:[a-z0-9-]+:\d{12}:secret:[A-Za-z0-9/_+=.@-]+-[A-Za-z0-9]{6})"
+    r"(:[A-Za-z0-9/_+=.@-]*){0,3}"
+)
+
+
+def secret_base_arn(arn: str) -> str:
+    """The secret's own ARN, without CodeBuild's json-key/version selectors."""
+    m = _SECRET_ARN.fullmatch(arn)
+    assert m, arn
+    return m.group(1)
+
+
 #: Environment variables a root may not set: each redirects init, plan, apply or the state.
 _RESERVED_ENV = frozenset(
     {"TF_WORKSPACE", "TF_DATA_DIR", "TF_STATE_BUCKET", "TF_CLI_CONFIG_FILE", "TF_PLUGIN_CACHE_DIR",
-     "TF_IN_AUTOMATION", "TF_INPUT", "TF_LOG_PATH", "TF_REGISTRY_DISCOVERY_RETRY"}
+     "TF_IN_AUTOMATION", "TF_INPUT", "TF_LOG_PATH", "TF_REGISTRY_DISCOVERY_RETRY",
+     # debug logs can print credentials and secret values into the build log
+     "TF_LOG", "TF_LOG_CORE", "TF_LOG_PROVIDER",
+     # these redirect the shell, the AWS SDK (the backend and the AWS provider) or CodeBuild
+     "PATH", "HOME", "CI"}
 )
+#: Prefixes a root may not set: AWS SDK settings and credentials, and CodeBuild's own variables
+#: (which CodeBuild refuses at deploy time anyway).
+_RESERVED_PREFIXES = ("TF_CLI_ARGS", "AWS_", "CODEBUILD_")
 
 
 def _root_path(path: str) -> str:
@@ -94,6 +116,11 @@ class TerraformRoot:
     var_files: Sequence[str] = ()
     allow_destroy: bool = False
     env: Mapping[str, str] = dataclasses.field(default_factory=dict)
+    #: Credentials for non-AWS providers (GitHub, Equinix, ...): environment variable name ->
+    #: Secrets Manager secret ARN (complete, with its random suffix; CodeBuild's
+    #: ``:json-key:version-stage:version-id`` suffixes are allowed). Exposed to this root's Plan
+    #: and Deploy only; nothing else in the pipeline can read them.
+    secrets: Mapping[str, str] = dataclasses.field(default_factory=dict)
     plan_ec2: Ec2 = dataclasses.field(default_factory=lambda: Ec2("small", 60))
     apply_ec2: Ec2 = dataclasses.field(default_factory=lambda: Ec2("small", 120))
 
@@ -107,15 +134,34 @@ class TerraformRoot:
             object.__setattr__(self, field, tuple(value))
         object.__setattr__(self, "var_files", tuple(_root_path(v) for v in self.var_files))
         object.__setattr__(self, "env", dict(self.env))
-        steering = sorted(
-            k for k in self.env
-            if k.startswith("TF_CLI_ARGS") or k in _RESERVED_ENV
-        )
-        if steering:
-            raise ValueError(
-                f"terraform root {self.name!r}: env may not set {steering}: they change what "
-                "init, plan or apply do, or where state goes"
+        object.__setattr__(self, "secrets", dict(self.secrets))
+        for key, arn in self.secrets.items():
+            if not re.fullmatch(r"[A-Z_][A-Z0-9_]*", key) or key in self.env or key in BASE_ENV:
+                raise ValueError(
+                    f"terraform root {self.name!r}: secret name {key!r} must be an upper-case "
+                    "variable name not also in env"
+                )
+            if key.startswith("TF_VAR_"):
+                raise ValueError(
+                    f"terraform root {self.name!r}: secret {key!r} would be a Terraform input "
+                    "variable, and Terraform writes input variable values into the saved plan, "
+                    "which every pipeline step can read. Pass provider credentials through the "
+                    "provider's own environment variable instead"
+                )
+            if not _SECRET_ARN.fullmatch(arn):
+                raise ValueError(
+                    f"terraform root {self.name!r}: secret {key!r} must be a complete Secrets "
+                    f"Manager secret ARN, got {arn!r}"
+                )
+        for field, keys in (("env", self.env), ("secrets", self.secrets)):
+            steering = sorted(
+                k for k in keys if k.startswith(_RESERVED_PREFIXES) or k in _RESERVED_ENV
             )
+            if steering:
+                raise ValueError(
+                    f"terraform root {self.name!r}: {field} may not set {steering}: they change "
+                    "what init, plan or apply do, where state goes, or what the build log shows"
+                )
         for field in ("plan_ec2", "apply_ec2"):
             if not isinstance(getattr(self, field), Ec2):
                 raise TypeError(f"terraform root {self.name!r}: {field} must be an Ec2(...)")
@@ -249,6 +295,25 @@ def plan_check_commands(root: TerraformRoot, plan_dir: str) -> list[str]:
             f"-f {plan_json} --framework terraform_plan "
             f"--repo-root-for-plan-enrichment {shlex.quote(plan_dir)}",
         ),
+    ]
+
+
+def secrets_buildspec(root: TerraformRoot) -> dict:
+    """The buildspec ``env`` block that hands the root's secrets to the build. Given here, not as
+    CodeBuild project variables: for those, CDK adds its own grant on ``<arn>*`` (and KMS
+    decrypt on every key of another account), wider than ``secrets_policy``."""
+    return {"env": {"secrets-manager": dict(sorted(root.secrets.items()))}} if root.secrets else {}
+
+
+def secrets_policy(root: TerraformRoot) -> list[iam.PolicyStatement]:
+    """Read access to exactly this root's provider secrets."""
+    if not root.secrets:
+        return []
+    return [
+        iam.PolicyStatement(
+            actions=["secretsmanager:GetSecretValue"],
+            resources=sorted({secret_base_arn(a) for a in root.secrets.values()}),
+        )
     ]
 
 

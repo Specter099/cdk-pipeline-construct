@@ -8,7 +8,7 @@ version = "0.3.0"
 description = "Shared CDK construct for CodePipeline + CodeBuild pipelines (Lambda compute, EC2 for long steps) across Specter099 repos"
 requires-python = ">=3.11"
 dependencies = [
-    "aws-cdk-lib>=2.170.0",
+    "aws-cdk-lib>=2.278.0",  # tested floor: AL2023 standard 6.0 and the Node 22 Lambda image
     "constructs>=10.0.0",
 ]
 

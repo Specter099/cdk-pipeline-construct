@@ -38,8 +38,10 @@ from .gate import (
 from .pipeline import artifact_bucket_purpose
 from .runtimes import (
     NODE_LINUX_X64_SHA256,
+    PYTHON_VERSION,
     Runtime,
     cdk_cli_install,
+    ec2_python_select,
     node_tarball_prelude,
 )
 
@@ -194,6 +196,15 @@ def assert_lambda_compute(template: Template, ec2_steps: Iterable[str] = ()) -> 
             assert 5 <= int(props.get("TimeoutInMinutes", 0)) <= 480, (
                 f"{step} on EC2 has no explicit timeout"
             )
+            assert env["ComputeType"].startswith("BUILD_GENERAL1_"), f"{step} on EC2 has a Lambda size"
+            # The image's own Python is not 3.12: a venv must come from the pinned selection.
+            cmds = json.loads(props["Source"]["BuildSpec"])["phases"]["build"]["commands"]
+            venvs = [i for i, x in enumerate(cmds) if " -m venv " in x]
+            select = ec2_python_select()
+            for i in venvs:
+                assert cmds[i].startswith(f"python{PYTHON_VERSION} -m venv") and any(
+                    cmds[j : j + len(select)] == select for j in range(i)
+                ), f"{step} on EC2 builds a venv from the image's Python: {cmds[i]!r}"
             continue
         assert env["Type"] == "LINUX_LAMBDA_CONTAINER", (
             f"{logical_id} ({step}) is not on Lambda compute and is not declared in ec2_steps"
@@ -323,7 +334,8 @@ def _project_of(template: Template, step_name: str) -> dict:
 def _assert_construct_deploy(template: Template, action: dict) -> None:
     """The deploy action runs exactly: snapshot the assembly, install the pinned CLI, deploy the
     snapshot with that CLI by absolute path from an empty directory. Nothing else: no other
-    buildspec key, phase or phase setting, no environment beyond CI=true, the Node image."""
+    buildspec key, phase or phase setting, no environment beyond CI=true, the Node Lambda image
+    with a Lambda size or the pinned EC2 image with an EC2 size."""
     step = action["Name"]
     assert not action.get("Configuration", {}).get("EnvironmentVariables"), (
         f"{step} sets action-level environment variables"
@@ -652,8 +664,9 @@ def assert_standard_contract(
             expected_ec2.add(f"{name}-pr-{g.name}")
     if deploy_step is not None and deploy_step.ec2 is not None:
         expected_ec2.add(f"Deploy-{deploy_step.name}")
-        if assembly is not None and (deploy_step.install or deploy_step.commands):
-            expected_ec2.add(f"PreDeploy-{deploy_step.name}")
+        pre = f"PreDeploy-{deploy_step.name}"
+        if any(_project_step_name(r["Properties"]) == pre for r in projects(template).values()):
+            expected_ec2.add(pre)
     assert_lambda_compute(template, expected_ec2)
     assert_ci_env_on_repo_command_projects(template)
     assert_stage_order(template, deploy_stage)

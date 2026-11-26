@@ -52,19 +52,33 @@ class Runtime(enum.Enum):
 
 
 #: The Python every step's venv is built from. Lambda's python3.12 image provides it as
-#: ``python3``; on EC2 the standard image carries several, so the venv is built from this exact
-#: interpreter and the build stops if the image lacks it.
+#: ``python3``. The EC2 standard image installs several through pyenv but activates only one
+#: (3.14 on 6.0), and exports PYTHON_312_VERSION; a ``python3.12`` shim exists for the inactive
+#: versions but fails when run. So on EC2 the step selects 3.12 through pyenv, runs it to prove
+#: it is 3.12, and stops otherwise.
 PYTHON_VERSION = "3.12"
+_PYENV_VAR = "PYTHON_" + PYTHON_VERSION.replace(".", "") + "_VERSION"
+
+
+def ec2_python_select() -> list[str]:
+    """Make python3.12 the active interpreter on the EC2 standard image, or stop the build."""
+    want = f"({PYTHON_VERSION.replace('.', ', ')})"
+    return [
+        f': "${{{_PYENV_VAR}:?this image does not provide Python {PYTHON_VERSION} ({_PYENV_VAR} is unset)}}"',
+        f'export PYENV_VERSION="${_PYENV_VAR}"',
+        (
+            f"python{PYTHON_VERSION} -c 'import sys; assert sys.version_info[:2] == {want}, sys.version' "
+            f'|| {{ echo "python{PYTHON_VERSION} does not run Python {PYTHON_VERSION} on this image"; exit 1; }}'
+        ),
+    ]
 
 
 def python_prelude(*, ec2: bool = False) -> list[str]:
     """Create ``/tmp/venv`` and activate it, with the image's pip config off. On EC2 the venv is
-    built from ``python3.12`` explicitly (fails closed if the image has none)."""
+    built from Python 3.12 selected through pyenv (``ec2_python_select``), or the build stops."""
     interpreter = f"python{PYTHON_VERSION}" if ec2 else "python3"
-    missing = f"this image has no {interpreter}; EC2 steps need it"
-    check = [f'command -v {interpreter} >/dev/null || {{ echo "{missing}"; exit 1; }}'] if ec2 else []
     return [
-        *check,
+        *(ec2_python_select() if ec2 else []),
         # Image-level pip settings override the venv; drop every PIP_* variable.
         'for v in $(env | grep -oE "^PIP_[A-Z_]+"); do unset "$v"; done',
         "unset PYTHONPATH PYTHONUSERBASE",
@@ -105,7 +119,7 @@ def node_tarball_prelude(node_version: str = DEFAULT_NODE_VERSION) -> list[str]:
         f"curl -fsSL -o /tmp/node.tgz https://nodejs.org/dist/{node_version}/{tarball}",
         # Non-zero exit (build fails) on any mismatch.
         f'echo "{sha256}  /tmp/node.tgz" | sha256sum -c -',
-        f"mkdir -p {_NODE_HOME} && tar -xzf /tmp/node.tgz -C {_NODE_HOME} --strip-components=1",
+        f"mkdir -p {_NODE_HOME} && tar -xzf /tmp/node.tgz -C {_NODE_HOME} --strip-components=1 --no-same-owner",
         f"export PATH={_NODE_HOME}/bin:$PATH",
         "node --version",
     ]

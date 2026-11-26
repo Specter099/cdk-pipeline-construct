@@ -37,6 +37,12 @@ _EC2 = {
     "2xlarge": codebuild.ComputeType.X2_LARGE,
 }
 
+#: Memory in GB of each EC2 size, for choosing one that is at least a Lambda size.
+_EC2_MEMORY_GB = {"small": 3, "medium": 7, "large": 15, "xlarge": 72, "2xlarge": 144}
+
+#: Lambda compute's hard limit, the time a Lambda step can take.
+LAMBDA_LIMIT_MINUTES = 15
+
 #: The image every EC2 step runs on: one major version. AWS republishes the tag with patches, so
 #: the toolchain steps rely on is installed by the step itself (see runtimes.prelude).
 EC2_IMAGE = codebuild.LinuxBuildImage.AMAZON_LINUX_2023_6
@@ -86,6 +92,12 @@ class Ec2:
         size = max(self.size, other.size, key=order.index)
         return Ec2(size, min(480, self.timeout_minutes + other.timeout_minutes))
 
+    @classmethod
+    def at_least(cls, memory_gb: int, timeout_minutes: int = LAMBDA_LIMIT_MINUTES) -> Ec2:
+        """The smallest EC2 size with at least ``memory_gb``: the EC2 equal of a Lambda step."""
+        size = next(n for n, gb in _EC2_MEMORY_GB.items() if gb >= memory_gb)
+        return cls(size, max(5, timeout_minutes))
+
     @property
     def compute_type(self) -> codebuild.ComputeType:
         return _EC2[self.size]
@@ -104,11 +116,6 @@ def build_environment(runtime: Runtime, memory_gb: int, ec2: Ec2 | None) -> code
     return codebuild.BuildEnvironment(
         build_image=EC2_IMAGE, compute_type=ec2.compute_type, privileged=False
     )
-
-
-#: Concurrent builds allowed per EC2 PR-check project: PR-head code on EC2 can run up to its
-#: timeout as root, so a burst of pushes must not fan out into many large builds.
-PR_EC2_CONCURRENT_BUILDS = 2
 
 
 def build_timeout(ec2: Ec2 | None) -> Duration | None:

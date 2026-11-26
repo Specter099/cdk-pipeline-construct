@@ -32,7 +32,7 @@ from aws_cdk import aws_codebuild as codebuild
 from aws_cdk import aws_iam as iam
 from constructs import Construct
 
-from .compute import PR_EC2_CONCURRENT_BUILDS, Ec2, build_environment, build_timeout
+from .compute import Ec2, build_environment, build_timeout
 from .gate import BASE_ENV, Gate
 from .runtimes import DEFAULT_NODE_VERSION, Runtime, join, prelude
 
@@ -75,8 +75,11 @@ class PullRequestChecks(Construct):
             )
             # A synthesis that needs EC2 in the pipeline needs it on the PR too, at least as big,
             # with time for the synthesis and the gate.
-            if gate.uses_assembly and assembly_ec2 is not None:
-                ec2 = assembly_ec2.larger(gate.ec2)
+            # A Lambda side counts as its EC2 equal: at least its memory, up to Lambda's limit.
+            if gate.uses_assembly and (assembly_ec2 is not None or gate.ec2 is not None):
+                synth = assembly_ec2 or Ec2.at_least(assembly_memory_gb)
+                own = gate.ec2 or Ec2.at_least(gate.memory_gb)
+                ec2 = synth.larger(own)
             else:
                 ec2 = gate.ec2
             pre = list(assembly_commands) if gate.uses_assembly else []
@@ -109,7 +112,6 @@ class PullRequestChecks(Construct):
                 ),
                 environment=build_environment(runtime, memory_gb, ec2),
                 timeout=build_timeout(ec2),
-                concurrent_build_limit=PR_EC2_CONCURRENT_BUILDS if ec2 else None,
                 environment_variables={
                     key: codebuild.BuildEnvironmentVariable(value=value)
                     for key, value in env.items()

@@ -2,6 +2,9 @@
 
 import copy
 import inspect
+import json
+import shutil
+import subprocess
 
 import pytest
 from aws_cdk.assertions import Template
@@ -10,8 +13,12 @@ from test_pipeline import GATES, build
 
 from specter_pipeline import Assembly, DeployStep, Ec2, Gate, PostDeployStep, Runtime
 from specter_pipeline import testing as c
-from specter_pipeline.compute import EC2_IMAGE, PR_EC2_CONCURRENT_BUILDS
-from specter_pipeline.runtimes import DEFAULT_NODE_VERSION, NODE_LINUX_X64_SHA256
+from specter_pipeline.compute import EC2_IMAGE
+from specter_pipeline.runtimes import (
+    DEFAULT_NODE_VERSION,
+    NODE_LINUX_X64_SHA256,
+    ec2_python_select,
+)
 
 REPO = "Specter099/demo"
 NODE_GATES = ["synth-check", "lint"]
@@ -74,10 +81,42 @@ def test_an_ec2_gate_runs_on_ec2_in_the_pipeline_and_on_pull_requests():
 def test_ec2_steps_bring_the_same_pinned_toolchain_not_the_image_s():
     lam = c.step_commands(build(gates=[*GATES, Gate("tf-plan", ["terraform plan"])]), "Gate-tf-plan")
     ec2 = c.step_commands(build(gates=[*GATES, TF]), "Gate-tf-plan")
-    # the venv is built from python3.12 explicitly, and the build stops if the image lacks it
-    assert ec2[0] == 'command -v python3.12 >/dev/null || { echo "this image has no python3.12; EC2 steps need it"; exit 1; }'
-    assert "python3.12 -m venv /tmp/venv" in ec2 and "python3 -m venv /tmp/venv" in lam
-    assert ec2[1:] == [x.replace("python3 -m venv", "python3.12 -m venv") for x in lam]
+    select = ec2_python_select()
+    # 3.12 is selected through pyenv and proven before the venv is built from it
+    assert ec2[: len(select)] == select
+    assert 'export PYENV_VERSION="$PYTHON_312_VERSION"' in select
+    assert ec2[len(select):] == [x.replace("python3 -m venv", "python3.12 -m venv") for x in lam]
+
+
+def _run_select(tmp_path, env_version, reported):
+    """Run the selection with a stand-in python3.12 that reports ``reported``."""
+    shim = tmp_path / "bin"
+    shim.mkdir(exist_ok=True)
+    fake = shim / "python3.12"
+    fake.write_text(f"#!/bin/sh\nexec python3 -c 'import sys; sys.version_info = {reported!r}; '\"$2\"\n")
+    fake.write_text("#!/usr/bin/env python3\nimport sys\n" f"sys.version_info = {reported!r}\n" "exec(sys.argv[2])\n")
+    fake.chmod(0o755)
+    env = {"PATH": f"{shim}:/usr/bin:/bin"}
+    if env_version is not None:
+        env["PYTHON_312_VERSION"] = env_version
+    return subprocess.run(["bash", "-ec", "\n".join(ec2_python_select())], check=False,
+                          capture_output=True, text=True, env=env)
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+@pytest.mark.parametrize(
+    "env_version,reported,ok,says",
+    [
+        ("3.12.15", (3, 12, 15), True, ""),
+        (None, (3, 12, 15), False, "PYTHON_312_VERSION is unset"),
+        # the 6.0 image's shim case: python3.12 resolves to another interpreter
+        ("3.12.15", (3, 14, 9), False, "does not run Python 3.12"),
+    ],
+)
+def test_ec2_python_selection_fails_closed(tmp_path, env_version, reported, ok, says):
+    r = _run_select(tmp_path, env_version, reported)
+    assert (r.returncode == 0) is ok, r.stdout + r.stderr
+    assert says in r.stdout + r.stderr
 
 
 @pytest.mark.parametrize("runtime", [Runtime.NODE, Runtime.PYTHON_NODE])
@@ -168,10 +207,46 @@ def test_an_assembly_gate_pr_check_gets_the_larger_size_and_both_timeouts():
     assert Ec2("large", 400).larger(Ec2("small", 400)) == Ec2("large", 480)
 
 
-def test_ec2_pr_checks_are_concurrency_capped_and_lambda_ones_are_not():
+def test_no_pr_check_has_a_concurrency_limit():
+    """CodeBuild drops builds over a project's limit instead of queueing them, which would leave a
+    PR without its status check."""
     t = build(gates=[*GATES, TF])
-    assert project(t, "demo-pr-tf-plan")["ConcurrentBuildLimit"] == PR_EC2_CONCURRENT_BUILDS
-    assert "ConcurrentBuildLimit" not in project(t, "demo-pr-unit")
+    for r in c.pr_projects(t, "demo").values():
+        assert "ConcurrentBuildLimit" not in r["Properties"]
+
+
+@pytest.mark.parametrize(
+    "gate_ec2,asm_ec2,asm_mem,size,timeout",
+    [
+        (Ec2("small", 10), None, 10, "BUILD_GENERAL1_LARGE", 25),   # Lambda 10 GB synth: >= 10 GB
+        (None, Ec2("large", 30), 4, "BUILD_GENERAL1_LARGE", 45),    # Lambda gate adds 15 min
+        (Ec2("small", 10), None, 2, "BUILD_GENERAL1_SMALL", 25),
+    ],
+)
+def test_mixed_lambda_and_ec2_pr_sizing(gate_ec2, asm_ec2, asm_mem, size, timeout):
+    scan = Gate("scan", ["ls cdk.out"], uses_assembly=True, ec2=gate_ec2)
+    t = asm_build(assembly=Assembly(ec2=asm_ec2, memory_gb=asm_mem), gates=[*GATES, scan])
+    pr = project(t, "demo-pr-scan")
+    assert (pr["Environment"]["ComputeType"], pr["TimeoutInMinutes"]) == (size, timeout)
+
+
+def test_an_ec2_step_whose_venv_uses_the_image_python_fails_the_contract():
+    doc = copy.deepcopy(build(gates=[*GATES, TF]).to_json())
+    for r in doc["Resources"].values():
+        if r["Type"] == "AWS::CodeBuild::Project" and c._project_step_name(r["Properties"]) == "Gate-tf-plan":
+            spec = json.loads(r["Properties"]["Source"]["BuildSpec"])
+            cmds = spec["phases"]["build"]["commands"]
+            spec["phases"]["build"]["commands"] = [x for x in cmds if x not in ec2_python_select()]
+            r["Properties"]["Source"]["BuildSpec"] = json.dumps(spec)
+    with pytest.raises(AssertionError, match="builds a venv from the image's Python"):
+        c.assert_lambda_compute(Template.from_json(doc), ["Gate-tf-plan", "demo-pr-tf-plan"])
+
+
+def test_pre_deploy_on_ec2_is_inferred_from_the_template():
+    deploy = DeployStep("app", ["./migrate.sh"], stacks=["AppStack"], ec2=Ec2("small", 60))
+    t = asm_build(deploy_step=deploy)
+    # assembly= not passed: the PreDeploy action is still found
+    c.assert_standard_contract(t, repo=REPO, gates=ASM_GATES, node_gates=NODE_GATES, deploy_step=deploy)
 
 
 def test_a_deploy_step_on_ec2_moves_its_pre_deploy_action_too_and_the_contract_knows():

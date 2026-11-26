@@ -220,8 +220,10 @@ Gate("tf-plan", ["terraform plan -out=tfplan"], ec2=Ec2(size="medium", timeout_m
   patches the image under the same tag.
 * An EC2 gate's PR check runs on EC2 too. The PR check of a `uses_assembly` gate synthesizes first,
   so when the assembly step is on EC2 it gets the larger of the two sizes and both timeouts added
-  together (at most 480). EC2 PR checks are limited to 2 concurrent builds: they run the PR's code,
-  as root, for up to their timeout.
+  together (at most 480). A Lambda side counts as its EC2 equal: at least its memory, and 15
+  minutes. EC2 PR checks have no concurrency limit, because CodeBuild drops builds over a limit
+  instead of queueing them, which would leave a PR without its status. They do run the PR's code
+  as root for up to their timeout, so keep PR-facing EC2 gates' timeouts tight.
 * `DeployStep(ec2=...)` applies to its `PreDeploy` action as well as the deploy action.
 * Not yet: caching, VPC, Docker. The contract still refuses all three.
 * The contract expects EC2 exactly where it is declared, and infers it from the steps. Gates with
@@ -229,8 +231,10 @@ Gate("tf-plan", ["terraform plan -out=tfplan"], ec2=Ec2(size="medium", timeout_m
   `assert_standard_contract` and their EC2 steps are inferred too, including the PR checks of
   `uses_assembly` gates. Name anything else in `ec2_steps=[...]`. An undeclared EC2 project fails,
   and so does a declared name that matches more than one project.
-* Not yet proven on live EC2: that the 6.0 image provides `python3.12`. The first EC2 build says so
-  plainly if it does not.
+* Python on EC2: the 6.0 image installs several Pythons through pyenv but activates only 3.14. EC2
+  steps select 3.12 with `PYENV_VERSION="$PYTHON_312_VERSION"`, run it to prove it is 3.12, and stop
+  with a clear message otherwise. This is from the image's published Dockerfile, not yet from a live
+  build.
 
 ## Development
 

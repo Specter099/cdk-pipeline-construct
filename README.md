@@ -180,7 +180,7 @@ GATES = terraform_gates(roots=["infra"])   # tf-fmt, tf-validate, tf-checkov
   every provider in it must list hashes: `init` would otherwise install an unhashed provider as
   "unauthenticated". The lock file must keep the layout `terraform init` writes: unindented
   `provider "host[:port]/namespace/name" {` blocks, a `hashes = [` list with at least one entry,
-  no comments and no other syntax. Regenerate it with `terraform providers lock` rather than
+  no comments inside a provider block and no other syntax. Regenerate it with `terraform providers lock` rather than
   editing it by hand; anything else is refused, so a comment cannot hide a missing hash. A committed `terraform.d/` or `.terraform/` is refused, because it could supply
   provider binaries.
 * `tf-checkov` runs pinned Checkov with its built-in policies, `--skip-download` (no platform calls)

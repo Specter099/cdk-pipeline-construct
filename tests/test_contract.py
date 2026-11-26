@@ -131,3 +131,23 @@ def test_catches_a_post_deploy_step_the_caller_did_not_declare():
     # an undeclared step would skip its runtime and compute checks
     with pytest.raises(AssertionError, match=r"Post-frontend.*not passed as post_deploy="):
         c.assert_standard_contract(tpl, repo=REPO, gates=GATES, node_gates=NODE_GATES)
+
+
+def test_a_repo_named_post_something_still_passes():
+    # its PR checks are named "Post-office-pr-<gate>", which are not post-deploy steps
+    t = build(repo="Specter099/Post-office")
+    c.assert_standard_contract(t, repo="Specter099/Post-office", gates=GATES, node_gates=NODE_GATES, deploy_stage="Prod",
+                               post_deploy=[POST])
+
+
+def test_rewording_a_post_step_description_does_not_hide_it():
+    import copy
+
+    from aws_cdk.assertions import Template
+
+    doc = copy.deepcopy(build().to_json())
+    for r in doc["Resources"].values():
+        if str(r.get("Properties", {}).get("Description", "")).endswith("/Post-frontend"):
+            r["Properties"]["Description"] = "something else"
+    with pytest.raises(AssertionError, match="Post-frontend"):
+        c.assert_standard_contract(Template.from_json(doc), repo=REPO, gates=GATES, node_gates=NODE_GATES)

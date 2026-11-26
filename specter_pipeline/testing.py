@@ -1103,10 +1103,19 @@ def assert_standard_contract(
         if pr_on_ec2 and pull_request_checks and g.runs_on_pull_requests:
             expected_ec2.add(f"{name}-pr-{g.name}")
     declared = {f"Post-{step.name}" for step in post_deploy}
+    # Pipeline steps only (a PR check of a repo named "Post-..." is not one), found both by the
+    # project's description and by the pipeline's own action names, which a description edit
+    # cannot hide.
     present = {
         n
         for r in projects(template).values()
-        if (n := _project_step_name(r["Properties"])) and n.startswith("Post-")
+        if str(r["Properties"].get("Description", "")).startswith("Pipeline step ")
+        and (n := _project_step_name(r["Properties"])).startswith("Post-")
+    } | {
+        a["Name"]
+        for st in pipeline(template).get("Stages", [])
+        for a in st.get("Actions", [])
+        if a["Name"].startswith("Post-")
     }
     # an undeclared post-deploy step would skip its runtime and compute checks
     assert present <= declared, (

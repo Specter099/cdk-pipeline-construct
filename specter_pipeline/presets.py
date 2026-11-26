@@ -354,6 +354,7 @@ def checkov_commands(raw: str, d: str, extra_args: str = "") -> list[str]:
         # The search is repo-wide and follows symlinks: a module outside the root, a nested
         # .terraform/ directory or a linked directory can all hold configuration Checkov loads.
         (
+            "command -v find > /dev/null || { echo 'find is not installed'; exit 1; }; "
             f'if [ -n "$(find -L . -name \'*.tf.json\' -print -quit 2>/dev/null)" ]; '
             f"then echo {json_tf}; exit 1; fi"
         ),

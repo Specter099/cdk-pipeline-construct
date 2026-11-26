@@ -270,7 +270,7 @@ def test_any_other_principal_that_can_read_a_secret_fails(principal):
         c.assert_applies_plan(mutated(change), GITHUB)
 
 
-@pytest.mark.parametrize("key", ["AWS_REGION", "AWS_PROFILE", "CODEBUILD_SRC_DIR", "PATH", "TF_LOG", "CI"])
+@pytest.mark.parametrize("key", ["AWS_ACCESS_KEY_ID", "AWS_PROFILE", "AWS_ENDPOINT_URL", "CODEBUILD_SRC_DIR", "PATH", "TF_LOG", "CI"])
 def test_env_may_not_redirect_the_sdk_or_codebuild(key):
     with pytest.raises(ValueError, match="env may not set"):
         TerraformRoot("x", env={key: "v"})
@@ -330,3 +330,57 @@ def test_a_role_reading_a_secret_of_this_template_is_not_a_false_positive():
 def test_a_missing_apply_is_an_assertion_not_a_key_error():
     with pytest.raises(AssertionError, match="no \\['Deploy-nope'\\]"):
         c.assert_terraform_order(tf_build(), [*ROOTS, TerraformRoot("nope", name="nope")])
+
+
+# --- PR #7 verification follow-ups (L2, L3, L5, L6) -------------------------------------------
+
+
+@pytest.mark.parametrize("key", ["AWS_MAX_ATTEMPTS", "AWS_RETRY_MODE"])
+def test_env_may_tune_the_aws_sdk(key):
+    TerraformRoot("x", env={key: "1"})
+
+
+def test_a_tf_token_secret_keeps_its_lower_case_host():
+    root = TerraformRoot("x", secrets={"TF_TOKEN_app_terraform_io": GH})
+    assert root.secrets == {"TF_TOKEN_app_terraform_io": GH}
+
+
+def test_a_named_template_secret_matching_a_roots_secret_is_caught():
+    def change(res):
+        res["Sec"] = {"Type": "AWS::SecretsManager::Secret", "Properties": {"Name": "gh-token"}}
+        _role_stmts(res, "Plan-network").append(
+            {"Effect": "Allow", "Action": "secretsmanager:GetSecretValue", "Resource": {"Ref": "Sec"}})
+    with pytest.raises(AssertionError, match="can read github's secret"):
+        c.assert_applies_plan(mutated(change), GITHUB, "demo", ROOTS)
+
+
+def test_a_gate_with_buildspec_secrets_fails_the_contract():
+    def change(res):
+        p = _project(res, "Gate-tf-validate")
+        spec = json.loads(p["Source"]["BuildSpec"])
+        spec["env"] = {"secrets-manager": {"GITHUB_TOKEN": GH}}
+        p["Source"]["BuildSpec"] = json.dumps(spec)
+    with pytest.raises(AssertionError, match="Gate-tf-validate reads Secrets Manager secrets"):
+        c.assert_standard_contract(mutated(change), post_deploy=[POST], repo=REPO, gates=GATES, terraform=ROOTS)
+
+
+def test_the_region_is_the_stacks():
+    # init gives the backend region=$AWS_REGION, which CodeBuild sets to the stack's region
+    for key in ("AWS_REGION", "AWS_DEFAULT_REGION"):
+        with pytest.raises(ValueError, match="env may not set"):
+            TerraformRoot("x", env={key: "eu-west-1"})
+
+
+def test_tf_token_needs_a_host():
+    with pytest.raises(ValueError, match="TF_TOKEN_<host>"):
+        TerraformRoot("x", secrets={"TF_TOKEN_": GH})
+
+
+@pytest.mark.parametrize("resource", [{"Fn::GetAtt": ["Sec", "Id"]}, {"Fn::Sub": "${Sec.Id}"}])
+def test_a_named_template_secret_by_its_id_is_caught(resource):
+    def change(res):
+        res["Sec"] = {"Type": "AWS::SecretsManager::Secret", "Properties": {"Name": "gh-token"}}
+        _role_stmts(res, "Plan-network").append(
+            {"Effect": "Allow", "Action": "secretsmanager:GetSecretValue", "Resource": resource})
+    with pytest.raises(AssertionError, match="can read github's secret"):
+        c.assert_applies_plan(mutated(change), GITHUB, "demo", ROOTS)

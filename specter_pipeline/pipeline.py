@@ -41,6 +41,7 @@ from aws_cdk import pipelines
 from constructs import Construct
 
 from .compute import Ec2, build_environment, build_timeout
+from .drift import TerraformDriftChecks
 from .gate import (
     BASE_ENV,
     Assembly,
@@ -168,8 +169,15 @@ class StandardPipeline(Construct):
         cdk_cli_version: str = DEFAULT_CDK_CLI_VERSION,
         node_version: str = DEFAULT_NODE_VERSION,
         terraform_version: str = DEFAULT_TERRAFORM_VERSION,
+        drift_schedule: str | None = None,
     ) -> None:
         super().__init__(scope, construct_id)
+        if drift_schedule is not None and terraform is None:
+            raise ValueError("drift_schedule checks Terraform roots; this pipeline has none")
+        if drift_schedule is not None and not (
+            drift_schedule.startswith(("cron(", "rate(")) and drift_schedule.endswith(")")
+        ):
+            raise ValueError(f"drift_schedule must be a cron(...) or rate(...) expression, got {drift_schedule!r}")
 
         if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo):
             raise ValueError(f"repo must be 'owner/name', got {repo!r}")
@@ -566,6 +574,25 @@ class StandardPipeline(Construct):
             self.notification_topic,
             events=[codepipeline.PipelineNotificationEvents.PIPELINE_EXECUTION_FAILED],
         )
+
+        # --- Terraform drift (scheduled, read-only) ----------------------------
+        self.drift_checks: TerraformDriftChecks | None = None
+        if drift_schedule is not None:
+            assert self.state_bucket is not None
+            self.drift_checks = TerraformDriftChecks(
+                self,
+                "DriftChecks",
+                repo=repo,
+                branch=branch,
+                connection_arn=connection_arn,
+                roots=roots,
+                state_bucket=self.state_bucket,
+                schedule=drift_schedule,
+                topic=self.notification_topic,
+                name_prefix=name,
+                node_version=node_version,
+                terraform_version=terraform_version,
+            )
 
         # --- PR validation (separate, deploy-less path) ----------------------
         self.pull_request_checks: PullRequestChecks | None = None

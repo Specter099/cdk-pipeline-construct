@@ -447,6 +447,23 @@ Gate("tf-plan", ["terraform plan -out=tfplan"], ec2=Ec2(size="medium", timeout_m
   with a clear message otherwise. This is from the image's published Dockerfile, not yet from a live
   build.
 
+## This repo's own CI
+
+`ci_app.py` deploys the library's own `PullRequestChecks` for this repo. Every PR gets four commit
+statuses:
+* `lint`: ruff;
+* `tests`: pytest, on Python+Node because the tests import `aws_cdk`;
+* `dependency-audit`: pinned pip-audit;
+* `ec2-smoke`: on EC2, the live check that the Amazon Linux 2023 standard 6.0 image gives Python
+  3.12 (selected through pyenv) and the pinned Node 22.
+
+Nothing is deployed by the checks, and their roles hold only logs and the connection token.
+Deploy it once:
+
+```bash
+cdk -a "python3 ci_app.py" deploy -c connection_arn=<the SpecterGitHubConnection ARN>
+```
+
 ## Development
 
 ```bash

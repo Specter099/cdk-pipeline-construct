@@ -242,3 +242,96 @@ def test_failures_say_which_root_and_where_to_look(tpl):
                if "EventPattern" in r["Properties"] and "'github'" in r["Properties"]["Description"]]
     template = rule["Targets"][0]["InputTransformer"]["InputTemplate"]
     assert "'github'" in template and "<detail-build-status>" in template and "<detail-build-id>" in template
+
+
+# --- PR #8 verification follow-ups (A, B): rules that never fire, extra project settings ------
+
+
+def _failure_rules(res):
+    return _rules(res, lambda p: "EventPattern" in p)
+
+
+def _schedule_rules(res):
+    return _rules(res, lambda p: "ScheduleExpression" in p)
+
+
+def _drop_topic_policy(res):
+    for k in [k for k, r in res.items() if r["Type"] == "AWS::SNS::TopicPolicy"]:
+        res.pop(k)
+
+
+@pytest.mark.parametrize(
+    "change,message",
+    [
+        (lambda r: [p["EventPattern"].__setitem__("source", ["aws.codepipeline"]) for p in _failure_rules(r)],
+         "failures are not published"),
+        (lambda r: [p["EventPattern"].__setitem__("detail-type", ["x"]) for p in _failure_rules(r)],
+         "failures are not published"),
+        (lambda r: [p["EventPattern"]["detail"].__setitem__("never", ["x"]) for p in _failure_rules(r)],
+         "failures are not published"),
+        (lambda r: [p["EventPattern"].__setitem__("account", ["111122223333"]) for p in _failure_rules(r)],
+         "failures are not published"),
+        (lambda r: [p.__setitem__("EventBusName", "custom") for p in _failure_rules(r)],
+         "failures are not published"),
+        (_drop_topic_policy, "failures are not published"),
+        (lambda r: [p.__setitem__("EventBusName", "custom") for p in _schedule_rules(r)],
+         "not started by a schedule"),
+        (lambda r: [t.pop("RoleArn") for p in _schedule_rules(r) for t in p["Targets"]],
+         "not started by a schedule"),
+        (lambda r: _drift(r).__setitem__("SecondarySources", [{"Type": "GITHUB", "Location": "x"}]),
+         "project settings the construct does not set"),
+        (lambda r: _drift(r).__setitem__("BuildBatchConfig", {}), "project settings the construct does not set"),
+        (lambda r: _drift(r)["Source"].__setitem__("GitSubmodulesConfig", {"FetchSubmodules": True}),
+         "source settings the construct does not set"),
+    ],
+)
+def test_rules_that_never_fire_and_extra_settings_are_caught(change, message):
+    with pytest.raises(AssertionError, match=message):
+        c.assert_standard_contract(mutated(change), post_deploy=[POST], repo=REPO, gates=GATES,
+                                   terraform=ROOTS, drift=True)
+
+
+# --- PR #9 review: no false positives on tagged stacks or minimized topic policies ------------
+
+
+def test_a_tagged_stack_passes_the_drift_contract():
+    import aws_cdk as cdk
+    from test_pipeline import CONN, ENV
+
+    from specter_pipeline import StandardPipeline
+
+    app = cdk.App()
+    cdk.Tags.of(app).add("owner", "me")
+    stack = cdk.Stack(app, "PipelineStack", env=ENV)
+    StandardPipeline(stack, "P", repo=REPO, connection_arn=CONN, gates=GATES, terraform=ROOTS,
+                     drift_schedule=CRON, synth_commands=["cdk -a 'python3 pipeline_app.py' synth"],
+                     synth_install=["pip install -r requirements.txt"], post_deploy=[POST])
+    c.assert_standard_contract(Template.from_stack(stack), post_deploy=[POST], repo=REPO, gates=GATES,
+                               terraform=ROOTS, drift=True)
+
+
+def test_a_minimized_topic_policy_passes_the_drift_contract():
+    import aws_cdk as cdk
+    from test_pipeline import CONN, ENV
+
+    from specter_pipeline import StandardPipeline
+
+    app = cdk.App(context={"@aws-cdk/aws-iam:minimizePolicies": True})
+    stack = cdk.Stack(app, "PipelineStack", env=ENV)
+    StandardPipeline(stack, "P", repo=REPO, connection_arn=CONN, gates=GATES, terraform=ROOTS,
+                     drift_schedule=CRON, synth_commands=["cdk -a 'python3 pipeline_app.py' synth"],
+                     synth_install=["pip install -r requirements.txt"], post_deploy=[POST])
+    t = Template.from_stack(stack)
+    services = [st["Principal"].get("Service") for pol in t.find_resources("AWS::SNS::TopicPolicy").values()
+                for st in pol["Properties"]["PolicyDocument"]["Statement"] if isinstance(st.get("Principal"), dict)]
+    assert any(isinstance(s, list) for s in services), services  # the shape that used to fail
+    c.assert_standard_contract(t, post_deploy=[POST], repo=REPO, gates=GATES, terraform=ROOTS, drift=True)
+
+
+def test_a_build_status_filter_that_is_not_a_plain_list_is_an_assertion():
+    def change(res):
+        for p in _failure_rules(res):
+            p["EventPattern"]["detail"]["build-status"] = [{"anything-but": ["SUCCEEDED"]}]
+    with pytest.raises(AssertionError, match="failures are not published"):
+        c.assert_standard_contract(mutated(change), post_deploy=[POST], repo=REPO, gates=GATES,
+                                   terraform=ROOTS, drift=True)

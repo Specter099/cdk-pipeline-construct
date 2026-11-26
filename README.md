@@ -356,7 +356,8 @@ CodeBuild project per root, started by an EventBridge schedule:
     approval that changes a root output or adds a `moved` block also exits 2.
   * A check that runs while `Deploy-<root>` applies compares half-applied infrastructure with the
     state from before the apply. Schedule the check away from release times.
-* One schedule rule per root, so there is no limit on the number of roots.
+* Each root gets its own schedule rule (an EventBridge rule takes at most 5 targets) and its own
+  failure rule, so the drift checks use two of the account's EventBridge rules per root.
 * It runs on EC2 with the root's plan permissions, read-only access to its state object (no lock),
   and the root's provider secrets. It has no state write and no deploy rights.
 * Like `Plan-<root>`, it runs the branch's code with those credentials before anyone approves a
@@ -447,12 +448,42 @@ Gate("tf-plan", ["terraform plan -out=tfplan"], ec2=Ec2(size="medium", timeout_m
   with a clear message otherwise. This is from the image's published Dockerfile, not yet from a live
   build.
 
+## This repo's own CI
+
+`ci_app.py` deploys the library's own `PullRequestChecks` for this repo. Every PR gets four commit
+statuses:
+* `lint`: ruff over the whole repo;
+* `tests`: pytest, on Python+Node because the tests import `aws_cdk`, on EC2 (30 minutes): the
+  suite synthesizes hundreds of pipelines and would come close to Lambda's 15-minute limit;
+* `dependency-audit`: pinned pip-audit, after upgrading the venv's own pip;
+* `ec2-smoke`: on EC2, the live check that the Amazon Linux 2023 standard 6.0 image gives Python
+  3.12 (selected through pyenv) and the pinned Node 22.
+
+The checks install from `requirements-dev.txt` with the exact versions in `constraints-dev.txt`,
+so a new CDK release cannot turn unrelated PRs red; raise them in a PR of their own.
+
+Nothing is deployed by the checks, and their roles hold only logs and the connection token.
+* `lint`, `tests` and `dependency-audit` run the PR's code (its requirements, its package build,
+  its tests) with that token, which reaches every repository the GitHub connection's app is
+  installed on. PRs from forks wait for a maintainer's approval comment: before approving, read
+  the PR's changes to `requirements-dev.txt`, `constraints-dev.txt`, `pyproject.toml` and the
+  tests. A connection whose app is installed on this repository only would narrow the token.
+* The checks are deployed from `main`. A PR that changes `ci/ci_stack.py` is still checked by the
+  deployed projects until someone redeploys after the merge.
+
+Deploy it once, into a CDK-bootstrapped account (the stack has no assets, but CloudFormation
+deploys it through the bootstrap roles):
+
+```bash
+cdk -a "python3 ci_app.py" deploy -c connection_arn=<the SpecterGitHubConnection ARN>
+```
+
 ## Development
 
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements-dev.txt
-ruff check specter_pipeline tests
+pip install -r requirements-dev.txt -c constraints-dev.txt
+ruff check .
 JSII_RUNTIME_PACKAGE_CACHE_ROOT=$TMPDIR/jsii-cache pytest -q   # env var only needed in a sandbox
 ```
 

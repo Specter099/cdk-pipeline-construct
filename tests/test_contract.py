@@ -97,7 +97,7 @@ def test_catches_a_wrong_stage_order():
 
 
 def test_catches_the_wrong_artifact_bucket_name():
-    with pytest.raises(AssertionError, match="unexpected bucket prefix"):
+    with pytest.raises(AssertionError, match="expected one artifact bucket with prefix .not-demo-pipeline., found 0"):
         c.assert_artifact_bucket(_step_build(), "not-demo")
 
 

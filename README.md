@@ -200,6 +200,46 @@ GATES = terraform_gates(roots=["infra"])   # tf-fmt, tf-validate, tf-checkov
   still run in the check. Keep the repo private, or require approval for PRs from forks (the
   default). Plan and apply, with state and credentials, come in step 3, on EC2 compute.
 
+## Terraform: plan once, apply exactly that plan
+
+Step 3. The pipeline is still CDK; the infrastructure is a Terraform root module.
+
+```python
+from specter_pipeline import StandardPipeline, TerraformRoot
+from specter_pipeline.presets import terraform_gates
+
+ROOT = TerraformRoot(
+    "infra",
+    plan_policy_statements=[...],    # what refresh and plan read
+    apply_policy_statements=[...],   # what apply creates and changes
+)
+StandardPipeline(..., gates=terraform_gates(roots=["infra"]), terraform=ROOT,
+                 synth_commands=['cdk -a "python3 pipeline_app.py" synth'])
+```
+
+```
+Gates:  Plan-main (EC2)  ->  Gate-tf-plan-check-main      + the static gates, in parallel
+Deploy: Approve -> Deploy-main (EC2: terraform apply tfplan) -> post-deploy steps
+```
+
+* The construct creates the state bucket: `{repo}-tfstate-{account}-{region}-an`, versioned,
+  encrypted, retained, with state never expired. Each root gets its own key and lock file
+  (`<name>/terraform.tfstate`), using Terraform's own S3 lock file (no DynamoDB). The root declares
+  a partial backend, `terraform { backend "s3" {} }`, and the construct supplies the rest at `init`.
+* `Plan-<name>` runs `plan -out=tfplan` and saves `show -json` and a text rendering. It can read
+  state and hold the lock, but not write state. Its output is the checkout plus the saved plan.
+* `Gate-tf-plan-check-<name>` reads only the plan, with no AWS access. It fails on any delete or
+  replace unless `allow_destroy=True`, and runs Checkov's plan checks.
+* `Deploy-<name>` belongs to the construct. Its only input is the plan artifact. It re-initialises
+  against the committed lock file and runs exactly `terraform apply tfplan`, which Terraform refuses
+  if the state has moved since the plan. Only this role can write state.
+* Plan and apply run on EC2 (`plan_ec2`, `apply_ec2`; defaults are small with 60 and 120 minutes),
+  so a long apply is not killed half-way.
+* What the construct cannot promise: Terraform itself runs the configuration's code during plan and
+  apply (provider plugins, `external` data sources, `local-exec`). That code comes from the reviewed
+  main branch, as a CDK app's does.
+* `assert_standard_contract(..., terraform=ROOT)` checks all of this, via `assert_applies_plan`.
+
 ## Contract tests: `specter_pipeline.testing`
 
 Every consumer must prove the same things about its pipeline. Instead of copying a test file:

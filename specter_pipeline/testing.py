@@ -44,7 +44,10 @@ from .runtimes import (
     cdk_cli_install,
     node_tarball_prelude,
     prelude,
+    python_prelude,
+    terraform_prelude,
 )
+from .terraform import TerraformRoot, apply_commands, plan_commands
 
 #: The exact actions a PR-check role may hold (measured on a synthesized pipeline): its own
 #: logs, the report permissions CodeBuild adds for the project's own report group, and the
@@ -536,6 +539,79 @@ def assert_builds_once(
             )
 
 
+def _role_of(template: Template, step: str) -> str:
+    return _project_of(template, step)["ServiceRole"]["Fn::GetAtt"][0]
+
+
+def _state_resource(resource, root: TerraformRoot, suffix: str) -> bool:
+    text = json.dumps(resource)
+    return "TerraformState" in text and text.rstrip('"]}').endswith(f"{root.name}/terraform.tfstate{suffix}")
+
+
+def assert_applies_plan(template: Template, root: TerraformRoot) -> None:
+    """Plan once, check that plan, apply exactly that plan.
+
+    ``Plan-<name>`` (EC2) produces the plan artifact. ``Gate-tf-plan-check-<name>`` and the
+    construct-only ``Deploy-<name>`` read that artifact and nothing else, after the plan. The
+    deploy runs on EC2 exactly the pinned Terraform set-up and ``apply_commands``. Only the deploy
+    role may write the state file; the plan role may read it and hold its lock; the plan-check role
+    has no access to the state bucket at all."""
+    gates = {a["Name"]: a for a in _stage(template, "Gates")["Actions"]}
+    plan_name, check_name, deploy_name = (
+        f"Plan-{root.name}", f"Gate-tf-plan-check-{root.name}", f"Deploy-{root.name}"
+    )
+    assert plan_name in gates, f"no {plan_name} action in Gates"
+    (out,) = gates[plan_name].get("OutputArtifacts", [{}]) or [{}]
+    artifact = out.get("Name")
+    assert artifact, f"{plan_name} produces no artifact"
+    assert check_name in gates, f"no {check_name} action in Gates"
+    check = gates[check_name]
+    assert [i["Name"] for i in check.get("InputArtifacts", [])] == [artifact], (
+        f"{check_name} does not read exactly the plan artifact"
+    )
+    assert check["RunOrder"] > gates[plan_name]["RunOrder"], f"{check_name} does not wait for the plan"
+    assert any("plan_check" not in c and "tfplan.json" in c for c in step_commands(template, check_name)), (
+        f"{check_name} does not read the plan JSON"
+    )
+
+    deploys = {a["Name"]: a for a in _stage(template, "Deploy")["Actions"]}
+    assert deploy_name in deploys, f"no {deploy_name} action in Deploy"
+    reads = [i["Name"] for i in deploys[deploy_name].get("InputArtifacts", [])]
+    assert reads == [artifact], f"{deploy_name} reads {reads}: it must read the plan artifact only"
+
+    for step, ec2 in ((plan_name, root.plan_ec2), (deploy_name, root.apply_ec2)):
+        env = _project_of(template, step)["Environment"]
+        assert env["Type"] == "LINUX_CONTAINER" and env["Image"] == EC2_IMAGE.image_id, (
+            f"{step} is not on EC2: Terraform must not be killed by Lambda's 15-minute limit"
+        )
+    spec = json.loads(_project_of(template, deploy_name)["Source"]["BuildSpec"])
+    assert set(spec) <= {"version", "phases"} and set(spec["phases"]) == {"build"}, (
+        f"{deploy_name} buildspec has more than the build commands"
+    )
+    assert set(spec["phases"]["build"]) == {"commands"}, f"{deploy_name} build phase has extra settings"
+    cmds = spec["phases"]["build"]["commands"]
+    expected = [
+        [*python_prelude(ec2=True), *terraform_prelude(v), *apply_commands(root)]
+        for v in TERRAFORM_LINUX_SHA256
+    ]
+    assert cmds in expected, f"{deploy_name} runs more or other than applying the saved plan: {cmds}"
+    assert step_commands(template, plan_name)[-len(plan_commands(root)):] == plan_commands(root), (
+        f"{plan_name} does not end with the construct's plan commands"
+    )
+
+    roles = {step: _role_of(template, step) for step in (plan_name, check_name, deploy_name)}
+    for step, role in roles.items():
+        for _, stmt in _role_policy_statements(template, {role}):
+            actions = set(_as_list(stmt["Action"]))
+            for resource in _as_list(stmt["Resource"]):
+                if step == check_name:
+                    assert "TerraformState" not in json.dumps(resource), (
+                        f"{check_name} can reach the state bucket"
+                    )
+                if _state_resource(resource, root, "") and "s3:PutObject" in actions:
+                    assert step == deploy_name, f"{step} can write the Terraform state"
+
+
 def assert_no_pipeline_triggers(template: Template) -> None:
     """A pull-request trigger would run self-mutation from a PR branch before any approval.
     CloudFormation spells the key 'PullRequest', so check for no triggers at all."""
@@ -573,17 +649,28 @@ def assert_source(
 def assert_artifact_bucket(template: Template, name: str) -> None:
     """A '...-{account}-{region}-an' name needs the account-regional namespace; a literal
     BucketName fails to create (found on a real deploy attempt)."""
-    buckets = [
+    prefixed = [
         r["Properties"]
         for r in template.find_resources("AWS::S3::Bucket").values()
         if "BucketNamePrefix" in r["Properties"]
     ]
+    # Every house-named bucket (the artifact bucket, a Terraform state bucket) must be in the
+    # account-regional namespace and private.
+    for b in prefixed:
+        assert "BucketName" not in b, f"{b['BucketNamePrefix']} uses a literal BucketName"
+        assert b.get("BucketNamespace") == "account-regional", (
+            f"{b['BucketNamePrefix']} is not in the account-regional namespace"
+        )
+        assert b["PublicAccessBlockConfiguration"]["BlockPublicAcls"] in (True, "true"), (
+            f"{b['BucketNamePrefix']} allows public access"
+        )
+    expected = artifact_bucket_purpose(name)
+    buckets = [b for b in prefixed if b["BucketNamePrefix"] == expected]
     assert len(buckets) == 1, (
-        f"expected one prefixed artifact bucket, found {len(buckets)}"
+        f"expected one artifact bucket with prefix {expected!r}, found {len(buckets)}"
     )
     props = buckets[0]
     assert "BucketName" not in props, "artifact bucket uses a literal BucketName"
-    expected = artifact_bucket_purpose(name)
     assert props["BucketNamePrefix"] == expected, (
         f"unexpected bucket prefix {props['BucketNamePrefix']!r}, expected {expected!r}"
     )
@@ -729,6 +816,7 @@ def assert_standard_contract(
     assembly: Assembly | None = None,
     deploy_step: DeployStep | None = None,
     post_deploy: Sequence[PostDeployStep] = (),
+    terraform: TerraformRoot | None = None,
 ) -> None:
     """Every invariant a StandardPipeline must satisfy. Repo-specific checks go alongside.
 
@@ -780,6 +868,10 @@ def assert_standard_contract(
             Runtime.NODE if builds_from_assembly else deploy_step.runtime
         )
         runtimes[f"PreDeploy-{deploy_step.name}"] = deploy_step.runtime
+    if terraform is not None:
+        expected_ec2 |= {f"Plan-{terraform.name}", f"Deploy-{terraform.name}"}
+        runtimes[f"Plan-{terraform.name}"] = Runtime.TERRAFORM
+        runtimes[f"Deploy-{terraform.name}"] = Runtime.TERRAFORM
     if deploy_step is not None and deploy_step.ec2 is not None:
         expected_ec2.add(f"Deploy-{deploy_step.name}")
         pre = f"PreDeploy-{deploy_step.name}"
@@ -788,7 +880,13 @@ def assert_standard_contract(
     assert_lambda_compute(template, expected_ec2, runtimes, pr_prefix=name)
     assert_ci_env_on_repo_command_projects(template)
     assert_stage_order(template, deploy_stage)
-    assert_gates_present(template, gates)
+    checked_gates = list(gates)
+    if terraform is not None:
+        # The construct's plan check reads the plan artifact, like an assembly gate.
+        checked_gates.append(
+            Gate(f"tf-plan-check-{terraform.name}", ["true"], uses_assembly=True)
+        )
+    assert_gates_present(template, checked_gates)
     assert_deploy_ordering(template, deploy_stage, require_approval=require_approval)
     if deploy_enabled:
         assert_deploy_open(template)
@@ -806,6 +904,9 @@ def assert_standard_contract(
             "PR-check projects exist but pull_request_checks is off"
         )
     assert_gates_have_node(gates, node_gates)
+    if terraform is not None:
+        assert_applies_plan(template, terraform)
+        builds_once = False if builds_once is None else builds_once
     if builds_once is None:
         builds_once = bool(_assembly_actions(template)) or any(g.uses_assembly for g in gates)
     if builds_once:
@@ -814,6 +915,7 @@ def assert_standard_contract(
 
 __all__ = [
     "CDK_INTERNAL_WILDCARDS",
+    "assert_applies_plan",
     "assert_artifact_bucket",
     "assert_builds_once",
     "assert_ci_env_on_repo_command_projects",

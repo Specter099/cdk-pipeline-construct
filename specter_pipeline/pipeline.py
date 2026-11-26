@@ -63,6 +63,14 @@ from .runtimes import (
     join,
     prelude,
 )
+from .terraform import CHECKOV as TF_CHECKOV
+from .terraform import (
+    TerraformRoot,
+    apply_commands,
+    plan_check_commands,
+    plan_commands,
+    state_policy,
+)
 
 #: Pipeline stage name used when deploying through a ``DeployStep`` (with an
 #: ``application_stage`` the stage's own name is used instead).
@@ -136,6 +144,7 @@ class StandardPipeline(Construct):
         application_stage: cdk.Stage | None = None,
         deploy_step: DeployStep | None = None,
         assembly: Assembly | None = None,
+        terraform: TerraformRoot | None = None,
         bootstrap_qualifier: str = "hnb659fds",
         synth_commands: Sequence[str],
         synth_install: Sequence[str] = (),
@@ -164,8 +173,12 @@ class StandardPipeline(Construct):
         if len({p.name for p in post_deploy}) != len(post_deploy):
             raise ValueError("post-deploy step names must be unique")
 
-        if (application_stage is None) == (deploy_step is None):
-            raise ValueError("provide exactly one of application_stage or deploy_step")
+        if sum(x is not None for x in (application_stage, deploy_step, terraform)) != 1:
+            raise ValueError("provide exactly one of application_stage, deploy_step or terraform")
+        if terraform is not None and (assembly is not None or any(g.uses_assembly for g in gates)):
+            raise ValueError(
+                "terraform pipelines have no cloud assembly: the plan is what the checks read"
+            )
 
         if assembly is not None and application_stage is not None:
             raise ValueError(
@@ -210,6 +223,8 @@ class StandardPipeline(Construct):
         deploy_stage_name = (
             application_stage.stage_name if application_stage else DEPLOY_WAVE
         )
+        if terraform is not None and any(g.name == f"tf-plan-check-{terraform.name}" for g in gates):
+            raise ValueError(f"gate name tf-plan-check-{terraform.name} is the construct's")
 
         # --- artifact bucket (explicit, account-namespaced name) -------------
         self.artifact_bucket = s3.Bucket(
@@ -233,6 +248,26 @@ class StandardPipeline(Construct):
             ],
             removal_policy=cdk.RemovalPolicy.RETAIN,
         )
+
+        # --- Terraform state (only for terraform pipelines) -------------------
+        self.state_bucket: s3.Bucket | None = None
+        if terraform is not None:
+            self.state_bucket = s3.Bucket(
+                self,
+                "TerraformState",
+                # House naming rule, as for the artifact bucket: {purpose}-{account}-{region}-an.
+                bucket_name_prefix=artifact_bucket_purpose(name).removesuffix("-pipeline") + "-tfstate",
+                bucket_namespace=s3.BucketNamespace.ACCOUNT_REGIONAL,
+                encryption=s3.BucketEncryption.S3_MANAGED,
+                enforce_ssl=True,
+                block_public_access=s3.BlockPublicAccess.BLOCK_ALL,
+                versioned=True,
+                # State is never expired; old versions are kept 90 days for recovery.
+                lifecycle_rules=[
+                    s3.LifecycleRule(noncurrent_version_expiration=cdk.Duration.days(90))
+                ],
+                removal_policy=cdk.RemovalPolicy.RETAIN,
+            )
 
         # --- source ----------------------------------------------------------
         source = pipelines.CodePipelineSource.connection(
@@ -317,8 +352,43 @@ class StandardPipeline(Construct):
             )
             for gate in gates
         ]
+        plan: pipelines.CodeBuildStep | None = None
+        if terraform is not None:
+            assert self.state_bucket is not None
+            tf_env = {**terraform.environment, "TF_STATE_BUCKET": self.state_bucket.bucket_name}
+            # Plan once. Reads state and holds the lock; cannot write state.
+            plan = pipelines.CodeBuildStep(
+                f"Plan-{terraform.name}",
+                input=source,
+                primary_output_directory=".",
+                commands=join(
+                    prelude(Runtime.TERRAFORM, node_version, terraform_version, ec2=True),
+                    plan_commands(terraform),
+                ),
+                env=tf_env,
+                role_policy_statements=[
+                    *terraform.plan_policy_statements,
+                    *state_policy(self.state_bucket.bucket_arn, terraform, write_state=False),
+                ],
+                build_environment=_environment(Runtime.TERRAFORM, 2, terraform.plan_ec2),
+                timeout=build_timeout(terraform.plan_ec2),
+            )
+            # Check the plan with no AWS access: destroys, then Checkov's plan policies.
+            gate_steps.append(
+                pipelines.CodeBuildStep(
+                    f"Gate-tf-plan-check-{terraform.name}",
+                    input=plan,
+                    commands=join(
+                        prelude(Runtime.PYTHON, node_version),
+                        [f"pip install {TF_CHECKOV}"],
+                        plan_check_commands(terraform, terraform.path),
+                    ),
+                    env=dict(BASE_ENV),
+                    build_environment=_environment(Runtime.PYTHON, 2),
+                )
+            )
         self.pipeline.add_wave(
-            "Gates", pre=[assemble] if assemble else [], post=gate_steps
+            "Gates", pre=[s for s in (assemble, plan) if s is not None], post=gate_steps
         )
 
         # --- deploy stage: approval -> deploy -> post-deploy -----------------
@@ -336,7 +406,30 @@ class StandardPipeline(Construct):
             )
             for step in post_deploy
         ]
-        if application_stage is not None:
+        if terraform is not None:
+            assert plan is not None and self.state_bucket is not None
+            # Apply exactly the saved plan. Construct-only: its only input is the plan artifact.
+            apply = pipelines.CodeBuildStep(
+                f"Deploy-{terraform.name}",
+                input=plan,
+                commands=join(
+                    prelude(Runtime.TERRAFORM, node_version, terraform_version, ec2=True),
+                    apply_commands(terraform),
+                ),
+                env={**terraform.environment, "TF_STATE_BUCKET": self.state_bucket.bucket_name},
+                role_policy_statements=[
+                    *terraform.apply_policy_statements,
+                    *state_policy(self.state_bucket.bucket_arn, terraform, write_state=True),
+                ],
+                build_environment=_environment(Runtime.TERRAFORM, 2, terraform.apply_ec2),
+                timeout=build_timeout(terraform.apply_ec2),
+            )
+            for approval in pre:
+                apply.add_step_dependency(approval)
+            for step in post:
+                step.add_step_dependency(apply)
+            self.pipeline.add_wave(DEPLOY_WAVE, pre=pre, post=[apply, *post])
+        elif application_stage is not None:
             self.pipeline.add_stage(application_stage, pre=pre, post=post)
         else:
             assert deploy_step is not None

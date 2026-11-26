@@ -265,15 +265,49 @@ def _terraform_root(root: str) -> str:
     return norm
 
 
-#: Fails unless every provider in a .terraform.lock.hcl lists hashes: `init -lockfile=readonly`
-#: installs a provider whose lock entry has none ("unauthenticated") and exits 0.
-_LOCK_HASHES_CHECK = (
-    "import re, sys; t = open(sys.argv[1]).read(); "
-    "bad = [b.split('\"', 1)[0] for b in re.split(r'(?m)^provider\\s+\"', t)[1:] "
-    "if not re.search(r'hashes\\s*=\\s*\\[\\s*\"(h1|zh):', b)]; "
-    "bad and print('lock file entries without hashes: ' + ', '.join(bad) + "
-    "' (run terraform providers lock)'); sys.exit(1 if bad else 0)"
-)
+#: Fails unless .terraform.lock.hcl is exactly the shape `terraform init` writes and every
+#: provider in it lists at least one hash. `init -lockfile=readonly` installs a provider whose
+#: entry has no hashes ("unauthenticated") and exits 0, and a loose pattern match can be fooled
+#: (a comment holding "hashes", indentation, a byte-order mark), so the whole file is checked line
+#: by line against Terraform's own layout: anything else is refused.
+_LOCK_GRAMMAR = r"""
+import re, sys
+raw = open(sys.argv[1], "rb").read()
+try:
+    text = raw.decode("ascii")
+except UnicodeDecodeError:
+    print("lock file has non-ASCII bytes"); sys.exit(1)
+ok, block, hashes, in_hashes, bad = True, None, 0, False, []
+for n, line in enumerate(text.replace("\r\n", "\n").split("\n"), 1):
+    if block is None:
+        if line == "" or line.startswith("#"):
+            continue
+        m = re.fullmatch(r'provider "([a-z0-9.-]+/[a-z0-9_-]+/[a-z0-9_-]+)" \{', line)
+        if not m:
+            print(f"lock file line {n} is not what terraform init writes: {line!r}"); sys.exit(1)
+        block, hashes = m.group(1), 0
+    elif in_hashes:
+        if re.fullmatch(r'    "(h1|zh):[A-Za-z0-9+/=]+",', line):
+            hashes += 1
+        elif line == "  ]":
+            in_hashes = False
+        else:
+            print(f"lock file line {n} is not what terraform init writes: {line!r}"); sys.exit(1)
+    elif line == "}":
+        if not hashes:
+            bad.append(block)
+        block = None
+    elif line == "  hashes = [":
+        in_hashes = True
+    elif not re.fullmatch(r'  (version|constraints) +=  ?"[^"\\]*"', line):
+        print(f"lock file line {n} is not what terraform init writes: {line!r}"); sys.exit(1)
+if block is not None or in_hashes:
+    print("lock file ends inside a block"); sys.exit(1)
+if bad:
+    print("lock file entries without hashes: " + ", ".join(bad) + " (run terraform providers lock)")
+    sys.exit(1)
+""".strip()
+_LOCK_HASHES_CHECK = "exec(" + repr(_LOCK_GRAMMAR) + ")"
 
 #: Checkov reads .checkov.yaml/.yml from the scanned directory, the working directory and $HOME,
 #: and such a file can switch the gate off (soft-fail, skip-path, skip-check, external checks).
@@ -311,8 +345,16 @@ def checkov_commands(raw: str, d: str, extra_args: str = "") -> list[str]:
     refuse = shlex.quote("a Checkov config file can switch the gate off; remove it")
     unparsed = shlex.quote(f"{raw}: Checkov could not parse some files")
     missing = shlex.quote(f"{raw}: no such directory")
+    json_tf = shlex.quote(
+        f"{raw}: *.tf.json files are not scanned by Checkov 3.4.4; write the configuration as .tf"
+    )
     return [
         f"test -d {d} || {{ echo {missing}; exit 1; }}",
+        # Checkov silently skips JSON configuration, so a .tf.json resource would pass unscanned.
+        (
+            f'if [ -n "$(find {d} -name \'*.tf.json\' -not -path \'*/.terraform/*\' | head -n 1)" ]; '
+            f"then echo {json_tf}; exit 1; fi"
+        ),
         f'for f in {configs}; do if [ -e "$f" ]; then echo "$f:" {refuse}; exit 1; fi; done',
         (
             f"rc=0; checkov {extra_args or f'-d {d} --framework terraform'} --quiet --compact "

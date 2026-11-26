@@ -182,8 +182,9 @@ GATES = terraform_gates(roots=["infra"])   # tf-fmt, tf-validate, tf-checkov
   provider binaries.
 * `tf-checkov` runs pinned Checkov with its built-in policies, `--skip-download` (no platform calls)
   and `--hard-fail-on 'CKV*'`. A `.checkov.yaml` or `.checkov.yml` in the root, the working
-  directory or `$HOME` is refused, because such a file can switch the gate off. A missing root or
-  any file Checkov cannot parse fails the gate. Inline `#checkov:skip=` comments still work and show
+  directory or `$HOME` is refused, because such a file can switch the gate off. A missing root, a
+  file Checkov cannot parse, or any `*.tf.json` file (Checkov 3.4.4 skips JSON configuration)
+  fails the gate. Inline `#checkov:skip=` comments still work and show
   in the diff.
 * TFLint is opt-in (`tflint=(version, sha256)`), because its releases are on GitHub and no hash has
   been verified for this package yet. It runs without `--init`, so only its bundled Terraform rules
@@ -207,6 +208,9 @@ def test_pipeline(template):
     contract.assert_standard_contract(template, repo="Specter099/my-repo", gates=GATES,
                                       node_gates=["tests", "cdk-synth"])
 ```
+
+Pass `assembly=`, `deploy_step=` and `post_deploy=` too, so that each step's expected runtime and
+compute are known and its pinned toolchain is checked exactly.
 
 It checks Lambda compute everywhere, the stage order, the gates, build-once (whenever the pipeline has an
 assembly step or a gate reads the assembly), the deploy closed (or open),

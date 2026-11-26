@@ -107,14 +107,14 @@ def test_no_gate_has_aws_access_and_all_run_on_pull_requests():
 
 def test_validate_never_reads_state_and_requires_the_lock_file():
     (validate,) = [g for g in terraform_gates() if g.name == "tf-validate"]
-    init = [x for x in validate.commands if " init " in x]
+    init = [x for x in validate.commands if x.startswith("terraform ") and " init " in x]
     assert init and all("-backend=false" in x and "-lockfile=readonly" in x for x in init)
     assert validate.commands[0].startswith("test -f ./.terraform.lock.hcl ||")
 
 
 def test_each_root_is_checked():
     gates = {g.name: g for g in terraform_gates(roots=["infra", "envs/prod"])}
-    for name, per_root in (("tf-fmt", 1), ("tf-validate", 5), ("tf-checkov", 3)):
+    for name, per_root in (("tf-fmt", 1), ("tf-validate", 5), ("tf-checkov", 4)):
         cmds = gates[name].commands
         assert len(cmds) == 2 * per_root
         assert any("infra" in x for x in cmds) and any("envs/prod" in x for x in cmds)
@@ -290,13 +290,16 @@ def test_a_checkov_config_in_home_is_refused_too(tmp_path):
     assert r.returncode != 0 and "config file" in r.stdout
 
 
-def test_post_deploy_steps_get_the_pipeline_terraform_version():
+def test_post_deploy_steps_get_the_pipeline_terraform_version(monkeypatch):
     from specter_pipeline import PostDeployStep
 
+    other = {"amd64": "9" * 64, "arm64": "8" * 64}
+    monkeypatch.setitem(TERRAFORM_LINUX_SHA256, "9.9.9", other)
     post = PostDeployStep("tf-out", ["terraform version"], Runtime.TERRAFORM)
-    t = tf_build(terraform_gates(), post_deploy=[post])
-    sha = TERRAFORM_LINUX_SHA256[DEFAULT_TERRAFORM_VERSION]["amd64"]
-    assert f'echo "{sha}  /tmp/terraform.zip" | sha256sum -c -' in c.step_commands(t, "Post-tf-out")
+    t = tf_build(terraform_gates(), post_deploy=[post], terraform_version="9.9.9")
+    cmds = c.step_commands(t, "Post-tf-out")
+    assert any("/terraform/9.9.9/terraform_9.9.9_linux_amd64.zip" in x for x in cmds)
+    assert f'echo "{"9" * 64}  /tmp/terraform.zip" | sha256sum -c -' in cmds
 
 
 def test_a_lambda_terraform_gate_with_its_download_swapped_fails_the_contract():
@@ -314,3 +317,59 @@ def test_a_lambda_terraform_gate_with_its_download_swapped_fails_the_contract():
             r["Properties"]["Source"]["BuildSpec"] = json.dumps(spec)
     with pytest.raises(AssertionError, match="pinned TERRAFORM toolchain"):
         c.assert_standard_contract(Template.from_json(doc), repo=REPO, gates=terraform_gates())
+
+
+
+# --- second round: strict lock grammar, .tf.json, quote-aware deploy check ---------------------
+
+FIXTURES = __import__("pathlib").Path(__file__).parent / "fixtures" / "lockfile"
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+@pytest.mark.parametrize(
+    "lock,ok",
+    [
+        ((FIXTURES / "terraform-1.17.2.lock.hcl").read_text(), True),  # written by terraform init
+        ((FIXTURES / "terraform-1.17.2.lock.hcl").read_text().replace("\n", "\r\n"), True),
+        ('provider "registry.terraform.io/a/b" {\n  version = "1"\n  # hashes = ["h1:x"]\n}\n', False),
+        ('  provider "registry.terraform.io/a/b" {\n  hashes = [\n    "h1:x",\n  ]\n}\n', False),
+        ('provider"registry.terraform.io/a/b" {\n}\n', False),
+        ('﻿provider "registry.terraform.io/a/b" {\n  version = "1"\n}\n', False),
+        ('/* x */ provider "registry.terraform.io/a/b" {\n  version = "1"\n}\n', False),
+        ('provider "registry.terraform.io/a/b" {\n  version = "1"\n  hashes = [\n  ]\n}\n', False),
+        ('provider "registry.terraform.io/a/b" {\n  hashes = [\n    "h1:x",\n', False),
+    ],
+    ids=["terraform-wrote-it", "crlf", "comment-hiding-hashes", "indented", "no-space", "bom",
+         "block-comment", "empty-hashes", "unterminated"],
+)
+def test_lock_file_must_be_terraforms_own_layout_with_hashes(tmp_path, lock, ok):
+    (validate,) = [g for g in terraform_gates() if g.name == "tf-validate"]
+    (tmp_path / ".terraform.lock.hcl").write_bytes(lock.encode("utf-8"))
+    r = _run(validate.commands[:2], tmp_path, "")
+    assert (r.returncode == 0) is ok, r.stdout + r.stderr
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+def test_tf_json_configuration_is_refused_because_checkov_skips_it(tmp_path):
+    (ckv,) = [g for g in terraform_gates(roots=["infra"]) if g.name == "tf-checkov"]
+    (tmp_path / "w" / "infra").mkdir(parents=True)
+    (tmp_path / "w" / "infra" / "main.tf.json").write_text('{"resource": {}}')
+    (tmp_path / "home").mkdir()
+    r = _run(ckv.commands, tmp_path / "w", _fake_checkov(tmp_path, "Passed checks: 1", 0), home=tmp_path / "home")
+    assert r.returncode != 0 and ".tf.json" in r.stdout
+
+
+@pytest.mark.parametrize("arg", ["note=see `README`", "k=$(x)", "a\nb", "it's", "x;y", "#z"])
+def test_quoted_deploy_args_are_valid(arg):
+    from specter_pipeline.gate import deploy_command, split_deploy_command
+
+    tokens = split_deploy_command(deploy_command(["A"], ["--context", arg]))
+    assert tokens is not None and tokens[-3] == arg
+
+
+@pytest.mark.parametrize("tail", [" --app$IFS/tmp/evil", " --a${u}pp /tmp/evil", " # rest", " && x",
+                                  " *", " ~/x", "\nx", " `x`", " 'unterminated", ' "$x"'])
+def test_unquoted_shell_syntax_in_the_deploy_command_is_refused(tail):
+    from specter_pipeline.gate import deploy_command, split_deploy_command
+
+    assert split_deploy_command(deploy_command(["A"], []) + tail) is None

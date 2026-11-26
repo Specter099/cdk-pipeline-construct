@@ -674,3 +674,155 @@ def test_resources_without_properties_do_not_crash_the_contract():
     t = mutated(change)
     c.assert_state_bucket(t, "demo")
     c.assert_applies_plan(t, ROOT)
+
+
+# --- step 3, round 5: name normalisation, every way IAM can attach, wildcard segments ---------
+
+
+@pytest.mark.parametrize("repo", ["Specter099/Demo-App", "Specter099/my.site", "Specter099/Post-office"])
+def test_the_contract_normalises_the_repo_name_like_the_construct(repo):
+    t = tf_build(repo=repo)
+    c.assert_standard_contract(t, post_deploy=[POST], repo=repo, gates=GATES, terraform=ROOT)
+
+
+def _state_object(res):
+    return {"Fn::Join": ["", [{"Fn::GetAtt": [_state_lid(res), "Arn"]}, "/*"]]}
+
+
+@pytest.mark.parametrize(
+    "attach",
+    [
+        lambda res, st: (_other_role(res), _add(res, "RP", "AWS::IAM::RolePolicy", {
+            "RoleName": {"Ref": "OtherRole"}, "PolicyName": "p", "PolicyDocument": _doc(st)})),
+        lambda res, st: _add(res, "UP", "AWS::IAM::UserPolicy", {
+            "UserName": "someone-elsewhere", "PolicyName": "p", "PolicyDocument": _doc(st)}),
+        lambda res, st: (_other_role(res, RoleName="other"), _add(res, "P", "AWS::IAM::Policy", {
+            "PolicyName": "p", "PolicyDocument": _doc(st), "Roles": ["other"]})),
+        lambda res, st: (_other_role(res), _add(res, "P", "AWS::IAM::Policy", {
+            "PolicyName": "p", "PolicyDocument": _doc(st), "Roles": [{"Fn::Sub": "${OtherRole}"}]})),
+        lambda res, st: (_other_role(res, ManagedPolicyArns=[{"Fn::GetAtt": ["MP", "PolicyArn"]}]),
+                         _add(res, "MP", "AWS::IAM::ManagedPolicy", {"PolicyDocument": _doc(st)})),
+        lambda res, st: (_other_role(res, ManagedPolicyArns=[{"Fn::Sub": "${MP}"}]),
+                         _add(res, "MP", "AWS::IAM::ManagedPolicy", {"PolicyDocument": _doc(st)})),
+        lambda res, st: _other_role(res, Policies=[{"PolicyName": "p", "PolicyDocument": _doc(
+            {"Fn::If": ["C", st, {"Ref": "AWS::NoValue"}]})}]),
+        lambda res, st: _other_role(res, Policies=[{"PolicyName": "p", "PolicyDocument": _doc(
+            {**st, "Action": {"Fn::If": ["C", "s3:PutObject", "s3:GetObject"]}})}]),
+        lambda res, st: _other_role(res, Policies=[{"Fn::If": ["C", {"PolicyName": "p", "PolicyDocument": _doc(st)},
+                                                              {"Ref": "AWS::NoValue"}]}]),
+    ],
+    ids=["role-policy", "user-policy-by-name", "policy-by-role-name", "policy-by-sub", "managed-by-getatt",
+         "managed-by-sub", "if-statement", "if-action", "if-inline-policy"],
+)
+def test_every_way_of_attaching_a_state_write_is_caught(attach):
+    def change(res):
+        attach(res, _put(_state_object(res)))
+    with pytest.raises(AssertionError, match="can write the Terraform state"):
+        c.assert_applies_plan(mutated(change), ROOT)
+
+
+@pytest.mark.parametrize(
+    "resource",
+    [
+        "arn:aws:s3:::demo-tfstate-123456789012-eu-*-an/*",
+        "arn:aws:s3:::demo-tfstate-1234*-an/*",
+        "arn:aws:s3:::demo-tfstate-12345678901?-us-east-1-an/*",
+        "arn:aws-*:s3:::demo-tfstate-*/*",
+    ],
+)
+def test_wildcards_inside_account_or_region_are_caught(resource):
+    def change(res):
+        _other_role(res, Policies=[{"PolicyName": "p", "PolicyDocument": _doc(_put(resource))}])
+    with pytest.raises(AssertionError, match="OtherRole can write the Terraform state"):
+        c.assert_applies_plan(mutated(change), ROOT)
+
+
+@pytest.mark.parametrize("default", [None, "*", "STATE"])
+def test_a_parameter_resource_uses_its_default_or_fails_closed(default):
+    def change(res):
+        _other_role(res, Policies=[{"PolicyName": "p", "PolicyDocument": _doc(
+            _put({"Fn::Join": ["", ["arn:aws:s3:::", {"Ref": "Bkt"}, "/*"]]}))}])
+
+    doc = copy.deepcopy(tf_build().to_json())
+    change(doc["Resources"])
+    param = {"Type": "String"}
+    if default is not None:
+        param["Default"] = "demo-tfstate-123456789012-us-east-1-an" if default == "STATE" else default
+    doc.setdefault("Parameters", {})["Bkt"] = param
+    with pytest.raises(AssertionError, match="OtherRole can write the Terraform state"):
+        c.assert_applies_plan(Template.from_json(doc), ROOT)
+
+
+def test_a_parameter_naming_another_bucket_passes():
+    doc = copy.deepcopy(tf_build().to_json())
+    _other_role(doc["Resources"], Policies=[{"PolicyName": "p", "PolicyDocument": _doc(
+        _put({"Fn::Join": ["", ["arn:aws:s3:::", {"Ref": "Bkt"}, "/*"]]}))}])
+    doc.setdefault("Parameters", {})["Bkt"] = {"Type": "String", "Default": "site-assets"}
+    c.assert_applies_plan(Template.from_json(doc), ROOT)
+
+
+def test_a_sub_built_post_deploy_resource_is_not_a_false_positive():
+    from aws_cdk import Fn
+    from test_pipeline import PostDeployStep
+
+    post = PostDeployStep("frontend", ["npm run build"], policy_statements=[iam.PolicyStatement(
+        actions=["s3:PutObject"], resources=[Fn.sub("arn:aws:s3:::site-${AWS::AccountId}/*")])])
+    t = tf_build(post_deploy=[post])
+    c.assert_standard_contract(t, post_deploy=[post], repo=REPO, gates=GATES, terraform=ROOT)
+
+
+@pytest.mark.parametrize(
+    "stmts",
+    [
+        lambda res: [{"Effect": "Allow", "Action": "s3:*", "NotResource": [
+            {"Fn::GetAtt": [_state_lid(res), "Arn"]}, _state_object(res)]}],
+        lambda res: [{"Effect": "Allow", "Action": "s3:*", "Resource": "*"},
+                     {"Effect": "Deny", "Action": "s3:*", "Resource": _state_object(res)},
+                     {"Effect": "Deny", "Action": "s3:*", "Resource": {"Fn::GetAtt": [_state_lid(res), "Arn"]}}],
+    ],
+    ids=["not-resource-excludes-state", "explicit-deny"],
+)
+def test_statements_that_exclude_the_state_pass(stmts):
+    def change(res):
+        _other_role(res, Policies=[{"PolicyName": "p", "PolicyDocument": _doc(*stmts(res))}])
+    c.assert_applies_plan(mutated(change), ROOT)
+
+
+def test_a_wrong_account_not_resource_does_not_hide_a_state_write():
+    def change(res):
+        _other_role(res, Policies=[{"PolicyName": "p", "PolicyDocument": _doc(
+            {"Effect": "Allow", "Action": "s3:*",
+             "NotResource": "arn:aws:s3:::demo-tfstate-111111111111-us-east-1-an/*"})}])
+    with pytest.raises(AssertionError, match="OtherRole can write the Terraform state"):
+        c.assert_applies_plan(mutated(change), ROOT)
+
+
+@pytest.mark.parametrize("action", ["s3:PutBucketPolicy", "s3:PutLifecycleConfiguration", "s3:PutBucketVersioning"])
+def test_no_other_role_may_change_the_state_bucket(action):
+    def change(res):
+        _role_policy(res, "Plan-main").append(
+            {"Effect": "Allow", "Action": action, "Resource": {"Fn::GetAtt": [_state_lid(res), "Arn"]}})
+    with pytest.raises(AssertionError, match="can change the Terraform state bucket"):
+        c.assert_applies_plan(mutated(change), ROOT)
+
+
+def test_a_tls_deny_that_skips_the_objects_does_not_count():
+    def change(res):
+        for st in _bucket_policy_statements(res):
+            st["Resource"] = {"Fn::GetAtt": [_state_lid(res), "Arn"]}
+    with pytest.raises(AssertionError, match="no TLS-only deny"):
+        c.assert_state_bucket(mutated(change), "demo")
+
+
+def test_an_access_point_that_allows_fails():
+    def change(res):
+        _add(res, "AP", "AWS::S3::AccessPoint", {"Bucket": {"Ref": _state_lid(res)}, "Policy": _doc(
+            {"Effect": "Allow", "Principal": {"AWS": "*"}, "Action": "s3:*", "Resource": "*"})})
+    with pytest.raises(AssertionError, match="access point AP"):
+        c.assert_state_bucket(mutated(change), "demo")
+
+
+def test_the_full_contract_survives_a_bare_bucket():
+    def change(res):
+        res["Bare"] = {"Type": "AWS::S3::Bucket"}
+    c.assert_standard_contract(mutated(change), post_deploy=[POST], repo=REPO, gates=GATES, terraform=ROOT)

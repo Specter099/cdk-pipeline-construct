@@ -256,6 +256,17 @@ Deploy: Approve -> Deploy-main (EC2: terraform apply tfplan) -> post-deploy step
 * `assert_standard_contract(..., terraform=ROOT)` checks all of this, via `assert_applies_plan` and
   `assert_state_bucket`: exact command lists, environment variables, artifact wiring, and IAM with
   wildcards taken into account.
+  * The Plan, plan-check and Deploy roles are read strictly: no managed policies, no `NotAction`.
+  * Every other role, user and group, and any policy attached to a principal outside the
+    template, is read leniently. That covers inline and managed policies of the template,
+    `RolePolicy`/`UserPolicy`/`GroupPolicy`, `NotAction`/`NotResource`, explicit denies, and
+    `Fn::Sub`/`Fn::Join`/parameter defaults. A construction it cannot read (an `Fn::If`, an unknown
+    intrinsic) counts as reaching the state.
+  * Only the Deploy role may write the state or change the bucket (policy, versioning,
+    lifecycle, public access, encryption, deletion).
+  * **Not covered:** managed policies attached by a literal ARN (AWS-managed ones such as
+    `AdministratorAccess`, or another stack's) cannot be read from the template, and principals
+    in other stacks or accounts are not visible. Keep those off the state bucket in your account.
 
 **Operating notes.**
 * **Secrets in the plan:** the saved plan and `tfplan.json` contain the prior state and any

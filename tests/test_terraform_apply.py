@@ -986,3 +986,40 @@ def test_a_deny_on_a_parameter_never_excuses_even_with_a_star_default():
     doc.setdefault("Parameters", {})["P"] = {"Type": "String", "Default": "*"}
     with pytest.raises(AssertionError, match="OtherRole can"):
         c.assert_applies_plan(Template.from_json(doc), ROOT)
+
+
+# --- PR #7 review: P3 by-name matching -------------------------------------------------------
+
+
+def test_an_aws_managed_arn_never_borrows_a_template_policy_of_the_same_name():
+    def change(res):
+        _add(res, "MP", "AWS::IAM::ManagedPolicy", {"ManagedPolicyName": "ReadOnlyAccess",
+                                                    "PolicyDocument": _doc({"Effect": "Deny", "Action": "s3:*", "Resource": "*"})})
+        _other_role(res, ManagedPolicyArns=["arn:aws:iam::aws:policy/ReadOnlyAccess"],
+                    Policies=[{"PolicyName": "p", "PolicyDocument": _doc(_put(_state_object(res)))}])
+    with pytest.raises(AssertionError, match="OtherRole can write the Terraform state"):
+        c.assert_applies_plan(mutated(change), ROOT)
+
+
+def test_an_aws_managed_arn_is_not_a_template_policy_that_writes_state():
+    def change(res):
+        _add(res, "MP", "AWS::IAM::ManagedPolicy", {"ManagedPolicyName": "ReadOnlyAccess",
+                                                    "PolicyDocument": _doc(_put(_state_object(res)))})
+        _other_role(res, ManagedPolicyArns=["arn:aws:iam::aws:policy/ReadOnlyAccess"])
+    # MP itself is attached to nobody, so it reaches no principal
+    c.assert_applies_plan(mutated(change), ROOT)
+
+
+@pytest.mark.parametrize("name", [{"Fn::Sub": "state-writer"},
+                                  {"Fn::Join": ["-", ["state-writer", {"Ref": "AWS::Region"}]]},
+                                  {"Ref": "PolicyName"}])
+def test_a_non_literal_managed_policy_name_is_still_matched(name):
+    doc = copy.deepcopy(tf_build().to_json())
+    res = doc["Resources"]
+    _add(res, "MP", "AWS::IAM::ManagedPolicy", {"ManagedPolicyName": name,
+                                                "PolicyDocument": _doc(_put(_state_object(res)))})
+    _other_role(res, ManagedPolicyArns=["arn:aws:iam::000000000000:policy/state-writer-us-east-1"
+                                        if "Fn::Join" in name else "arn:aws:iam::000000000000:policy/state-writer"])
+    doc.setdefault("Parameters", {})["PolicyName"] = {"Type": "String", "Default": "state-writer"}
+    with pytest.raises(AssertionError, match="OtherRole can write the Terraform state"):
+        c.assert_applies_plan(Template.from_json(doc), ROOT)

@@ -96,13 +96,30 @@ def test_invalid_root_lists(roots, err, match):
 # --- provider secrets --------------------------------------------------------------------------
 
 
+def _buildspec_secrets(t, step):
+    return c._step_buildspec(t, step).get("env", {}).get("secrets-manager", {})
+
+
 def test_secrets_reach_only_their_roots_plan_and_deploy(tpl):
+    # in the buildspec, not as project variables: for those CDK adds a grant on "<arn>*"
     for step in ("Plan-github", "Deploy-github"):
-        assert env_of(tpl, step)["GITHUB_TOKEN"] == ("SECRETS_MANAGER", GH)
+        assert _buildspec_secrets(tpl, step) == {"GITHUB_TOKEN": GH}
     for step in ("Plan-edge", "Deploy-edge"):
-        assert env_of(tpl, step)["METAL_AUTH_TOKEN"] == ("SECRETS_MANAGER", EQX)
+        assert _buildspec_secrets(tpl, step) == {"METAL_AUTH_TOKEN": EQX}
     for step in ("Plan-network", "Deploy-network", "Gate-tf-plan-check-github", "Gate-tf-validate"):
-        assert not any(t == "SECRETS_MANAGER" for t, _ in env_of(tpl, step).values()), step
+        assert not _buildspec_secrets(tpl, step), step
+    for proj in c.projects(tpl).values():
+        env = proj["Properties"]["Environment"].get("EnvironmentVariables", [])
+        assert not any(v.get("Type") == "SECRETS_MANAGER" for v in env)
+
+
+def test_secret_grants_are_exactly_the_secret_arns(tpl):
+    for pol in tpl.find_resources("AWS::IAM::Policy").values():
+        for st in pol["Properties"]["PolicyDocument"]["Statement"]:
+            if "secretsmanager" in json.dumps(st["Action"]):
+                assert all(r in {GH, "arn:aws:secretsmanager:us-east-1:000000000000:secret:equinix-XyZ789"}
+                           for r in (st["Resource"] if isinstance(st["Resource"], list) else [st["Resource"]])), st
+            assert "kms:" not in json.dumps(st["Action"]), st
 
 
 def test_only_two_roles_per_secret_can_read_it(tpl):
@@ -124,6 +141,14 @@ def test_only_two_roles_per_secret_can_read_it(tpl):
         ({"github_token": GH}, "upper-case"),
         ({"TF_CLI_ARGS": GH}, "may not set"),
         ({"TF_WORKSPACE": GH}, "may not set"),
+        ({"TF_VAR_TOKEN": GH}, "saved plan"),
+        ({"CI": GH}, "upper-case"),
+        ({"TF_LOG": GH}, "secrets may not set"),
+        ({"AWS_ACCESS_KEY_ID": GH}, "secrets may not set"),
+        ({"CODEBUILD_X": GH}, "secrets may not set"),
+        ({"PATH": GH}, "secrets may not set"),
+        ({"GITHUB_TOKEN": GH + ":key\nrm -rf /"}, "complete Secrets"),
+        ({"GITHUB_TOKEN": GH + ":*"}, "complete Secrets"),
     ],
 )
 def test_secret_settings_are_validated(secrets, match):
@@ -172,6 +197,25 @@ def _secret_env_on(step):
     return change
 
 
+def _drop_buildspec_secrets(step):
+    def change(res):
+        p = _project(res, step)
+        spec = json.loads(p["Source"]["BuildSpec"])
+        spec.pop("env")
+        p["Source"]["BuildSpec"] = json.dumps(spec)
+    return change
+
+
+def _widen_secret_grant(step):
+    def change(res):
+        role = _project(res, step)["ServiceRole"]["Fn::GetAtt"][0]
+        pol = next(r for r in res.values() if r["Type"] == "AWS::IAM::Policy"
+                   and {x["Ref"] for x in r["Properties"]["Roles"]} == {role})
+        pol["Properties"]["PolicyDocument"]["Statement"].append(
+            {"Effect": "Allow", "Action": "secretsmanager:GetSecretValue", "Resource": GH + "*"})
+    return change
+
+
 @pytest.mark.parametrize(
     "change,root,message",
     [
@@ -180,9 +224,9 @@ def _secret_env_on(step):
         (_grant_secret_to("Gate-tf-validate"), GITHUB, "can read github's secret"),
         (_grant_secret_to("Plan-network"), GITHUB, "can read github's secret"),
         (_secret_env_on("Gate-tf-plan-check-github"), GITHUB, "besides CI=true"),
-        (lambda r: _project(r, "Deploy-github")["Environment"]["EnvironmentVariables"].__setitem__(
-            slice(None), [v for v in _project(r, "Deploy-github")["Environment"]["EnvironmentVariables"] if v["Name"] != "GITHUB_TOKEN"]),
-         GITHUB, "environment differs"),
+        (_secret_env_on("Deploy-github"), GITHUB, "environment differs"),
+        (_drop_buildspec_secrets("Deploy-github"), GITHUB, "buildspec has more than"),
+        (_widen_secret_grant("Plan-github"), GITHUB, "reads secrets more widely"),
     ],
 )
 def test_contract_rejects(change, root, message):
@@ -224,3 +268,65 @@ def test_any_other_principal_that_can_read_a_secret_fails(principal):
         res["Other"] = principal
     with pytest.raises(AssertionError, match="can read github's secret"):
         c.assert_applies_plan(mutated(change), GITHUB)
+
+
+@pytest.mark.parametrize("key", ["AWS_REGION", "AWS_PROFILE", "CODEBUILD_SRC_DIR", "PATH", "TF_LOG", "CI"])
+def test_env_may_not_redirect_the_sdk_or_codebuild(key):
+    with pytest.raises(ValueError, match="env may not set"):
+        TerraformRoot("x", env={key: "v"})
+
+
+def test_roots_may_share_a_secret():
+    a = TerraformRoot("a", name="a", secrets={"GITHUB_TOKEN": GH})
+    b = TerraformRoot("b", name="b", secrets={"GITHUB_TOKEN": GH})
+    t = build(application_stage=None, terraform=[a, b], gates=terraform_gates(roots=["a", "b"]))
+    c.assert_standard_contract(t, post_deploy=[POST], repo=REPO, gates=terraform_gates(roots=["a", "b"]),
+                               terraform=[a, b])
+
+
+def _role_stmts(res, step):
+    role = _project(res, step)["ServiceRole"]["Fn::GetAtt"][0]
+    pol = next(r for r in res.values() if r["Type"] == "AWS::IAM::Policy"
+               and {x["Ref"] for x in r["Properties"]["Roles"]} == {role})
+    return pol["Properties"]["PolicyDocument"]["Statement"]
+
+
+def _state_lid(res):
+    return next(k for k, r in res.items() if r["Type"] == "AWS::S3::Bucket"
+                and r["Properties"].get("BucketNamePrefix") == "demo-tfstate")
+
+
+def _key(res, key):
+    return {"Fn::Join": ["", [{"Fn::GetAtt": [_state_lid(res), "Arn"]}, "/" + key]]}
+
+
+@pytest.mark.parametrize(
+    "step,action,key,message",
+    [
+        ("Plan-github", "s3:GetObject", "network/terraform.tfstate", "can read network's"),
+        ("Plan-github", "s3:GetObject", "*", "can read network's"),
+        ("Deploy-github", "s3:DeleteObject", "network/terraform.tfstate.tflock", "release the lock of network's"),
+        ("Plan-github", "s3:PutObject", "network/terraform.tfstate.tflock", "take the lock of network's"),
+        ("Gate-tf-validate", "s3:GetObject", "network/terraform.tfstate", "can read network's"),
+    ],
+)
+def test_one_root_cannot_reach_another_roots_state_or_lock(step, action, key, message):
+    def change(res):
+        _role_stmts(res, step).append({"Effect": "Allow", "Action": action, "Resource": _key(res, key)})
+    with pytest.raises(AssertionError, match=message):
+        c.assert_applies_plan(mutated(change), NET, "demo", ROOTS)
+
+
+def test_a_role_reading_a_secret_of_this_template_is_not_a_false_positive():
+    def change(res):
+        res["MySecret"] = {"Type": "AWS::SecretsManager::Secret", "Properties": {}}
+        _role_stmts(res, "Plan-network").append(
+            {"Effect": "Allow", "Action": "secretsmanager:GetSecretValue", "Resource": {"Ref": "MySecret"}})
+    t = mutated(change)
+    for r in ROOTS:
+        c.assert_applies_plan(t, r, "demo", ROOTS)
+
+
+def test_a_missing_apply_is_an_assertion_not_a_key_error():
+    with pytest.raises(AssertionError, match="no \\['Deploy-nope'\\]"):
+        c.assert_terraform_order(tf_build(), [*ROOTS, TerraformRoot("nope", name="nope")])

@@ -69,6 +69,7 @@ from .terraform import (
     apply_commands,
     plan_check_commands,
     plan_commands,
+    secrets_buildspec,
     secrets_policy,
     state_policy,
 )
@@ -101,21 +102,10 @@ def _environment(
     return build_environment(runtime, memory_gb, ec2)
 
 
-def _with_secrets(env: codebuild.BuildEnvironment, root: TerraformRoot) -> codebuild.BuildEnvironment:
-    """The same environment plus the root's provider secrets as Secrets Manager variables."""
-    if not root.secrets:
-        return env
-    return codebuild.BuildEnvironment(
-        build_image=env.build_image,
-        compute_type=env.compute_type,
-        privileged=env.privileged,
-        environment_variables={
-            key: codebuild.BuildEnvironmentVariable(
-                type=codebuild.BuildEnvironmentVariableType.SECRETS_MANAGER, value=arn
-            )
-            for key, arn in root.secrets.items()
-        },
-    )
+def _secrets_spec(root: TerraformRoot) -> codebuild.BuildSpec | None:
+    """The root's provider secrets as a partial buildspec (see ``secrets_buildspec``)."""
+    spec = secrets_buildspec(root)
+    return codebuild.BuildSpec.from_object(spec) if spec else None
 
 
 def _codebuild_step(
@@ -400,9 +390,8 @@ class StandardPipeline(Construct):
                     *state_policy(self.state_bucket.bucket_arn, root, write_state=False),
                     *secrets_policy(root),
                 ],
-                build_environment=_with_secrets(
-                    _environment(Runtime.TERRAFORM, 2, root.plan_ec2), root
-                ),
+                build_environment=_environment(Runtime.TERRAFORM, 2, root.plan_ec2),
+                partial_build_spec=_secrets_spec(root),
                 timeout=build_timeout(root.plan_ec2),
             )
             # Check the plan with no AWS access: destroys, then Checkov's plan policies.
@@ -458,9 +447,8 @@ class StandardPipeline(Construct):
                         *state_policy(self.state_bucket.bucket_arn, root, write_state=True),
                         *secrets_policy(root),
                     ],
-                    build_environment=_with_secrets(
-                        _environment(Runtime.TERRAFORM, 2, root.apply_ec2), root
-                    ),
+                    build_environment=_environment(Runtime.TERRAFORM, 2, root.apply_ec2),
+                    partial_build_spec=_secrets_spec(root),
                     timeout=build_timeout(root.apply_ec2),
                 )
                 for root in roots
